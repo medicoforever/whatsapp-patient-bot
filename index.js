@@ -1,8 +1,6 @@
-import makeWASocket, { 
-    useMultiFileAuthState, 
-    DisconnectReason,
-    downloadMediaMessage 
-} from '@whiskeysockets/baileys';
+import pkg from '@whiskeysockets/baileys';
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = pkg;
+
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import pino from 'pino';
 import QRCode from 'qrcode';
@@ -321,7 +319,7 @@ async function startBot() {
     
     const { state, saveCreds } = await useMultiFileAuthState('auth_session');
     
-    sock = makeWASocket.default({
+    sock = makeWASocket({
         auth: state,
         printQRInTerminal: true,
         logger: pino({ level: 'silent' }),
@@ -490,20 +488,17 @@ async function processPatientImages(sock, chatId, patientIdentifier, images) {
         
         // Send to WhatsApp
         if (CONFIG.SEND_TO_WHATSAPP) {
-            // Create header
-            const header = `📋 *Report for: ${patientIdentifier}*\n📸 _${images.length} image(s) analyzed_\n${'─'.repeat(30)}\n\n`;
-            
             const maxLength = 4000;
             
-            if (clinicalProfile.length + header.length <= maxLength) {
-                await sock.sendMessage(chatId, { text: header + clinicalProfile });
+            if (clinicalProfile.length <= maxLength) {
+                await sock.sendMessage(chatId, { text: clinicalProfile });
             } else {
                 // Split long messages
                 await sock.sendMessage(chatId, { 
-                    text: header + clinicalProfile.substring(0, maxLength - header.length - 20) + '\n\n_(continued...)_'
+                    text: clinicalProfile.substring(0, maxLength - 20) + '\n\n_(continued...)_'
                 });
                 
-                let remaining = clinicalProfile.substring(maxLength - header.length - 20);
+                let remaining = clinicalProfile.substring(maxLength - 20);
                 while (remaining.length > 0) {
                     await new Promise(r => setTimeout(r, 1000));
                     const chunk = remaining.substring(0, maxLength);
