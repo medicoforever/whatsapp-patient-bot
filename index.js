@@ -12,9 +12,13 @@ const __dirname = dirname(__filename);
 // ============== CONFIGURATION ==============
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    GEMINI_MODEL: 'gemini-3-flash-preview',
-    IMAGE_TIMEOUT_MS: 120000,
-    SEND_TO_WHATSAPP: true,
+    GEMINI_MODEL: 'gemini-2.0-flash-exp',
+    
+    // Time to wait before auto-clearing images (5 minutes)
+    IMAGE_TIMEOUT_MS: 300000,
+    
+    // Trigger text to process images
+    TRIGGER_TEXT: '.',
     
     SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded pictures. Your task is to analyze that text to create a concise and comprehensive "Clinical Profile".
 
@@ -68,8 +72,10 @@ IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE
 };
 
 // ============== SETUP ==============
-let imageBuffer = [];
-let bufferTimeout = null;
+// Store images per chat (chatId -> array of images)
+const chatImageBuffers = new Map();
+const chatTimeouts = new Map();
+
 let sock = null;
 let isConnected = false;
 let qrCodeDataURL = null;
@@ -89,6 +95,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
+    const totalBuffered = Array.from(chatImageBuffers.values()).reduce((sum, arr) => sum + arr.length, 0);
+    
     let html = `
     <!DOCTYPE html>
     <html>
@@ -192,6 +200,14 @@ app.get('/', (req, res) => {
                 font-size: 12px;
                 word-break: break-word;
             }
+            .trigger-badge {
+                background: rgba(0,0,0,0.3);
+                padding: 8px 15px;
+                border-radius: 8px;
+                font-size: 14px;
+                margin: 10px 0;
+                display: inline-block;
+            }
         </style>
     </head>
     <body>
@@ -204,17 +220,19 @@ app.get('/', (req, res) => {
     if (isConnected) {
         html += `
             <div class="status connected">✅ CONNECTED & RUNNING</div>
+            <div class="trigger-badge">Send <strong>"."</strong> to process images</div>
             <div class="stats">
-                <div class="stat"><div class="stat-value">24/7</div><div class="stat-label">Uptime</div></div>
-                <div class="stat"><div class="stat-value">${imageBuffer.length}</div><div class="stat-label">Buffered</div></div>
+                <div class="stat"><div class="stat-value">${chatImageBuffers.size}</div><div class="stat-label">Active Chats</div></div>
+                <div class="stat"><div class="stat-value">${totalBuffered}</div><div class="stat-label">Buffered Imgs</div></div>
                 <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">Processed</div></div>
             </div>
             <div class="instructions">
                 <h3>✨ How to use:</h3>
                 <ol>
-                    <li>Send patient's medical report images to any WhatsApp group</li>
-                    <li>Then send patient identifier as text (e.g., "Patient 1")</li>
-                    <li>Bot will generate Clinical Profile and reply!</li>
+                    <li>Send medical report image(s) to the bot</li>
+                    <li>Send more images if needed</li>
+                    <li>Send <strong>.</strong> (period) when done</li>
+                    <li>Bot generates Clinical Profile! 🎉</li>
                 </ol>
             </div>
         `;
@@ -262,7 +280,7 @@ app.get('/health', (req, res) => {
         botStatus: botStatus,
         lastError: lastError,
         model: CONFIG.GEMINI_MODEL,
-        bufferedImages: imageBuffer.length,
+        activeChats: chatImageBuffers.size,
         processedCount: processedCount,
         timestamp: new Date().toISOString()
     });
@@ -270,7 +288,6 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
     log('🌐', `Web server running on port ${PORT}`);
-    log('🤖', `Using Gemini model: ${CONFIG.GEMINI_MODEL}`);
 });
 
 // ============== LOAD BAILEYS ==============
@@ -287,12 +304,11 @@ async function loadBaileys() {
         downloadMediaMessage = baileys.downloadMediaMessage;
         fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
         
-        log('✅', 'Baileys library loaded successfully!');
+        log('✅', 'Baileys library loaded!');
         return true;
     } catch (error) {
         log('❌', `Failed to load Baileys: ${error.message}`);
         lastError = error.message;
-        botStatus = 'Failed to load library';
         throw error;
     }
 }
@@ -307,24 +323,22 @@ async function startBot() {
             await loadBaileys();
         }
         
-        // Clear old session if exists and having issues
         const authPath = join(__dirname, 'auth_session');
         
         botStatus = 'Loading auth state...';
         const { state, saveCreds } = await useMultiFileAuthState(authPath);
         
-        botStatus = 'Fetching latest version...';
+        botStatus = 'Fetching WhatsApp version...';
         let version;
         try {
             const versionData = await fetchLatestBaileysVersion();
             version = versionData.version;
-            log('📱', `Using WhatsApp version: ${version.join('.')}`);
+            log('📱', `WhatsApp version: ${version.join('.')}`);
         } catch (e) {
-            log('⚠️', 'Could not fetch version, using defaults');
             version = [2, 3000, 1015901307];
         }
         
-        botStatus = 'Creating connection...';
+        botStatus = 'Connecting...';
         log('🔌', 'Creating WhatsApp connection...');
         
         sock = makeWASocket({
@@ -333,7 +347,6 @@ async function startBot() {
             logger: pino({ level: 'silent' }),
             browser: ['Ubuntu', 'Chrome', '20.0.04'],
             markOnlineOnConnect: false,
-            generateHighQualityLinkPreview: true,
             getMessage: async () => ({ conversation: '' })
         });
         
@@ -341,8 +354,6 @@ async function startBot() {
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
-            
-            log('🔄', `Update: ${connection || 'connecting'} ${qr ? '(QR available)' : ''}`);
             
             if (qr) {
                 try {
@@ -354,9 +365,8 @@ async function startBot() {
                     });
                     isConnected = false;
                     lastError = null;
-                    log('📱', '✅ QR Code generated - Visit web page to scan!');
+                    log('📱', '✅ QR Code ready - scan to connect!');
                 } catch (err) {
-                    log('❌', `QR generation error: ${err.message}`);
                     lastError = `QR Error: ${err.message}`;
                 }
             }
@@ -365,26 +375,13 @@ async function startBot() {
                 isConnected = false;
                 qrCodeDataURL = null;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const reason = lastDisconnect?.error?.message || 'Unknown';
                 
-                botStatus = `Disconnected (${statusCode})`;
-                lastError = `Code ${statusCode}: ${reason}`;
-                log('❌', `Connection closed: ${statusCode} - ${reason}`);
+                log('❌', `Disconnected: ${statusCode}`);
                 
-                // Handle specific error codes
-                if (statusCode === 401 || statusCode === DisconnectReason?.loggedOut) {
-                    log('🚪', 'Logged out - clearing auth session...');
+                if (statusCode === 401 || statusCode === 405 || statusCode === DisconnectReason?.loggedOut) {
                     try {
                         fs.rmSync(authPath, { recursive: true, force: true });
-                        log('✅', 'Auth cleared');
-                    } catch (e) {
-                        log('⚠️', 'Could not clear auth');
-                    }
-                } else if (statusCode === 405) {
-                    log('⚠️', 'Connection rejected (405) - clearing auth and retrying...');
-                    try {
-                        fs.rmSync(authPath, { recursive: true, force: true });
-                        log('✅', 'Auth cleared due to 405 error');
+                        log('🗑️', 'Auth cleared');
                     } catch (e) {}
                 }
                 
@@ -397,7 +394,8 @@ async function startBot() {
                 lastError = null;
                 botStatus = 'Connected';
                 log('✅', '🎉 CONNECTED TO WHATSAPP!');
-                log('👀', 'Listening for messages in groups...');
+                log('👀', 'Listening for messages...');
+                log('💡', 'Send images, then send "." to process');
             }
         });
 
@@ -412,16 +410,12 @@ async function startBot() {
         });
         
     } catch (error) {
-        log('💥', `StartBot Error: ${error.message}`);
-        console.error(error);
+        log('💥', `Error: ${error.message}`);
         lastError = error.message;
         botStatus = 'Error - retrying...';
         
-        // Clear auth on persistent errors
         try {
-            const authPath = join(__dirname, 'auth_session');
-            fs.rmSync(authPath, { recursive: true, force: true });
-            log('🗑️', 'Cleared auth due to error');
+            fs.rmSync(join(__dirname, 'auth_session'), { recursive: true, force: true });
         } catch (e) {}
         
         setTimeout(startBot, 10000);
@@ -431,57 +425,117 @@ async function startBot() {
 // ============== MESSAGE HANDLER ==============
 async function handleMessage(sock, msg) {
     const chatId = msg.key.remoteJid;
-    if (!chatId.endsWith('@g.us')) return;
+    
+    // Skip status broadcasts
+    if (chatId === 'status@broadcast') return;
     
     const messageType = Object.keys(msg.message)[0];
     
+    // Handle images
     if (messageType === 'imageMessage') {
-        log('📷', `Image received`);
+        log('📷', `Image received from ${chatId.split('@')[0]}`);
         
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
             
-            imageBuffer.push({
+            // Initialize buffer for this chat if needed
+            if (!chatImageBuffers.has(chatId)) {
+                chatImageBuffers.set(chatId, []);
+            }
+            
+            // Add image to this chat's buffer
+            chatImageBuffers.get(chatId).push({
                 data: buffer.toString('base64'),
                 mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
-                timestamp: Date.now(),
-                groupId: chatId
+                timestamp: Date.now()
             });
             
-            log('📦', `Buffer: ${imageBuffer.length} image(s)`);
+            const imageCount = chatImageBuffers.get(chatId).length;
+            log('📦', `Chat buffer: ${imageCount} image(s)`);
             
-            if (bufferTimeout) clearTimeout(bufferTimeout);
-            bufferTimeout = setTimeout(() => {
-                if (imageBuffer.length > 0) {
-                    log('⏰', 'Timeout - clearing buffer');
-                    imageBuffer = [];
+            // Reset timeout for this chat
+            if (chatTimeouts.has(chatId)) {
+                clearTimeout(chatTimeouts.get(chatId));
+            }
+            
+            // Set auto-clear timeout
+            chatTimeouts.set(chatId, setTimeout(() => {
+                if (chatImageBuffers.has(chatId)) {
+                    log('⏰', `Auto-clearing ${chatImageBuffers.get(chatId).length} images for ${chatId.split('@')[0]}`);
+                    chatImageBuffers.delete(chatId);
+                    chatTimeouts.delete(chatId);
                 }
-            }, CONFIG.IMAGE_TIMEOUT_MS);
+            }, CONFIG.IMAGE_TIMEOUT_MS));
+            
+            // Send acknowledgment for first image
+            if (imageCount === 1) {
+                await sock.sendMessage(chatId, { 
+                    text: `📷 Image received!\n\n_Send more images if needed, then send *.*  (period) to process._` 
+                });
+            } else {
+                // Just react to subsequent images
+                await sock.sendMessage(chatId, { 
+                    react: { text: '📷', key: msg.key }
+                });
+            }
             
         } catch (error) {
             log('❌', `Download error: ${error.message}`);
         }
     }
+    // Handle trigger text "."
     else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
         
-        if (text && text.trim() && imageBuffer.length > 0) {
-            const patientIdentifier = text.trim();
-            const groupImages = imageBuffer.filter(img => img.groupId === chatId);
+        // Check if it's the trigger
+        if (text === CONFIG.TRIGGER_TEXT) {
+            log('🔔', `Trigger received from ${chatId.split('@')[0]}`);
             
-            if (groupImages.length > 0) {
-                log('👤', `Patient ID: "${patientIdentifier}"`);
-                log('🔄', `Processing ${groupImages.length} images...`);
-                
-                if (bufferTimeout) {
-                    clearTimeout(bufferTimeout);
-                    bufferTimeout = null;
+            // Check if there are images to process
+            if (chatImageBuffers.has(chatId) && chatImageBuffers.get(chatId).length > 0) {
+                // Clear timeout
+                if (chatTimeouts.has(chatId)) {
+                    clearTimeout(chatTimeouts.get(chatId));
+                    chatTimeouts.delete(chatId);
                 }
                 
-                const imagesToProcess = [...groupImages];
-                imageBuffer = imageBuffer.filter(img => img.groupId !== chatId);
+                // Get and clear images
+                const images = chatImageBuffers.get(chatId);
+                chatImageBuffers.delete(chatId);
                 
-                await processPatientImages(sock, chatId, patientIdentifier, imagesToProcess);
+                log('🔄', `Processing ${images.length} images...`);
+                
+                // Process images
+                await processImages(sock, chatId, images);
+            } else {
+                // No images buffered
+                await sock.sendMessage(chatId, { 
+                    text: `❌ No images to process!\n\n_Send image(s) first, then send *.*  to generate the Clinical Profile._` 
+                });
+            }
+        }
+        // Help command
+        else if (text.toLowerCase() === 'help' || text === '?') {
+            await sock.sendMessage(chatId, { 
+                text: `🏥 *WhatsApp Clinical Profile Bot*\n\n*How to use:*\n1️⃣ Send medical report image(s)\n2️⃣ Send more images if needed\n3️⃣ Send *.* (period) to process\n\n_The bot will analyze all images and generate a Clinical Profile._` 
+            });
+        }
+        // Clear command
+        else if (text.toLowerCase() === 'clear') {
+            if (chatImageBuffers.has(chatId)) {
+                const count = chatImageBuffers.get(chatId).length;
+                chatImageBuffers.delete(chatId);
+                if (chatTimeouts.has(chatId)) {
+                    clearTimeout(chatTimeouts.get(chatId));
+                    chatTimeouts.delete(chatId);
+                }
+                await sock.sendMessage(chatId, { 
+                    text: `🗑️ Cleared ${count} buffered image(s).` 
+                });
+            } else {
+                await sock.sendMessage(chatId, { 
+                    text: `ℹ️ No images buffered.` 
+                });
             }
         }
     }
@@ -501,63 +555,66 @@ try {
     lastError = `Gemini: ${error.message}`;
 }
 
-async function processPatientImages(sock, chatId, patientIdentifier, images) {
+async function processImages(sock, chatId, images) {
     try {
         log('🤖', `Sending ${images.length} images to Gemini AI...`);
         
+        // Send processing message
         await sock.sendMessage(chatId, { 
-            text: `⏳ Processing ${images.length} image(s) for *${patientIdentifier}*...\n\n_Generating Clinical Profile..._` 
+            text: `⏳ Processing ${images.length} image(s)...\n\n_Generating Clinical Profile, please wait..._` 
         });
         
+        // Prepare image parts for Gemini
         const imageParts = images.map(img => ({
             inlineData: { data: img.data, mimeType: img.mimeType }
         }));
         
+        // Call Gemini API
         const userPrompt = `Analyze these ${images.length} medical document image(s) and generate the Clinical Profile as per your instructions.`;
         
         const result = await model.generateContent([userPrompt, ...imageParts]);
         const response = await result.response;
         const clinicalProfile = response.text();
         
-        log('✅', `Clinical Profile generated!`);
+        log('✅', 'Clinical Profile generated!');
         processedCount++;
         
+        // Log to console
         console.log('\n' + '═'.repeat(60));
-        console.log(`📋 Patient: ${patientIdentifier}`);
         console.log(`📸 Images: ${images.length}`);
         console.log(`⏰ Time: ${new Date().toLocaleString()}`);
         console.log('═'.repeat(60));
         console.log(clinicalProfile);
         console.log('═'.repeat(60) + '\n');
         
-        if (CONFIG.SEND_TO_WHATSAPP) {
-            const maxLength = 4000;
+        // Send to WhatsApp
+        const maxLength = 4000;
+        
+        if (clinicalProfile.length <= maxLength) {
+            await sock.sendMessage(chatId, { text: clinicalProfile });
+        } else {
+            // Split long messages
+            await sock.sendMessage(chatId, { 
+                text: clinicalProfile.substring(0, maxLength - 20) + '\n\n_(continued...)_'
+            });
             
-            if (clinicalProfile.length <= maxLength) {
-                await sock.sendMessage(chatId, { text: clinicalProfile });
-            } else {
-                await sock.sendMessage(chatId, { 
-                    text: clinicalProfile.substring(0, maxLength - 20) + '\n\n_(continued...)_'
-                });
-                
-                let remaining = clinicalProfile.substring(maxLength - 20);
-                while (remaining.length > 0) {
-                    await new Promise(r => setTimeout(r, 1000));
-                    const chunk = remaining.substring(0, maxLength);
-                    remaining = remaining.substring(maxLength);
-                    await sock.sendMessage(chatId, { text: chunk });
-                }
+            let remaining = clinicalProfile.substring(maxLength - 20);
+            while (remaining.length > 0) {
+                await new Promise(r => setTimeout(r, 1000));
+                const chunk = remaining.substring(0, maxLength);
+                remaining = remaining.substring(maxLength);
+                await sock.sendMessage(chatId, { text: chunk });
             }
-            
-            log('📤', 'Clinical Profile sent to WhatsApp!');
         }
+        
+        log('📤', 'Clinical Profile sent!');
         
     } catch (error) {
         log('❌', `Gemini Error: ${error.message}`);
         console.error(error);
         
         await sock.sendMessage(chatId, { 
-            text: `❌ Error processing *${patientIdentifier}*\n\n_${error.message}_\n\nPlease try again.` 
+            text: `❌ Error generating Clinical Profile\n\n_${error.message}_\n\nPlease try again.` 
         });
     }
 }
@@ -569,5 +626,6 @@ console.log('╚═════════════════════�
 
 log('🏁', 'Initializing...');
 log('🤖', `Model: ${CONFIG.GEMINI_MODEL}`);
+log('🔔', `Trigger: Send "${CONFIG.TRIGGER_TEXT}" to process images`);
 
 startBot();
