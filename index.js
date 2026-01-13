@@ -1,9 +1,3 @@
-import makeWASocket, { 
-    DisconnectReason, 
-    useMultiFileAuthState, 
-    downloadMediaMessage 
-} from '@whiskeysockets/baileys';
-
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import pino from 'pino';
 import QRCode from 'qrcode';
@@ -14,7 +8,7 @@ import fs from 'fs';
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
     
-    // Using the newest Gemini model
+    // Fixed: Use valid Gemini model name
     GEMINI_MODEL: 'gemini-3-flash-preview',
     
     // Time to wait for patient name after images (2 minutes)
@@ -82,13 +76,11 @@ let sock = null;
 let isConnected = false;
 let qrCodeDataURL = null;
 let processedCount = 0;
+let botStatus = 'Starting...';
+let lastError = null;
 
-// Gemini setup with system instruction
-const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ 
-    model: CONFIG.GEMINI_MODEL,
-    systemInstruction: CONFIG.SYSTEM_INSTRUCTION
-});
+// Baileys imports (will be loaded dynamically)
+let makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage;
 
 function log(emoji, message) {
     const time = new Date().toLocaleTimeString();
@@ -161,6 +153,9 @@ app.get('/', (req, res) => {
             .waiting { 
                 background: rgba(255,255,255,0.2); 
             }
+            .error {
+                background: #f44336;
+            }
             @keyframes pulse {
                 0%, 100% { opacity: 1; }
                 50% { opacity: 0.8; }
@@ -225,6 +220,16 @@ app.get('/', (req, res) => {
                 opacity: 0.8;
                 text-transform: uppercase;
             }
+            .error-box {
+                background: rgba(255,0,0,0.2);
+                border: 1px solid rgba(255,255,255,0.3);
+                padding: 15px;
+                border-radius: 10px;
+                margin-top: 15px;
+                text-align: left;
+                font-size: 12px;
+                word-break: break-all;
+            }
         </style>
     </head>
     <body>
@@ -281,12 +286,24 @@ app.get('/', (req, res) => {
             </div>
             <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
         `;
+    } else if (lastError) {
+        html += `
+            <div class="status error">
+                ❌ ERROR
+            </div>
+            <p>Bot encountered an error</p>
+            <div class="error-box">
+                <strong>Status:</strong> ${botStatus}<br><br>
+                <strong>Error:</strong> ${lastError}
+            </div>
+            <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
+        `;
     } else {
         html += `
             <div class="status waiting">
-                ⏳ INITIALIZING...
+                ⏳ ${botStatus.toUpperCase()}
             </div>
-            <p>Please wait, generating QR code...</p>
+            <p>Please wait...</p>
             <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
         `;
     }
@@ -304,6 +321,8 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'running',
         connected: isConnected,
+        botStatus: botStatus,
+        lastError: lastError,
         model: CONFIG.GEMINI_MODEL,
         bufferedImages: imageBuffer.length,
         processedCount: processedCount,
@@ -316,74 +335,145 @@ app.listen(PORT, () => {
     log('🤖', `Using Gemini model: ${CONFIG.GEMINI_MODEL}`);
 });
 
+// ============== LOAD BAILEYS ==============
+async function loadBaileys() {
+    botStatus = 'Loading WhatsApp library...';
+    log('📦', 'Loading Baileys library...');
+    
+    try {
+        // Dynamic import to handle the ESM/CJS compatibility
+        const baileys = await import('@whiskeysockets/baileys');
+        
+        // Handle different export styles
+        makeWASocket = baileys.default?.default || baileys.default || baileys.makeWASocket;
+        useMultiFileAuthState = baileys.useMultiFileAuthState;
+        DisconnectReason = baileys.DisconnectReason;
+        downloadMediaMessage = baileys.downloadMediaMessage;
+        
+        // Log what we found
+        log('📦', `makeWASocket: ${typeof makeWASocket}`);
+        log('📦', `useMultiFileAuthState: ${typeof useMultiFileAuthState}`);
+        log('📦', `DisconnectReason: ${typeof DisconnectReason}`);
+        log('📦', `downloadMediaMessage: ${typeof downloadMediaMessage}`);
+        
+        // Validate we have what we need
+        if (typeof makeWASocket !== 'function') {
+            throw new Error(`makeWASocket is ${typeof makeWASocket}, expected function`);
+        }
+        if (typeof useMultiFileAuthState !== 'function') {
+            throw new Error(`useMultiFileAuthState is ${typeof useMultiFileAuthState}, expected function`);
+        }
+        
+        log('✅', 'Baileys library loaded successfully!');
+        return true;
+        
+    } catch (error) {
+        log('❌', `Failed to load Baileys: ${error.message}`);
+        lastError = error.message;
+        botStatus = 'Failed to load library';
+        throw error;
+    }
+}
+
 // ============== WHATSAPP BOT ==============
 async function startBot() {
-    log('🚀', 'Starting WhatsApp Bot...');
-    
-    const { state, saveCreds } = await useMultiFileAuthState('auth_session');
-    
-    sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true,
-        logger: pino({ level: 'silent' }),
-        browser: ['Patient Bot', 'Chrome', '120.0.0']
-    });
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+    try {
+        botStatus = 'Initializing...';
+        log('🚀', 'Starting WhatsApp Bot...');
         
-        if (qr) {
-            try {
-                qrCodeDataURL = await QRCode.toDataURL(qr, {
-                    width: 300,
-                    margin: 2,
-                    color: {
-                        dark: '#128C7E',
-                        light: '#FFFFFF'
-                    }
-                });
-                isConnected = false;
-                log('📱', 'QR Code generated - open web page to scan');
-            } catch (err) {
-                log('❌', `QR generation error: ${err.message}`);
-            }
+        // Load baileys if not loaded
+        if (!makeWASocket) {
+            await loadBaileys();
         }
         
-        if (connection === 'close') {
-            isConnected = false;
-            qrCodeDataURL = null;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        botStatus = 'Loading auth state...';
+        const { state, saveCreds } = await useMultiFileAuthState('auth_session');
+        
+        botStatus = 'Creating connection...';
+        log('🔌', 'Creating WhatsApp connection...');
+        
+        sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: true,
+            logger: pino({ level: 'silent' }),
+            browser: ['Patient Bot', 'Chrome', '120.0.0']
+        });
+        
+        botStatus = 'Waiting for QR code...';
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
             
-            log('❌', `Connection closed. Code: ${statusCode}`);
+            log('🔄', `Connection update: ${JSON.stringify({ connection, hasQR: !!qr })}`);
             
-            if (shouldReconnect) {
-                log('🔄', 'Reconnecting in 5 seconds...');
-                setTimeout(startBot, 5000);
-            } else {
-                log('🚪', 'Logged out. Clearing session...');
+            if (qr) {
                 try {
-                    fs.rmSync('auth_session', { recursive: true, force: true });
-                } catch (e) {}
-                setTimeout(startBot, 5000);
+                    botStatus = 'QR Code ready';
+                    qrCodeDataURL = await QRCode.toDataURL(qr, {
+                        width: 300,
+                        margin: 2,
+                        color: {
+                            dark: '#128C7E',
+                            light: '#FFFFFF'
+                        }
+                    });
+                    isConnected = false;
+                    lastError = null;
+                    log('📱', 'QR Code generated - open web page to scan');
+                } catch (err) {
+                    log('❌', `QR generation error: ${err.message}`);
+                    lastError = `QR Error: ${err.message}`;
+                }
             }
-        } else if (connection === 'open') {
-            isConnected = true;
-            qrCodeDataURL = null;
-            log('✅', 'CONNECTED TO WHATSAPP!');
-            log('👀', 'Listening for messages in groups...');
-        }
-    });
+            
+            if (connection === 'close') {
+                isConnected = false;
+                qrCodeDataURL = null;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason?.loggedOut;
+                
+                botStatus = `Disconnected (${statusCode})`;
+                log('❌', `Connection closed. Code: ${statusCode}`);
+                
+                if (shouldReconnect) {
+                    log('🔄', 'Reconnecting in 5 seconds...');
+                    botStatus = 'Reconnecting...';
+                    setTimeout(startBot, 5000);
+                } else {
+                    log('🚪', 'Logged out. Clearing session...');
+                    botStatus = 'Logged out, restarting...';
+                    try {
+                        fs.rmSync('auth_session', { recursive: true, force: true });
+                    } catch (e) {}
+                    setTimeout(startBot, 5000);
+                }
+            } else if (connection === 'open') {
+                isConnected = true;
+                qrCodeDataURL = null;
+                lastError = null;
+                botStatus = 'Connected';
+                log('✅', 'CONNECTED TO WHATSAPP!');
+                log('👀', 'Listening for messages in groups...');
+            }
+        });
 
-    sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        for (const msg of messages) {
-            if (msg.key.fromMe) continue;
-            if (!msg.message) continue;
-            await handleMessage(sock, msg);
-        }
-    });
+        sock.ev.on('messages.upsert', async ({ messages }) => {
+            for (const msg of messages) {
+                if (msg.key.fromMe) continue;
+                if (!msg.message) continue;
+                await handleMessage(sock, msg);
+            }
+        });
+        
+    } catch (error) {
+        log('💥', `StartBot Error: ${error.message}`);
+        console.error(error);
+        lastError = error.message;
+        botStatus = 'Error - retrying...';
+        setTimeout(startBot, 10000);
+    }
 }
 
 // ============== MESSAGE HANDLER ==============
@@ -452,6 +542,20 @@ async function handleMessage(sock, msg) {
 }
 
 // ============== GEMINI PROCESSING ==============
+// Gemini setup with system instruction
+let model;
+try {
+    const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
+    model = genAI.getGenerativeModel({ 
+        model: CONFIG.GEMINI_MODEL,
+        systemInstruction: CONFIG.SYSTEM_INSTRUCTION
+    });
+    log('✅', 'Gemini AI initialized');
+} catch (error) {
+    log('❌', `Gemini init error: ${error.message}`);
+    lastError = `Gemini: ${error.message}`;
+}
+
 async function processPatientImages(sock, chatId, patientIdentifier, images) {
     try {
         log('🤖', `Sending ${images.length} images to Gemini AI...`);
@@ -533,9 +637,7 @@ console.log('');
 
 log('🏁', 'Initializing...');
 log('🤖', `Model: ${CONFIG.GEMINI_MODEL}`);
+log('🔑', `Gemini API Key: ${CONFIG.GEMINI_API_KEY ? 'Set (' + CONFIG.GEMINI_API_KEY.substring(0,10) + '...)' : 'NOT SET!'}`);
 
-startBot().catch(err => {
-    log('💥', `Fatal: ${err.message}`);
-    console.error(err);
-    setTimeout(startBot, 10000);
-});
+// Start the bot
+startBot();
