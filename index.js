@@ -1,28 +1,77 @@
-const { 
-    makeWASocket, 
+import makeWASocket, { 
     useMultiFileAuthState, 
     DisconnectReason,
     downloadMediaMessage 
-} = require('@whiskeysockets/baileys');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const pino = require('pino');
-const qrcode = require('qrcode-terminal');
-const express = require('express');
-const fs = require('fs');
+} from '@whiskeysockets/baileys';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import pino from 'pino';
+import QRCode from 'qrcode';
+import express from 'express';
+import fs from 'fs';
 
 // ============== CONFIGURATION ==============
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+    
+    // Using the newest Gemini model
+    GEMINI_MODEL: 'gemini-3-flash-preview',
+    
+    // Time to wait for patient name after images (2 minutes)
     IMAGE_TIMEOUT_MS: 120000,
+    
+    // Send results back to WhatsApp
     SEND_TO_WHATSAPP: true,
-    ANALYSIS_PROMPT: `You are a medical image analysis assistant.
+    
+    // Your exact system instruction
+    SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded pictures. Your task is to analyze that text to create a concise and comprehensive "Clinical Profile".
 
-Analyze these medical images and provide:
-1. Key observations from each image
-2. Overall summary of findings
-3. Any notable patterns or concerns
+IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT
 
-Be thorough but concise. Format your response clearly with sections.`
+YOUR RESPONSE MUST BE BASED SOLELY ON THE PROVIDED TRANSCRIPTIONS.
+
+Follow these strict instructions:
+
+Analyze All Transcriptions: Meticulously examine all provided text. This may include prior medical scan reports (like USG, CT, MRI), clinical notes, or other relevant documents.
+
+Extract Key Information: From the text, identify and extract all pertinent information, such as:
+
+Scan types (e.g., USG, CT Brain).
+
+Dates of scans or documents.
+
+Key findings, measurements, or impressions from reports.
+
+Relevant clinical history mentioned in notes.
+
+Synthesize into a Clinical Profile:
+
+Combine all extracted information into a single, cohesive paragraph. This represents a 100% recreation of the relevant clinical details from the provided text.
+
+If there are repeated or vague findings across multiple documents, synthesize them into a single, concise statement.
+
+Frame sentences properly to be concise, but you MUST NOT omit any important clinical details. Prioritize completeness of clinical information over extreme brevity.
+
+You MUST strictly exclude any mention of the patient's name, age, or gender.
+
+If multiple dated scan reports are present, you MUST arrange their summaries chronologically in ascending order based on their dates.
+
+If a date is not available for a scan, refer to it as "Previous [Scan Type]...".
+
+Formatting:
+
+The final output MUST be a single paragraph.
+
+This paragraph MUST start with "Clinical Profile:" and the entire content (including the prefix) must be wrapped in single asterisks. For example: "*Clinical Profile: Previous USG dated 01/01/2023 showed mild hepatomegaly. Patient also has a H/o hypertension as noted in the clinical sheet.*"
+
+Output:
+
+Do not output the raw transcribed text.
+
+Do not output JSON or Markdown code blocks.
+
+Return ONLY the single formatted paragraph described above.
+
+IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT`
 };
 
 // ============== SETUP ==============
@@ -30,10 +79,15 @@ let imageBuffer = [];
 let bufferTimeout = null;
 let sock = null;
 let isConnected = false;
-let qrCodeData = null;
+let qrCodeDataURL = null;
+let processedCount = 0;
 
+// Gemini setup with system instruction
 const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+const model = genAI.getGenerativeModel({ 
+    model: CONFIG.GEMINI_MODEL,
+    systemInstruction: CONFIG.SYSTEM_INSTRUCTION
+});
 
 function log(emoji, message) {
     const time = new Date().toLocaleTimeString();
@@ -51,76 +105,132 @@ app.get('/', (req, res) => {
     <head>
         <title>WhatsApp Patient Bot</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta http-equiv="refresh" content="10">
+        <meta http-equiv="refresh" content="5">
         <style>
+            * { box-sizing: border-box; }
             body {
-                font-family: Arial, sans-serif;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                 display: flex;
                 justify-content: center;
                 align-items: center;
                 min-height: 100vh;
                 margin: 0;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
                 color: white;
                 padding: 20px;
-                box-sizing: border-box;
             }
             .container {
                 text-align: center;
-                background: rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.15);
                 padding: 30px;
                 border-radius: 20px;
                 backdrop-filter: blur(10px);
-                max-width: 400px;
+                max-width: 450px;
                 width: 100%;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
             }
-            h1 { margin-bottom: 10px; }
+            h1 { 
+                margin: 0 0 10px 0; 
+                font-size: 24px;
+            }
+            .subtitle {
+                opacity: 0.9;
+                margin-bottom: 20px;
+                font-size: 14px;
+            }
+            .model-badge {
+                background: rgba(255,255,255,0.2);
+                padding: 5px 12px;
+                border-radius: 20px;
+                font-size: 11px;
+                display: inline-block;
+                margin-bottom: 15px;
+            }
             .status {
-                padding: 15px;
-                border-radius: 10px;
+                padding: 15px 20px;
+                border-radius: 12px;
                 margin: 20px 0;
-                font-size: 18px;
+                font-size: 16px;
+                font-weight: 600;
             }
-            .connected { background: #4CAF50; }
-            .waiting { background: #FF9800; }
+            .connected { 
+                background: #4CAF50; 
+                animation: pulse 2s infinite;
+            }
+            .waiting { 
+                background: rgba(255,255,255,0.2); 
+            }
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.8; }
+            }
             .qr-container {
                 background: white;
-                padding: 20px;
-                border-radius: 10px;
+                padding: 15px;
+                border-radius: 15px;
                 display: inline-block;
                 margin: 20px 0;
+                box-shadow: 0 5px 20px rgba(0,0,0,0.1);
             }
-            .qr-code {
-                font-family: monospace;
-                font-size: 4px;
-                line-height: 4px;
-                color: black;
-                white-space: pre;
+            .qr-container img {
+                display: block;
+                max-width: 250px;
+                width: 100%;
             }
             .instructions {
                 text-align: left;
                 background: rgba(0,0,0,0.2);
-                padding: 15px;
-                border-radius: 10px;
+                padding: 20px;
+                border-radius: 12px;
                 margin-top: 20px;
             }
+            .instructions h3 {
+                margin: 0 0 15px 0;
+                font-size: 16px;
+            }
             .instructions ol {
-                margin: 10px 0;
+                margin: 0;
                 padding-left: 20px;
             }
             .instructions li {
-                margin: 8px 0;
+                margin: 10px 0;
+                font-size: 14px;
+                line-height: 1.5;
             }
             .refresh-note {
                 font-size: 12px;
-                opacity: 0.8;
+                opacity: 0.7;
                 margin-top: 15px;
+            }
+            .stats {
+                display: flex;
+                justify-content: center;
+                gap: 15px;
+                margin-top: 20px;
+                flex-wrap: wrap;
+            }
+            .stat {
+                background: rgba(255,255,255,0.1);
+                padding: 10px 15px;
+                border-radius: 10px;
+                min-width: 80px;
+            }
+            .stat-value {
+                font-size: 22px;
+                font-weight: bold;
+            }
+            .stat-label {
+                font-size: 10px;
+                opacity: 0.8;
+                text-transform: uppercase;
             }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>📱 WhatsApp Patient Bot</h1>
+            <p class="subtitle">Medical Image Clinical Profile Generator</p>
+            <div class="model-badge">🤖 ${CONFIG.GEMINI_MODEL}</div>
     `;
     
     if (isConnected) {
@@ -128,42 +238,55 @@ app.get('/', (req, res) => {
             <div class="status connected">
                 ✅ CONNECTED & RUNNING
             </div>
-            <p>The bot is actively monitoring your WhatsApp groups.</p>
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value">24/7</div>
+                    <div class="stat-label">Uptime</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">${imageBuffer.length}</div>
+                    <div class="stat-label">Buffered</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">${processedCount}</div>
+                    <div class="stat-label">Processed</div>
+                </div>
+            </div>
             <div class="instructions">
-                <strong>How to use:</strong>
+                <h3>✨ How to use:</h3>
                 <ol>
-                    <li>Send images to any WhatsApp group</li>
-                    <li>Then send patient name as text</li>
-                    <li>Bot will analyze and reply!</li>
+                    <li>Send patient's medical report images to any WhatsApp group</li>
+                    <li>Then send patient identifier as text (e.g., "Patient 1" or any name)</li>
+                    <li>Bot will generate Clinical Profile and reply!</li>
                 </ol>
             </div>
         `;
-    } else if (qrCodeData) {
+    } else if (qrCodeDataURL) {
         html += `
             <div class="status waiting">
-                ⏳ WAITING FOR QR SCAN
+                📲 SCAN QR CODE TO CONNECT
             </div>
             <div class="qr-container">
-                <div class="qr-code">${qrCodeData}</div>
+                <img src="${qrCodeDataURL}" alt="QR Code">
             </div>
             <div class="instructions">
-                <strong>To connect:</strong>
+                <h3>📋 To connect WhatsApp:</h3>
                 <ol>
-                    <li>Open WhatsApp on your phone</li>
-                    <li>Tap ⋮ Menu → Linked Devices</li>
-                    <li>Tap "Link a Device"</li>
-                    <li>Scan the QR code above</li>
+                    <li>Open <strong>WhatsApp</strong> on your phone</li>
+                    <li>Tap <strong>⋮ Menu</strong> (3 dots) → <strong>Linked Devices</strong></li>
+                    <li>Tap <strong>"Link a Device"</strong></li>
+                    <li>Point camera at QR code above</li>
                 </ol>
             </div>
-            <p class="refresh-note">Page refreshes every 10 seconds</p>
+            <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
         `;
     } else {
         html += `
             <div class="status waiting">
-                ⏳ STARTING...
+                ⏳ INITIALIZING...
             </div>
-            <p>Please wait, QR code loading...</p>
-            <p class="refresh-note">Page refreshes every 10 seconds</p>
+            <p>Please wait, generating QR code...</p>
+            <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
         `;
     }
     
@@ -180,12 +303,16 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'running',
         connected: isConnected,
+        model: CONFIG.GEMINI_MODEL,
+        bufferedImages: imageBuffer.length,
+        processedCount: processedCount,
         timestamp: new Date().toISOString()
     });
 });
 
 app.listen(PORT, () => {
     log('🌐', `Web server running on port ${PORT}`);
+    log('🤖', `Using Gemini model: ${CONFIG.GEMINI_MODEL}`);
 });
 
 // ============== WHATSAPP BOT ==============
@@ -194,7 +321,7 @@ async function startBot() {
     
     const { state, saveCreds } = await useMultiFileAuthState('auth_session');
     
-    sock = makeWASocket({
+    sock = makeWASocket.default({
         auth: state,
         printQRInTerminal: true,
         logger: pino({ level: 'silent' }),
@@ -205,16 +332,25 @@ async function startBot() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            qrCodeData = generateTextQR(qr);
-            isConnected = false;
-            log('📱', 'QR Code generated - check web page or console');
-            console.log('\n--- SCAN THIS QR CODE ---\n');
-            qrcode.generate(qr, { small: true });
-            console.log('\n--- OR OPEN WEB PAGE ---\n');
+            try {
+                qrCodeDataURL = await QRCode.toDataURL(qr, {
+                    width: 300,
+                    margin: 2,
+                    color: {
+                        dark: '#128C7E',
+                        light: '#FFFFFF'
+                    }
+                });
+                isConnected = false;
+                log('📱', 'QR Code generated - open web page to scan');
+            } catch (err) {
+                log('❌', `QR generation error: ${err.message}`);
+            }
         }
         
         if (connection === 'close') {
             isConnected = false;
+            qrCodeDataURL = null;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
@@ -232,7 +368,7 @@ async function startBot() {
             }
         } else if (connection === 'open') {
             isConnected = true;
-            qrCodeData = null;
+            qrCodeDataURL = null;
             log('✅', 'CONNECTED TO WHATSAPP!');
             log('👀', 'Listening for messages in groups...');
         }
@@ -249,29 +385,16 @@ async function startBot() {
     });
 }
 
-function generateTextQR(qrString) {
-    const QRCode = require('qrcode-terminal');
-    let qrText = '';
-    
-    const originalLog = console.log;
-    console.log = (text) => { qrText += text + '\n'; };
-    
-    QRCode.generate(qrString, { small: true }, (qr) => {
-        qrText = qr;
-    });
-    
-    console.log = originalLog;
-    
-    return qrText.replace(/\n/g, '<br>').replace(/ /g, '&nbsp;');
-}
-
+// ============== MESSAGE HANDLER ==============
 async function handleMessage(sock, msg) {
     const chatId = msg.key.remoteJid;
     
+    // Only process group messages
     if (!chatId.endsWith('@g.us')) return;
     
     const messageType = Object.keys(msg.message)[0];
     
+    // Handle images
     if (messageType === 'imageMessage') {
         log('📷', `Image received`);
         
@@ -300,16 +423,17 @@ async function handleMessage(sock, msg) {
             log('❌', `Download error: ${error.message}`);
         }
     }
+    // Handle text (patient identifier)
     else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
         const text = msg.message.conversation || 
                      msg.message.extendedTextMessage?.text || '';
         
         if (text && text.trim() && imageBuffer.length > 0) {
-            const patientName = text.trim();
+            const patientIdentifier = text.trim();
             const groupImages = imageBuffer.filter(img => img.groupId === chatId);
             
             if (groupImages.length > 0) {
-                log('👤', `Patient: "${patientName}"`);
+                log('👤', `Patient ID: "${patientIdentifier}"`);
                 log('🔄', `Processing ${groupImages.length} images...`);
                 
                 if (bufferTimeout) {
@@ -320,20 +444,23 @@ async function handleMessage(sock, msg) {
                 const imagesToProcess = [...groupImages];
                 imageBuffer = imageBuffer.filter(img => img.groupId !== chatId);
                 
-                await processPatientImages(sock, chatId, patientName, imagesToProcess);
+                await processPatientImages(sock, chatId, patientIdentifier, imagesToProcess);
             }
         }
     }
 }
 
-async function processPatientImages(sock, chatId, patientName, images) {
+// ============== GEMINI PROCESSING ==============
+async function processPatientImages(sock, chatId, patientIdentifier, images) {
     try {
-        log('🤖', `Sending to Gemini AI...`);
+        log('🤖', `Sending ${images.length} images to Gemini AI...`);
         
+        // Send processing message
         await sock.sendMessage(chatId, { 
-            text: `⏳ Analyzing ${images.length} image(s) for *${patientName}*...\n\nPlease wait...` 
+            text: `⏳ Processing ${images.length} image(s) for *${patientIdentifier}*...\n\n_Generating Clinical Profile..._` 
         });
         
+        // Prepare image parts for Gemini
         const imageParts = images.map(img => ({
             inlineData: {
                 data: img.data,
@@ -341,38 +468,42 @@ async function processPatientImages(sock, chatId, patientName, images) {
             }
         }));
         
-        const fullPrompt = `
-Patient Name: ${patientName}
-Number of Images: ${images.length}
-Date/Time: ${new Date().toLocaleString()}
-
-${CONFIG.ANALYSIS_PROMPT}
-        `.trim();
+        // Simple prompt - system instruction handles the rest
+        const userPrompt = `Analyze these ${images.length} medical document image(s) and generate the Clinical Profile as per your instructions.`;
         
-        const result = await model.generateContent([fullPrompt, ...imageParts]);
+        // Call Gemini API
+        const result = await model.generateContent([userPrompt, ...imageParts]);
         const response = await result.response;
-        const analysisText = response.text();
+        const clinicalProfile = response.text();
         
-        log('✅', `Analysis complete!`);
+        log('✅', `Clinical Profile generated!`);
+        processedCount++;
         
-        console.log('\n' + '═'.repeat(50));
-        console.log(`📋 ${patientName}`);
-        console.log('═'.repeat(50));
-        console.log(analysisText);
-        console.log('═'.repeat(50) + '\n');
+        // Log to console
+        console.log('\n' + '═'.repeat(60));
+        console.log(`📋 Patient: ${patientIdentifier}`);
+        console.log(`📸 Images: ${images.length}`);
+        console.log(`⏰ Time: ${new Date().toLocaleString()}`);
+        console.log('═'.repeat(60));
+        console.log(clinicalProfile);
+        console.log('═'.repeat(60) + '\n');
         
+        // Send to WhatsApp
         if (CONFIG.SEND_TO_WHATSAPP) {
-            const maxLength = 4000;
-            const header = `📋 *Analysis: ${patientName}*\n📸 Images: ${images.length}\n${'─'.repeat(25)}\n\n`;
+            // Create header
+            const header = `📋 *Report for: ${patientIdentifier}*\n📸 _${images.length} image(s) analyzed_\n${'─'.repeat(30)}\n\n`;
             
-            if (analysisText.length + header.length <= maxLength) {
-                await sock.sendMessage(chatId, { text: header + analysisText });
+            const maxLength = 4000;
+            
+            if (clinicalProfile.length + header.length <= maxLength) {
+                await sock.sendMessage(chatId, { text: header + clinicalProfile });
             } else {
+                // Split long messages
                 await sock.sendMessage(chatId, { 
-                    text: header + analysisText.substring(0, maxLength - header.length - 20) + '\n\n_(continued...)_'
+                    text: header + clinicalProfile.substring(0, maxLength - header.length - 20) + '\n\n_(continued...)_'
                 });
                 
-                let remaining = analysisText.substring(maxLength - header.length - 20);
+                let remaining = clinicalProfile.substring(maxLength - header.length - 20);
                 while (remaining.length > 0) {
                     await new Promise(r => setTimeout(r, 1000));
                     const chunk = remaining.substring(0, maxLength);
@@ -381,20 +512,30 @@ ${CONFIG.ANALYSIS_PROMPT}
                 }
             }
             
-            log('📤', 'Sent to WhatsApp!');
+            log('📤', 'Clinical Profile sent to WhatsApp!');
         }
         
     } catch (error) {
-        log('❌', `Error: ${error.message}`);
+        log('❌', `Gemini Error: ${error.message}`);
+        console.error(error);
         
+        // Send error message
         await sock.sendMessage(chatId, { 
-            text: `❌ Error analyzing *${patientName}*\n\n${error.message}` 
+            text: `❌ Error processing *${patientIdentifier}*\n\n_${error.message}_\n\nPlease try again.` 
         });
     }
 }
 
 // ============== START ==============
+console.log('');
+console.log('╔════════════════════════════════════════════════════════╗');
+console.log('║     WhatsApp Patient Bot - Clinical Profile Generator  ║');
+console.log('╚════════════════════════════════════════════════════════╝');
+console.log('');
+
 log('🏁', 'Initializing...');
+log('🤖', `Model: ${CONFIG.GEMINI_MODEL}`);
+
 startBot().catch(err => {
     log('💥', `Fatal: ${err.message}`);
     console.error(err);
