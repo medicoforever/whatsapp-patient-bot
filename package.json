@@ -1,6 +1,7 @@
 {
   "name": "whatsapp-patient-bot",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,7 +10,7 @@
     "@google/generative-ai": "^0.21.0",
     "@whiskeysockets/baileys": "^6.7.9",
     "pino": "^9.5.0",
-    "qrcode-terminal": "^0.12.0",
+    "qrcode": "^1.5.3",
     "express": "^4.18.2"
   },
   "engines": {
