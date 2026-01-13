@@ -3,21 +3,19 @@ import pino from 'pino';
 import QRCode from 'qrcode';
 import express from 'express';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // ============== CONFIGURATION ==============
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    
-    // Fixed: Use valid Gemini model name
     GEMINI_MODEL: 'gemini-3-flash-preview',
-    
-    // Time to wait for patient name after images (2 minutes)
     IMAGE_TIMEOUT_MS: 120000,
-    
-    // Send results back to WhatsApp
     SEND_TO_WHATSAPP: true,
     
-    // Your exact system instruction
     SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded pictures. Your task is to analyze that text to create a concise and comprehensive "Clinical Profile".
 
 IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT
@@ -79,15 +77,14 @@ let processedCount = 0;
 let botStatus = 'Starting...';
 let lastError = null;
 
-// Baileys imports (will be loaded dynamically)
-let makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage;
+let makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion;
 
 function log(emoji, message) {
     const time = new Date().toLocaleTimeString();
     console.log(`[${time}] ${emoji} ${message}`);
 }
 
-// ============== WEB SERVER FOR QR CODE ==============
+// ============== WEB SERVER ==============
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -122,15 +119,8 @@ app.get('/', (req, res) => {
                 width: 100%;
                 box-shadow: 0 10px 40px rgba(0,0,0,0.2);
             }
-            h1 { 
-                margin: 0 0 10px 0; 
-                font-size: 24px;
-            }
-            .subtitle {
-                opacity: 0.9;
-                margin-bottom: 20px;
-                font-size: 14px;
-            }
+            h1 { margin: 0 0 10px 0; font-size: 24px; }
+            .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; }
             .model-badge {
                 background: rgba(255,255,255,0.2);
                 padding: 5px 12px;
@@ -146,16 +136,9 @@ app.get('/', (req, res) => {
                 font-size: 16px;
                 font-weight: 600;
             }
-            .connected { 
-                background: #4CAF50; 
-                animation: pulse 2s infinite;
-            }
-            .waiting { 
-                background: rgba(255,255,255,0.2); 
-            }
-            .error {
-                background: #f44336;
-            }
+            .connected { background: #4CAF50; animation: pulse 2s infinite; }
+            .waiting { background: rgba(255,255,255,0.2); }
+            .error { background: #f44336; }
             @keyframes pulse {
                 0%, 100% { opacity: 1; }
                 50% { opacity: 0.8; }
@@ -180,24 +163,10 @@ app.get('/', (req, res) => {
                 border-radius: 12px;
                 margin-top: 20px;
             }
-            .instructions h3 {
-                margin: 0 0 15px 0;
-                font-size: 16px;
-            }
-            .instructions ol {
-                margin: 0;
-                padding-left: 20px;
-            }
-            .instructions li {
-                margin: 10px 0;
-                font-size: 14px;
-                line-height: 1.5;
-            }
-            .refresh-note {
-                font-size: 12px;
-                opacity: 0.7;
-                margin-top: 15px;
-            }
+            .instructions h3 { margin: 0 0 15px 0; font-size: 16px; }
+            .instructions ol { margin: 0; padding-left: 20px; }
+            .instructions li { margin: 10px 0; font-size: 14px; line-height: 1.5; }
+            .refresh-note { font-size: 12px; opacity: 0.7; margin-top: 15px; }
             .stats {
                 display: flex;
                 justify-content: center;
@@ -211,15 +180,8 @@ app.get('/', (req, res) => {
                 border-radius: 10px;
                 min-width: 80px;
             }
-            .stat-value {
-                font-size: 22px;
-                font-weight: bold;
-            }
-            .stat-label {
-                font-size: 10px;
-                opacity: 0.8;
-                text-transform: uppercase;
-            }
+            .stat-value { font-size: 22px; font-weight: bold; }
+            .stat-label { font-size: 10px; opacity: 0.8; text-transform: uppercase; }
             .error-box {
                 background: rgba(255,0,0,0.2);
                 border: 1px solid rgba(255,255,255,0.3);
@@ -228,7 +190,7 @@ app.get('/', (req, res) => {
                 margin-top: 15px;
                 text-align: left;
                 font-size: 12px;
-                word-break: break-all;
+                word-break: break-word;
             }
         </style>
     </head>
@@ -241,45 +203,30 @@ app.get('/', (req, res) => {
     
     if (isConnected) {
         html += `
-            <div class="status connected">
-                ✅ CONNECTED & RUNNING
-            </div>
+            <div class="status connected">✅ CONNECTED & RUNNING</div>
             <div class="stats">
-                <div class="stat">
-                    <div class="stat-value">24/7</div>
-                    <div class="stat-label">Uptime</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">${imageBuffer.length}</div>
-                    <div class="stat-label">Buffered</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">${processedCount}</div>
-                    <div class="stat-label">Processed</div>
-                </div>
+                <div class="stat"><div class="stat-value">24/7</div><div class="stat-label">Uptime</div></div>
+                <div class="stat"><div class="stat-value">${imageBuffer.length}</div><div class="stat-label">Buffered</div></div>
+                <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">Processed</div></div>
             </div>
             <div class="instructions">
                 <h3>✨ How to use:</h3>
                 <ol>
                     <li>Send patient's medical report images to any WhatsApp group</li>
-                    <li>Then send patient identifier as text (e.g., "Patient 1" or any name)</li>
+                    <li>Then send patient identifier as text (e.g., "Patient 1")</li>
                     <li>Bot will generate Clinical Profile and reply!</li>
                 </ol>
             </div>
         `;
     } else if (qrCodeDataURL) {
         html += `
-            <div class="status waiting">
-                📲 SCAN QR CODE TO CONNECT
-            </div>
-            <div class="qr-container">
-                <img src="${qrCodeDataURL}" alt="QR Code">
-            </div>
+            <div class="status waiting">📲 SCAN QR CODE TO CONNECT</div>
+            <div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>
             <div class="instructions">
                 <h3>📋 To connect WhatsApp:</h3>
                 <ol>
                     <li>Open <strong>WhatsApp</strong> on your phone</li>
-                    <li>Tap <strong>⋮ Menu</strong> (3 dots) → <strong>Linked Devices</strong></li>
+                    <li>Tap <strong>⋮ Menu</strong> → <strong>Linked Devices</strong></li>
                     <li>Tap <strong>"Link a Device"</strong></li>
                     <li>Point camera at QR code above</li>
                 </ol>
@@ -288,32 +235,23 @@ app.get('/', (req, res) => {
         `;
     } else if (lastError) {
         html += `
-            <div class="status error">
-                ❌ ERROR
-            </div>
+            <div class="status error">❌ ERROR</div>
             <p>Bot encountered an error</p>
             <div class="error-box">
                 <strong>Status:</strong> ${botStatus}<br><br>
                 <strong>Error:</strong> ${lastError}
             </div>
-            <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
+            <p class="refresh-note">⟳ Retrying automatically...</p>
         `;
     } else {
         html += `
-            <div class="status waiting">
-                ⏳ ${botStatus.toUpperCase()}
-            </div>
+            <div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>
             <p>Please wait...</p>
             <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
         `;
     }
     
-    html += `
-        </div>
-    </body>
-    </html>
-    `;
-    
+    html += `</div></body></html>`;
     res.send(html);
 });
 
@@ -341,32 +279,16 @@ async function loadBaileys() {
     log('📦', 'Loading Baileys library...');
     
     try {
-        // Dynamic import to handle the ESM/CJS compatibility
         const baileys = await import('@whiskeysockets/baileys');
         
-        // Handle different export styles
-        makeWASocket = baileys.default?.default || baileys.default || baileys.makeWASocket;
+        makeWASocket = baileys.default || baileys.makeWASocket;
         useMultiFileAuthState = baileys.useMultiFileAuthState;
         DisconnectReason = baileys.DisconnectReason;
         downloadMediaMessage = baileys.downloadMediaMessage;
-        
-        // Log what we found
-        log('📦', `makeWASocket: ${typeof makeWASocket}`);
-        log('📦', `useMultiFileAuthState: ${typeof useMultiFileAuthState}`);
-        log('📦', `DisconnectReason: ${typeof DisconnectReason}`);
-        log('📦', `downloadMediaMessage: ${typeof downloadMediaMessage}`);
-        
-        // Validate we have what we need
-        if (typeof makeWASocket !== 'function') {
-            throw new Error(`makeWASocket is ${typeof makeWASocket}, expected function`);
-        }
-        if (typeof useMultiFileAuthState !== 'function') {
-            throw new Error(`useMultiFileAuthState is ${typeof useMultiFileAuthState}, expected function`);
-        }
+        fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
         
         log('✅', 'Baileys library loaded successfully!');
         return true;
-        
     } catch (error) {
         log('❌', `Failed to load Baileys: ${error.message}`);
         lastError = error.message;
@@ -381,30 +303,46 @@ async function startBot() {
         botStatus = 'Initializing...';
         log('🚀', 'Starting WhatsApp Bot...');
         
-        // Load baileys if not loaded
         if (!makeWASocket) {
             await loadBaileys();
         }
         
+        // Clear old session if exists and having issues
+        const authPath = join(__dirname, 'auth_session');
+        
         botStatus = 'Loading auth state...';
-        const { state, saveCreds } = await useMultiFileAuthState('auth_session');
+        const { state, saveCreds } = await useMultiFileAuthState(authPath);
+        
+        botStatus = 'Fetching latest version...';
+        let version;
+        try {
+            const versionData = await fetchLatestBaileysVersion();
+            version = versionData.version;
+            log('📱', `Using WhatsApp version: ${version.join('.')}`);
+        } catch (e) {
+            log('⚠️', 'Could not fetch version, using defaults');
+            version = [2, 3000, 1015901307];
+        }
         
         botStatus = 'Creating connection...';
         log('🔌', 'Creating WhatsApp connection...');
         
         sock = makeWASocket({
+            version,
             auth: state,
-            printQRInTerminal: true,
             logger: pino({ level: 'silent' }),
-            browser: ['Patient Bot', 'Chrome', '120.0.0']
+            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            markOnlineOnConnect: false,
+            generateHighQualityLinkPreview: true,
+            getMessage: async () => ({ conversation: '' })
         });
         
-        botStatus = 'Waiting for QR code...';
+        botStatus = 'Waiting for connection...';
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
-            log('🔄', `Connection update: ${JSON.stringify({ connection, hasQR: !!qr })}`);
+            log('🔄', `Update: ${connection || 'connecting'} ${qr ? '(QR available)' : ''}`);
             
             if (qr) {
                 try {
@@ -412,14 +350,11 @@ async function startBot() {
                     qrCodeDataURL = await QRCode.toDataURL(qr, {
                         width: 300,
                         margin: 2,
-                        color: {
-                            dark: '#128C7E',
-                            light: '#FFFFFF'
-                        }
+                        color: { dark: '#128C7E', light: '#FFFFFF' }
                     });
                     isConnected = false;
                     lastError = null;
-                    log('📱', 'QR Code generated - open web page to scan');
+                    log('📱', '✅ QR Code generated - Visit web page to scan!');
                 } catch (err) {
                     log('❌', `QR generation error: ${err.message}`);
                     lastError = `QR Error: ${err.message}`;
@@ -430,29 +365,38 @@ async function startBot() {
                 isConnected = false;
                 qrCodeDataURL = null;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason?.loggedOut;
+                const reason = lastDisconnect?.error?.message || 'Unknown';
                 
                 botStatus = `Disconnected (${statusCode})`;
-                log('❌', `Connection closed. Code: ${statusCode}`);
+                lastError = `Code ${statusCode}: ${reason}`;
+                log('❌', `Connection closed: ${statusCode} - ${reason}`);
                 
-                if (shouldReconnect) {
-                    log('🔄', 'Reconnecting in 5 seconds...');
-                    botStatus = 'Reconnecting...';
-                    setTimeout(startBot, 5000);
-                } else {
-                    log('🚪', 'Logged out. Clearing session...');
-                    botStatus = 'Logged out, restarting...';
+                // Handle specific error codes
+                if (statusCode === 401 || statusCode === DisconnectReason?.loggedOut) {
+                    log('🚪', 'Logged out - clearing auth session...');
                     try {
-                        fs.rmSync('auth_session', { recursive: true, force: true });
+                        fs.rmSync(authPath, { recursive: true, force: true });
+                        log('✅', 'Auth cleared');
+                    } catch (e) {
+                        log('⚠️', 'Could not clear auth');
+                    }
+                } else if (statusCode === 405) {
+                    log('⚠️', 'Connection rejected (405) - clearing auth and retrying...');
+                    try {
+                        fs.rmSync(authPath, { recursive: true, force: true });
+                        log('✅', 'Auth cleared due to 405 error');
                     } catch (e) {}
-                    setTimeout(startBot, 5000);
                 }
+                
+                botStatus = 'Reconnecting...';
+                setTimeout(startBot, 5000);
+                
             } else if (connection === 'open') {
                 isConnected = true;
                 qrCodeDataURL = null;
                 lastError = null;
                 botStatus = 'Connected';
-                log('✅', 'CONNECTED TO WHATSAPP!');
+                log('✅', '🎉 CONNECTED TO WHATSAPP!');
                 log('👀', 'Listening for messages in groups...');
             }
         });
@@ -472,6 +416,14 @@ async function startBot() {
         console.error(error);
         lastError = error.message;
         botStatus = 'Error - retrying...';
+        
+        // Clear auth on persistent errors
+        try {
+            const authPath = join(__dirname, 'auth_session');
+            fs.rmSync(authPath, { recursive: true, force: true });
+            log('🗑️', 'Cleared auth due to error');
+        } catch (e) {}
+        
         setTimeout(startBot, 10000);
     }
 }
@@ -479,13 +431,10 @@ async function startBot() {
 // ============== MESSAGE HANDLER ==============
 async function handleMessage(sock, msg) {
     const chatId = msg.key.remoteJid;
-    
-    // Only process group messages
     if (!chatId.endsWith('@g.us')) return;
     
     const messageType = Object.keys(msg.message)[0];
     
-    // Handle images
     if (messageType === 'imageMessage') {
         log('📷', `Image received`);
         
@@ -502,7 +451,6 @@ async function handleMessage(sock, msg) {
             log('📦', `Buffer: ${imageBuffer.length} image(s)`);
             
             if (bufferTimeout) clearTimeout(bufferTimeout);
-            
             bufferTimeout = setTimeout(() => {
                 if (imageBuffer.length > 0) {
                     log('⏰', 'Timeout - clearing buffer');
@@ -514,10 +462,8 @@ async function handleMessage(sock, msg) {
             log('❌', `Download error: ${error.message}`);
         }
     }
-    // Handle text (patient identifier)
     else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
-        const text = msg.message.conversation || 
-                     msg.message.extendedTextMessage?.text || '';
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
         
         if (text && text.trim() && imageBuffer.length > 0) {
             const patientIdentifier = text.trim();
@@ -542,7 +488,6 @@ async function handleMessage(sock, msg) {
 }
 
 // ============== GEMINI PROCESSING ==============
-// Gemini setup with system instruction
 let model;
 try {
     const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
@@ -560,23 +505,16 @@ async function processPatientImages(sock, chatId, patientIdentifier, images) {
     try {
         log('🤖', `Sending ${images.length} images to Gemini AI...`);
         
-        // Send processing message
         await sock.sendMessage(chatId, { 
             text: `⏳ Processing ${images.length} image(s) for *${patientIdentifier}*...\n\n_Generating Clinical Profile..._` 
         });
         
-        // Prepare image parts for Gemini
         const imageParts = images.map(img => ({
-            inlineData: {
-                data: img.data,
-                mimeType: img.mimeType
-            }
+            inlineData: { data: img.data, mimeType: img.mimeType }
         }));
         
-        // Simple prompt - system instruction handles the rest
         const userPrompt = `Analyze these ${images.length} medical document image(s) and generate the Clinical Profile as per your instructions.`;
         
-        // Call Gemini API
         const result = await model.generateContent([userPrompt, ...imageParts]);
         const response = await result.response;
         const clinicalProfile = response.text();
@@ -584,7 +522,6 @@ async function processPatientImages(sock, chatId, patientIdentifier, images) {
         log('✅', `Clinical Profile generated!`);
         processedCount++;
         
-        // Log to console
         console.log('\n' + '═'.repeat(60));
         console.log(`📋 Patient: ${patientIdentifier}`);
         console.log(`📸 Images: ${images.length}`);
@@ -593,14 +530,12 @@ async function processPatientImages(sock, chatId, patientIdentifier, images) {
         console.log(clinicalProfile);
         console.log('═'.repeat(60) + '\n');
         
-        // Send to WhatsApp
         if (CONFIG.SEND_TO_WHATSAPP) {
             const maxLength = 4000;
             
             if (clinicalProfile.length <= maxLength) {
                 await sock.sendMessage(chatId, { text: clinicalProfile });
             } else {
-                // Split long messages
                 await sock.sendMessage(chatId, { 
                     text: clinicalProfile.substring(0, maxLength - 20) + '\n\n_(continued...)_'
                 });
@@ -621,7 +556,6 @@ async function processPatientImages(sock, chatId, patientIdentifier, images) {
         log('❌', `Gemini Error: ${error.message}`);
         console.error(error);
         
-        // Send error message
         await sock.sendMessage(chatId, { 
             text: `❌ Error processing *${patientIdentifier}*\n\n_${error.message}_\n\nPlease try again.` 
         });
@@ -629,15 +563,11 @@ async function processPatientImages(sock, chatId, patientIdentifier, images) {
 }
 
 // ============== START ==============
-console.log('');
-console.log('╔════════════════════════════════════════════════════════╗');
+console.log('\n╔════════════════════════════════════════════════════════╗');
 console.log('║     WhatsApp Patient Bot - Clinical Profile Generator  ║');
-console.log('╚════════════════════════════════════════════════════════╝');
-console.log('');
+console.log('╚════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Initializing...');
 log('🤖', `Model: ${CONFIG.GEMINI_MODEL}`);
-log('🔑', `Gemini API Key: ${CONFIG.GEMINI_API_KEY ? 'Set (' + CONFIG.GEMINI_API_KEY.substring(0,10) + '...)' : 'NOT SET!'}`);
 
-// Start the bot
 startBot();
