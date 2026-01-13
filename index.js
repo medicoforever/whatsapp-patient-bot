@@ -1,5 +1,8 @@
-import pkg from '@whiskeysockets/baileys';
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = pkg;
+import makeWASocket, { 
+    DisconnectReason, 
+    useMultiFileAuthState, 
+    downloadMediaMessage 
+} from '@whiskeysockets/baileys';
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import pino from 'pino';
