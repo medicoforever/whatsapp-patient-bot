@@ -18,23 +18,29 @@ const CONFIG = {
     // Leave empty to see group IDs in logs first
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
     
-    // Time before auto-clearing images (5 minutes)
-    IMAGE_TIMEOUT_MS: 300000,
+    // Time before auto-clearing media (5 minutes)
+    MEDIA_TIMEOUT_MS: 300000,
     
-    // Trigger to process images
+    // Trigger to process media
     TRIGGER_TEXT: '.',
     
-    SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded pictures. Your task is to analyze that text to create a concise and comprehensive "Clinical Profile".
+    // Typing delay range (milliseconds) - simulates human thinking
+    TYPING_DELAY_MIN: 3000,
+    TYPING_DELAY_MAX: 6000,
+    
+    SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded files (images, PDFs, or audio recordings). Your task is to analyze that content to create a concise and comprehensive "Clinical Profile".
 
 IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT
 
-YOUR RESPONSE MUST BE BASED SOLELY ON THE PROVIDED TRANSCRIPTIONS.
+FOR AUDIO FILES: Transcribe the audio content carefully and extract all relevant medical information mentioned.
+
+YOUR RESPONSE MUST BE BASED SOLELY ON THE PROVIDED CONTENT.
 
 Follow these strict instructions:
 
-Analyze All Transcriptions: Meticulously examine all provided text. This may include prior medical scan reports (like USG, CT, MRI), clinical notes, or other relevant documents.
+Analyze All Content: Meticulously examine all provided files - images, PDFs, and audio recordings. This may include prior medical scan reports (like USG, CT, MRI), clinical notes, voice memos, or other relevant documents.
 
-Extract Key Information: From the text, identify and extract all pertinent information, such as:
+Extract Key Information: From the content, identify and extract all pertinent information, such as:
 
 Scan types (e.g., USG, CT Brain).
 
@@ -42,11 +48,11 @@ Dates of scans or documents.
 
 Key findings, measurements, or impressions from reports.
 
-Relevant clinical history mentioned in notes.
+Relevant clinical history mentioned in notes or audio.
 
 Synthesize into a Clinical Profile:
 
-Combine all extracted information into a single, cohesive paragraph. This represents a 100% recreation of the relevant clinical details from the provided text.
+Combine all extracted information into a single, cohesive paragraph. This represents a 100% recreation of the relevant clinical details from the provided content.
 
 If there are repeated or vague findings across multiple documents, synthesize them into a single, concise statement.
 
@@ -76,7 +82,8 @@ IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE
 };
 
 // ============== SETUP ==============
-const chatImageBuffers = new Map();
+// Changed from chatImageBuffers to chatMediaBuffers to handle all media types
+const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
 const discoveredGroups = new Map();
 
@@ -103,14 +110,32 @@ function isAllowedGroup(chatId) {
     return chatId === CONFIG.ALLOWED_GROUP_ID;
 }
 
+// Helper function to get media type label
+function getMediaTypeLabel(type) {
+    switch(type) {
+        case 'image': return '📷 Image';
+        case 'pdf': return '📄 PDF';
+        case 'audio': return '🎵 Audio';
+        case 'voice': return '🎤 Voice';
+        default: return '📎 File';
+    }
+}
+
 // ============== WEB SERVER ==============
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    const imageCount = chatImageBuffers.has(CONFIG.ALLOWED_GROUP_ID) 
-        ? chatImageBuffers.get(CONFIG.ALLOWED_GROUP_ID).length 
-        : 0;
+    let mediaStats = { images: 0, pdfs: 0, audio: 0 };
+    if (chatMediaBuffers.has(CONFIG.ALLOWED_GROUP_ID)) {
+        const media = chatMediaBuffers.get(CONFIG.ALLOWED_GROUP_ID);
+        media.forEach(m => {
+            if (m.type === 'image') mediaStats.images++;
+            else if (m.type === 'pdf') mediaStats.pdfs++;
+            else if (m.type === 'audio' || m.type === 'voice') mediaStats.audio++;
+        });
+    }
+    const totalBuffered = mediaStats.images + mediaStats.pdfs + mediaStats.audio;
     
     let html = `
     <!DOCTYPE html>
@@ -215,16 +240,18 @@ app.get('/', (req, res) => {
             .stats {
                 display: flex;
                 justify-content: center;
-                gap: 15px;
+                gap: 10px;
                 margin-top: 20px;
+                flex-wrap: wrap;
             }
             .stat {
                 background: rgba(255,255,255,0.1);
-                padding: 10px 15px;
+                padding: 10px 12px;
                 border-radius: 10px;
+                min-width: 60px;
             }
-            .stat-value { font-size: 22px; font-weight: bold; }
-            .stat-label { font-size: 10px; opacity: 0.8; }
+            .stat-value { font-size: 20px; font-weight: bold; }
+            .stat-label { font-size: 9px; opacity: 0.8; }
             .configured {
                 background: rgba(76, 175, 80, 0.3);
                 border: 1px solid rgba(76, 175, 80, 0.5);
@@ -239,12 +266,19 @@ app.get('/', (req, res) => {
                 border-radius: 8px;
                 margin: 15px 0;
             }
+            .media-support {
+                background: rgba(0,0,0,0.15);
+                padding: 10px;
+                border-radius: 8px;
+                margin-top: 10px;
+                font-size: 12px;
+            }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>📱 WhatsApp Patient Bot</h1>
-            <p class="subtitle">Medical Image Clinical Profile Generator</p>
+            <p class="subtitle">Medical Image, PDF & Audio Clinical Profile Generator</p>
     `;
     
     if (isConnected) {
@@ -258,14 +292,20 @@ app.get('/', (req, res) => {
                     <code style="font-size:10px">${CONFIG.ALLOWED_GROUP_ID}</code>
                 </div>
                 <div class="stats">
-                    <div class="stat"><div class="stat-value">${imageCount}</div><div class="stat-label">Buffered</div></div>
-                    <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">Processed</div></div>
+                    <div class="stat"><div class="stat-value">${mediaStats.images}</div><div class="stat-label">📷 Images</div></div>
+                    <div class="stat"><div class="stat-value">${mediaStats.pdfs}</div><div class="stat-label">📄 PDFs</div></div>
+                    <div class="stat"><div class="stat-value">${mediaStats.audio}</div><div class="stat-label">🎤 Audio</div></div>
+                    <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
                 </div>
                 <div class="info-box">
                     <h3>✨ Usage:</h3>
-                    <p>1. Send image(s) in the group<br>
+                    <p>1. Send any combination of:<br>
+                    &nbsp;&nbsp;&nbsp;📷 Images, 📄 PDFs, 🎤 Voice notes<br>
                     2. Send <strong>.</strong> to process<br>
                     3. Get Clinical Profile!</p>
+                </div>
+                <div class="media-support">
+                    <strong>Supported:</strong> Images • PDFs • Audio files • Voice messages
                 </div>
             `;
         } else {
@@ -331,11 +371,22 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+    let mediaStats = { images: 0, pdfs: 0, audio: 0 };
+    if (chatMediaBuffers.has(CONFIG.ALLOWED_GROUP_ID)) {
+        const media = chatMediaBuffers.get(CONFIG.ALLOWED_GROUP_ID);
+        media.forEach(m => {
+            if (m.type === 'image') mediaStats.images++;
+            else if (m.type === 'pdf') mediaStats.pdfs++;
+            else if (m.type === 'audio' || m.type === 'voice') mediaStats.audio++;
+        });
+    }
+    
     res.json({ 
         status: 'running',
         connected: isConnected,
         configuredGroup: CONFIG.ALLOWED_GROUP_ID || 'NOT SET',
         discoveredGroups: Object.fromEntries(discoveredGroups),
+        bufferedMedia: mediaStats,
         processedCount,
         timestamp: new Date().toISOString()
     });
@@ -490,41 +541,93 @@ async function handleMessage(sock, msg) {
     const messageType = Object.keys(msg.message)[0];
     const senderName = msg.pushName || 'Unknown';
     
-    // Handle images
+    // Initialize media buffer for this chat if needed
+    if (!chatMediaBuffers.has(chatId)) {
+        chatMediaBuffers.set(chatId, []);
+    }
+    
+    // Handle IMAGES
     if (messageType === 'imageMessage') {
         log('📷', `Image from ${senderName}`);
         
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
             
-            if (!chatImageBuffers.has(chatId)) {
-                chatImageBuffers.set(chatId, []);
-            }
-            
-            chatImageBuffers.get(chatId).push({
+            chatMediaBuffers.get(chatId).push({
+                type: 'image',
                 data: buffer.toString('base64'),
                 mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
                 timestamp: Date.now()
             });
             
-            const count = chatImageBuffers.get(chatId).length;
-            log('📦', `Buffer: ${count} image(s)`);
+            const count = chatMediaBuffers.get(chatId).length;
+            log('📦', `Buffer: ${count} file(s)`);
             
-            // Reset timeout
-            if (chatTimeouts.has(chatId)) {
-                clearTimeout(chatTimeouts.get(chatId));
-            }
-            
-            chatTimeouts.set(chatId, setTimeout(() => {
-                if (chatImageBuffers.has(chatId)) {
-                    log('⏰', 'Auto-clearing images');
-                    chatImageBuffers.delete(chatId);
-                    chatTimeouts.delete(chatId);
-                }
-            }, CONFIG.IMAGE_TIMEOUT_MS));
+            resetMediaTimeout(chatId);
             
         } catch (error) {
-            log('❌', `Error: ${error.message}`);
+            log('❌', `Image error: ${error.message}`);
+        }
+    }
+    // Handle PDFs (documentMessage)
+    else if (messageType === 'documentMessage') {
+        const docMime = msg.message.documentMessage.mimetype || '';
+        const fileName = msg.message.documentMessage.fileName || 'document';
+        
+        // Check if it's a PDF
+        if (docMime === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')) {
+            log('📄', `PDF from ${senderName}: ${fileName}`);
+            
+            try {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                
+                chatMediaBuffers.get(chatId).push({
+                    type: 'pdf',
+                    data: buffer.toString('base64'),
+                    mimeType: 'application/pdf',
+                    fileName: fileName,
+                    timestamp: Date.now()
+                });
+                
+                const count = chatMediaBuffers.get(chatId).length;
+                log('📦', `Buffer: ${count} file(s)`);
+                
+                resetMediaTimeout(chatId);
+                
+            } catch (error) {
+                log('❌', `PDF error: ${error.message}`);
+            }
+        } else {
+            log('📎', `Skipping non-PDF document: ${fileName} (${docMime})`);
+        }
+    }
+    // Handle AUDIO FILES (including voice messages)
+    else if (messageType === 'audioMessage') {
+        const isVoice = msg.message.audioMessage.ptt === true; // ptt = push to talk (voice message)
+        const audioType = isVoice ? 'voice' : 'audio';
+        const emoji = isVoice ? '🎤' : '🎵';
+        
+        log(emoji, `${isVoice ? 'Voice message' : 'Audio file'} from ${senderName}`);
+        
+        try {
+            const buffer = await downloadMediaMessage(msg, 'buffer', {});
+            const mimeType = msg.message.audioMessage.mimetype || 'audio/ogg';
+            
+            chatMediaBuffers.get(chatId).push({
+                type: audioType,
+                data: buffer.toString('base64'),
+                mimeType: mimeType,
+                duration: msg.message.audioMessage.seconds || 0,
+                timestamp: Date.now()
+            });
+            
+            const count = chatMediaBuffers.get(chatId).length;
+            log('📦', `Buffer: ${count} file(s)`);
+            
+            resetMediaTimeout(chatId);
+            
+        } catch (error) {
+            log('❌', `Audio error: ${error.message}`);
         }
     }
     // Handle text
@@ -535,49 +638,74 @@ async function handleMessage(sock, msg) {
         if (text === CONFIG.TRIGGER_TEXT) {
             log('🔔', `Trigger from ${senderName}`);
             
-            // Wait briefly for any concurrent image downloads to complete
+            // Wait briefly for any concurrent media downloads to complete
             await new Promise(r => setTimeout(r, 1500));
             
-            if (chatImageBuffers.has(chatId) && chatImageBuffers.get(chatId).length > 0) {
+            if (chatMediaBuffers.has(chatId) && chatMediaBuffers.get(chatId).length > 0) {
                 if (chatTimeouts.has(chatId)) {
                     clearTimeout(chatTimeouts.get(chatId));
                     chatTimeouts.delete(chatId);
                 }
                 
-                const images = chatImageBuffers.get(chatId);
-                chatImageBuffers.delete(chatId);
+                const mediaFiles = chatMediaBuffers.get(chatId);
+                chatMediaBuffers.delete(chatId);
                 
-                await processImages(sock, chatId, images);
+                await processMedia(sock, chatId, mediaFiles);
             }
         }
         // Help
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
-                text: `🏥 *Clinical Profile Bot*\n\n*Usage:*\n1️⃣ Send medical image(s)\n2️⃣ Send *.* to process\n\n*Commands:*\n• *.* - Process images\n• *clear* - Clear buffer\n• *status* - Check status` 
+                text: `🏥 *Clinical Profile Bot*\n\n*Supported Files:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files\n\n*Usage:*\n1️⃣ Send file(s) - any combination!\n2️⃣ Send *.* to process\n\n*Commands:*\n• *.* - Process all files\n• *clear* - Clear buffer\n• *status* - Check status` 
             });
         }
         // Clear
         else if (text.toLowerCase() === 'clear') {
-            if (chatImageBuffers.has(chatId)) {
-                const count = chatImageBuffers.get(chatId).length;
-                chatImageBuffers.delete(chatId);
+            if (chatMediaBuffers.has(chatId)) {
+                const count = chatMediaBuffers.get(chatId).length;
+                chatMediaBuffers.delete(chatId);
                 if (chatTimeouts.has(chatId)) {
                     clearTimeout(chatTimeouts.get(chatId));
                     chatTimeouts.delete(chatId);
                 }
-                await sock.sendMessage(chatId, { text: `🗑️ Cleared ${count} image(s)` });
+                await sock.sendMessage(chatId, { text: `🗑️ Cleared ${count} file(s)` });
             } else {
-                await sock.sendMessage(chatId, { text: `ℹ️ No images buffered` });
+                await sock.sendMessage(chatId, { text: `ℹ️ No files buffered` });
             }
         }
         // Status
         else if (text.toLowerCase() === 'status') {
-            const count = chatImageBuffers.has(chatId) ? chatImageBuffers.get(chatId).length : 0;
+            let mediaStats = { images: 0, pdfs: 0, audio: 0 };
+            if (chatMediaBuffers.has(chatId)) {
+                const media = chatMediaBuffers.get(chatId);
+                media.forEach(m => {
+                    if (m.type === 'image') mediaStats.images++;
+                    else if (m.type === 'pdf') mediaStats.pdfs++;
+                    else if (m.type === 'audio' || m.type === 'voice') mediaStats.audio++;
+                });
+            }
+            const total = mediaStats.images + mediaStats.pdfs + mediaStats.audio;
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n📷 Buffered: ${count}\n✅ Processed: ${processedCount}` 
+                text: `📊 *Status*\n\n📷 Images: ${mediaStats.images}\n📄 PDFs: ${mediaStats.pdfs}\n🎤 Audio: ${mediaStats.audio}\n━━━━━━━━━━\n📦 Total buffered: ${total}\n✅ Processed: ${processedCount}` 
             });
         }
     }
+}
+
+// Helper function to reset the auto-clear timeout
+function resetMediaTimeout(chatId) {
+    if (chatTimeouts.has(chatId)) {
+        clearTimeout(chatTimeouts.get(chatId));
+    }
+    
+    chatTimeouts.set(chatId, setTimeout(() => {
+        if (chatMediaBuffers.has(chatId)) {
+            const count = chatMediaBuffers.get(chatId).length;
+            log('⏰', `Auto-clearing ${count} file(s) after timeout`);
+            chatMediaBuffers.delete(chatId);
+            chatTimeouts.delete(chatId);
+        }
+    }, CONFIG.MEDIA_TIMEOUT_MS));
 }
 
 // ============== GEMINI ==============
@@ -593,17 +721,37 @@ try {
     log('❌', `Gemini error: ${error.message}`);
 }
 
-async function processImages(sock, chatId, images) {
+async function processMedia(sock, chatId, mediaFiles) {
     try {
-        log('🤖', `Processing ${images.length} images...`);
+        // Count media types
+        const counts = { images: 0, pdfs: 0, audio: 0 };
+        mediaFiles.forEach(m => {
+            if (m.type === 'image') counts.images++;
+            else if (m.type === 'pdf') counts.pdfs++;
+            else if (m.type === 'audio' || m.type === 'voice') counts.audio++;
+        });
         
-        const imageParts = images.map(img => ({
-            inlineData: { data: img.data, mimeType: img.mimeType }
+        log('🤖', `Processing: ${counts.images} image(s), ${counts.pdfs} PDF(s), ${counts.audio} audio file(s)...`);
+        
+        // Build content parts for Gemini
+        const mediaParts = mediaFiles.map(media => ({
+            inlineData: { 
+                data: media.data, 
+                mimeType: media.mimeType 
+            }
         }));
         
+        // Build descriptive prompt
+        let promptParts = [];
+        if (counts.images > 0) promptParts.push(`${counts.images} image(s)`);
+        if (counts.pdfs > 0) promptParts.push(`${counts.pdfs} PDF document(s)`);
+        if (counts.audio > 0) promptParts.push(`${counts.audio} audio/voice recording(s)`);
+        
+        const promptText = `Analyze these ${promptParts.join(', ')} containing medical information and generate the Clinical Profile. For audio files, transcribe the content first, then extract medical information.`;
+        
         const result = await model.generateContent([
-            `Analyze these ${images.length} medical document image(s) and generate the Clinical Profile.`,
-            ...imageParts
+            promptText,
+            ...mediaParts
         ]);
         
         const clinicalProfile = result.response.text();
@@ -613,10 +761,23 @@ async function processImages(sock, chatId, images) {
         
         // Log to console
         console.log('\n' + '═'.repeat(50));
-        console.log(`📸 ${images.length} images | ⏰ ${new Date().toLocaleString()}`);
+        console.log(`📊 ${counts.images} images, ${counts.pdfs} PDFs, ${counts.audio} audio | ⏰ ${new Date().toLocaleString()}`);
         console.log('═'.repeat(50));
         console.log(clinicalProfile);
         console.log('═'.repeat(50) + '\n');
+        
+        // ========== HUMAN-LIKE BEHAVIOR ==========
+        // 1. Tell WhatsApp "I am typing..."
+        await sock.sendPresenceUpdate('composing', chatId);
+        
+        // 2. Wait for a random time (3 to 6 seconds) to simulate thinking
+        const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
+        log('⌨️', `Simulating typing for ${(delay/1000).toFixed(1)}s...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        
+        // 3. Stop typing indicator (optional - sending message stops it automatically)
+        await sock.sendPresenceUpdate('paused', chatId);
+        // ==========================================
         
         // Send response (handle long messages)
         if (clinicalProfile.length <= 4000) {
@@ -624,7 +785,11 @@ async function processImages(sock, chatId, images) {
         } else {
             const chunks = clinicalProfile.match(/.{1,3900}/gs) || [];
             for (let i = 0; i < chunks.length; i++) {
-                if (i > 0) await new Promise(r => setTimeout(r, 1000));
+                if (i > 0) {
+                    // Show typing for subsequent chunks too
+                    await sock.sendPresenceUpdate('composing', chatId);
+                    await new Promise(r => setTimeout(r, 2000));
+                }
                 await sock.sendMessage(chatId, { 
                     text: chunks[i] + (i < chunks.length - 1 ? '\n\n_(continued...)_' : '')
                 });
@@ -635,6 +800,11 @@ async function processImages(sock, chatId, images) {
         
     } catch (error) {
         log('❌', `Error: ${error.message}`);
+        
+        // Still show typing before error message (human-like)
+        await sock.sendPresenceUpdate('composing', chatId);
+        await new Promise(r => setTimeout(r, 1500));
+        
         await sock.sendMessage(chatId, { 
             text: `❌ *Error*\n_${error.message}_\n\nPlease try again.` 
         });
@@ -644,6 +814,8 @@ async function processImages(sock, chatId, images) {
 // ============== START ==============
 console.log('\n╔═══════════════════════════════════════════════════════╗');
 console.log('║      WhatsApp Clinical Profile Bot                    ║');
+console.log('║                                                       ║');
+console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio               ║');
 console.log('║                                                       ║');
 console.log('║  🔒 Works ONLY in ONE specific group                  ║');
 console.log('║  💬 Normal WhatsApp everywhere else                   ║');
