@@ -12,7 +12,7 @@ const __dirname = dirname(__filename);
 // ============== CONFIGURATION ==============
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    GEMINI_MODEL: 'gemini-2.0-flash',
+    GEMINI_MODEL: 'gemini-3-flash-preview',
     
     // SET THIS TO YOUR GROUP ID (from environment variable)
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
