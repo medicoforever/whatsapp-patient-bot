@@ -12,12 +12,16 @@ const __dirname = dirname(__filename);
 // ============== CONFIGURATION ==============
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    GEMINI_MODEL: 'gemini-3-flash-preview',
+    GEMINI_MODEL: 'gemini-2.0-flash-exp',
     
-    // Time to wait before auto-clearing images (5 minutes)
+    // SET THIS TO YOUR GROUP ID (from environment variable)
+    // Leave empty to see group IDs in logs first
+    ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
+    
+    // Time before auto-clearing images (5 minutes)
     IMAGE_TIMEOUT_MS: 300000,
     
-    // Trigger text to process images
+    // Trigger to process images
     TRIGGER_TEXT: '.',
     
     SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded pictures. Your task is to analyze that text to create a concise and comprehensive "Clinical Profile".
@@ -72,9 +76,9 @@ IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE
 };
 
 // ============== SETUP ==============
-// Store images per chat (chatId -> array of images)
 const chatImageBuffers = new Map();
 const chatTimeouts = new Map();
+const discoveredGroups = new Map();
 
 let sock = null;
 let isConnected = false;
@@ -90,12 +94,23 @@ function log(emoji, message) {
     console.log(`[${time}] ${emoji} ${message}`);
 }
 
+// Check if chat is the allowed group
+function isAllowedGroup(chatId) {
+    // If no group is configured, we're in "discovery mode"
+    if (!CONFIG.ALLOWED_GROUP_ID) {
+        return false;
+    }
+    return chatId === CONFIG.ALLOWED_GROUP_ID;
+}
+
 // ============== WEB SERVER ==============
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    const totalBuffered = Array.from(chatImageBuffers.values()).reduce((sum, arr) => sum + arr.length, 0);
+    const imageCount = chatImageBuffers.has(CONFIG.ALLOWED_GROUP_ID) 
+        ? chatImageBuffers.get(CONFIG.ALLOWED_GROUP_ID).length 
+        : 0;
     
     let html = `
     <!DOCTYPE html>
@@ -123,20 +138,12 @@ app.get('/', (req, res) => {
                 padding: 30px;
                 border-radius: 20px;
                 backdrop-filter: blur(10px);
-                max-width: 450px;
+                max-width: 550px;
                 width: 100%;
                 box-shadow: 0 10px 40px rgba(0,0,0,0.2);
             }
             h1 { margin: 0 0 10px 0; font-size: 24px; }
             .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; }
-            .model-badge {
-                background: rgba(255,255,255,0.2);
-                padding: 5px 12px;
-                border-radius: 20px;
-                font-size: 11px;
-                display: inline-block;
-                margin-bottom: 15px;
-            }
             .status {
                 padding: 15px 20px;
                 border-radius: 12px;
@@ -144,69 +151,93 @@ app.get('/', (req, res) => {
                 font-size: 16px;
                 font-weight: 600;
             }
-            .connected { background: #4CAF50; animation: pulse 2s infinite; }
+            .connected { background: #4CAF50; }
             .waiting { background: rgba(255,255,255,0.2); }
-            .error { background: #f44336; }
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.8; }
-            }
+            .warning { background: #FF9800; }
             .qr-container {
                 background: white;
                 padding: 15px;
                 border-radius: 15px;
                 display: inline-block;
                 margin: 20px 0;
-                box-shadow: 0 5px 20px rgba(0,0,0,0.1);
             }
-            .qr-container img {
-                display: block;
-                max-width: 250px;
-                width: 100%;
-            }
-            .instructions {
+            .qr-container img { display: block; max-width: 250px; width: 100%; }
+            .info-box {
                 text-align: left;
                 background: rgba(0,0,0,0.2);
-                padding: 20px;
+                padding: 15px;
                 border-radius: 12px;
-                margin-top: 20px;
+                margin-top: 15px;
+                font-size: 13px;
             }
-            .instructions h3 { margin: 0 0 15px 0; font-size: 16px; }
-            .instructions ol { margin: 0; padding-left: 20px; }
-            .instructions li { margin: 10px 0; font-size: 14px; line-height: 1.5; }
-            .refresh-note { font-size: 12px; opacity: 0.7; margin-top: 15px; }
+            .info-box h3 { margin: 0 0 10px 0; font-size: 15px; }
+            .info-box code {
+                background: rgba(0,0,0,0.3);
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-size: 11px;
+                word-break: break-all;
+            }
+            .group-list {
+                text-align: left;
+                background: rgba(255,255,255,0.1);
+                padding: 15px;
+                border-radius: 12px;
+                margin-top: 15px;
+            }
+            .group-list h4 { margin: 0 0 10px 0; }
+            .group-item {
+                background: rgba(0,0,0,0.2);
+                padding: 10px;
+                border-radius: 8px;
+                margin: 8px 0;
+                font-size: 12px;
+            }
+            .group-item strong { display: block; margin-bottom: 5px; }
+            .group-item code {
+                background: rgba(0,0,0,0.3);
+                padding: 3px 6px;
+                border-radius: 4px;
+                font-size: 10px;
+                word-break: break-all;
+                display: block;
+            }
+            .copy-btn {
+                background: rgba(255,255,255,0.2);
+                border: none;
+                color: white;
+                padding: 3px 8px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 10px;
+                margin-top: 5px;
+            }
             .stats {
                 display: flex;
                 justify-content: center;
                 gap: 15px;
                 margin-top: 20px;
-                flex-wrap: wrap;
             }
             .stat {
                 background: rgba(255,255,255,0.1);
                 padding: 10px 15px;
                 border-radius: 10px;
-                min-width: 80px;
             }
             .stat-value { font-size: 22px; font-weight: bold; }
-            .stat-label { font-size: 10px; opacity: 0.8; text-transform: uppercase; }
-            .error-box {
-                background: rgba(255,0,0,0.2);
-                border: 1px solid rgba(255,255,255,0.3);
-                padding: 15px;
-                border-radius: 10px;
-                margin-top: 15px;
-                text-align: left;
-                font-size: 12px;
-                word-break: break-word;
-            }
-            .trigger-badge {
-                background: rgba(0,0,0,0.3);
-                padding: 8px 15px;
+            .stat-label { font-size: 10px; opacity: 0.8; }
+            .configured {
+                background: rgba(76, 175, 80, 0.3);
+                border: 1px solid rgba(76, 175, 80, 0.5);
+                padding: 10px;
                 border-radius: 8px;
-                font-size: 14px;
-                margin: 10px 0;
-                display: inline-block;
+                margin: 15px 0;
+            }
+            .not-configured {
+                background: rgba(255, 152, 0, 0.3);
+                border: 1px solid rgba(255, 152, 0, 0.5);
+                padding: 10px;
+                border-radius: 8px;
+                margin: 15px 0;
             }
         </style>
     </head>
@@ -214,58 +245,84 @@ app.get('/', (req, res) => {
         <div class="container">
             <h1>📱 WhatsApp Patient Bot</h1>
             <p class="subtitle">Medical Image Clinical Profile Generator</p>
-            <div class="model-badge">🤖 ${CONFIG.GEMINI_MODEL}</div>
     `;
     
     if (isConnected) {
-        html += `
-            <div class="status connected">✅ CONNECTED & RUNNING</div>
-            <div class="trigger-badge">Send <strong>"."</strong> to process images</div>
-            <div class="stats">
-                <div class="stat"><div class="stat-value">${chatImageBuffers.size}</div><div class="stat-label">Active Chats</div></div>
-                <div class="stat"><div class="stat-value">${totalBuffered}</div><div class="stat-label">Buffered Imgs</div></div>
-                <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">Processed</div></div>
-            </div>
-            <div class="instructions">
-                <h3>✨ How to use:</h3>
-                <ol>
-                    <li>Send medical report image(s) to the bot</li>
-                    <li>Send more images if needed</li>
-                    <li>Send <strong>.</strong> (period) when done</li>
-                    <li>Bot generates Clinical Profile! 🎉</li>
-                </ol>
-            </div>
-        `;
+        if (CONFIG.ALLOWED_GROUP_ID) {
+            // Configured - show active status
+            const groupName = discoveredGroups.get(CONFIG.ALLOWED_GROUP_ID) || 'Configured Group';
+            html += `
+                <div class="status connected">✅ ACTIVE IN GROUP</div>
+                <div class="configured">
+                    <strong>🎯 Active Group:</strong> ${groupName}<br>
+                    <code style="font-size:10px">${CONFIG.ALLOWED_GROUP_ID}</code>
+                </div>
+                <div class="stats">
+                    <div class="stat"><div class="stat-value">${imageCount}</div><div class="stat-label">Buffered</div></div>
+                    <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">Processed</div></div>
+                </div>
+                <div class="info-box">
+                    <h3>✨ Usage:</h3>
+                    <p>1. Send image(s) in the group<br>
+                    2. Send <strong>.</strong> to process<br>
+                    3. Get Clinical Profile!</p>
+                </div>
+            `;
+        } else {
+            // Not configured - show discovery mode
+            html += `
+                <div class="status warning">⚠️ DISCOVERY MODE</div>
+                <div class="not-configured">
+                    <strong>No group configured yet!</strong><br>
+                    Send a message in your target group to discover its ID.
+                </div>
+            `;
+            
+            if (discoveredGroups.size > 0) {
+                html += `<div class="group-list"><h4>📋 Discovered Groups (send message to discover):</h4>`;
+                for (const [id, name] of discoveredGroups) {
+                    html += `
+                        <div class="group-item">
+                            <strong>${name}</strong>
+                            <code>${id}</code>
+                            <button class="copy-btn" onclick="navigator.clipboard.writeText('${id}')">📋 Copy ID</button>
+                        </div>
+                    `;
+                }
+                html += `</div>`;
+                
+                html += `
+                    <div class="info-box">
+                        <h3>🔧 Next Steps:</h3>
+                        <p>1. Copy the Group ID above<br>
+                        2. Go to Render Dashboard → Environment<br>
+                        3. Add: <code>ALLOWED_GROUP_ID</code> = (paste ID)<br>
+                        4. Click "Save Changes" and redeploy</p>
+                    </div>
+                `;
+            } else {
+                html += `
+                    <div class="info-box">
+                        <h3>👋 Getting Started:</h3>
+                        <p>Send any message in your target WhatsApp group.<br>
+                        The group ID will appear here.</p>
+                    </div>
+                `;
+            }
+        }
     } else if (qrCodeDataURL) {
         html += `
-            <div class="status waiting">📲 SCAN QR CODE TO CONNECT</div>
+            <div class="status waiting">📲 SCAN QR CODE</div>
             <div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>
-            <div class="instructions">
-                <h3>📋 To connect WhatsApp:</h3>
-                <ol>
-                    <li>Open <strong>WhatsApp</strong> on your phone</li>
-                    <li>Tap <strong>⋮ Menu</strong> → <strong>Linked Devices</strong></li>
-                    <li>Tap <strong>"Link a Device"</strong></li>
-                    <li>Point camera at QR code above</li>
-                </ol>
+            <div class="info-box">
+                <h3>📋 To connect:</h3>
+                <p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device</p>
             </div>
-            <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
-        `;
-    } else if (lastError) {
-        html += `
-            <div class="status error">❌ ERROR</div>
-            <p>Bot encountered an error</p>
-            <div class="error-box">
-                <strong>Status:</strong> ${botStatus}<br><br>
-                <strong>Error:</strong> ${lastError}
-            </div>
-            <p class="refresh-note">⟳ Retrying automatically...</p>
         `;
     } else {
         html += `
             <div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>
             <p>Please wait...</p>
-            <p class="refresh-note">⟳ Page auto-refreshes every 5 seconds</p>
         `;
     }
     
@@ -277,11 +334,9 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'running',
         connected: isConnected,
-        botStatus: botStatus,
-        lastError: lastError,
-        model: CONFIG.GEMINI_MODEL,
-        activeChats: chatImageBuffers.size,
-        processedCount: processedCount,
+        configuredGroup: CONFIG.ALLOWED_GROUP_ID || 'NOT SET',
+        discoveredGroups: Object.fromEntries(discoveredGroups),
+        processedCount,
         timestamp: new Date().toISOString()
     });
 });
@@ -293,7 +348,6 @@ app.listen(PORT, () => {
 // ============== LOAD BAILEYS ==============
 async function loadBaileys() {
     botStatus = 'Loading WhatsApp library...';
-    log('📦', 'Loading Baileys library...');
     
     try {
         const baileys = await import('@whiskeysockets/baileys');
@@ -304,11 +358,10 @@ async function loadBaileys() {
         downloadMediaMessage = baileys.downloadMediaMessage;
         fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
         
-        log('✅', 'Baileys library loaded!');
+        log('✅', 'Baileys loaded!');
         return true;
     } catch (error) {
-        log('❌', `Failed to load Baileys: ${error.message}`);
-        lastError = error.message;
+        log('❌', `Failed: ${error.message}`);
         throw error;
     }
 }
@@ -319,27 +372,20 @@ async function startBot() {
         botStatus = 'Initializing...';
         log('🚀', 'Starting WhatsApp Bot...');
         
-        if (!makeWASocket) {
-            await loadBaileys();
-        }
+        if (!makeWASocket) await loadBaileys();
         
         const authPath = join(__dirname, 'auth_session');
-        
-        botStatus = 'Loading auth state...';
         const { state, saveCreds } = await useMultiFileAuthState(authPath);
         
-        botStatus = 'Fetching WhatsApp version...';
         let version;
         try {
-            const versionData = await fetchLatestBaileysVersion();
-            version = versionData.version;
-            log('📱', `WhatsApp version: ${version.join('.')}`);
+            const v = await fetchLatestBaileysVersion();
+            version = v.version;
         } catch (e) {
             version = [2, 3000, 1015901307];
         }
         
         botStatus = 'Connecting...';
-        log('🔌', 'Creating WhatsApp connection...');
         
         sock = makeWASocket({
             version,
@@ -349,8 +395,6 @@ async function startBot() {
             markOnlineOnConnect: false,
             getMessage: async () => ({ conversation: '' })
         });
-        
-        botStatus = 'Waiting for connection...';
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -359,43 +403,37 @@ async function startBot() {
                 try {
                     botStatus = 'QR Code ready';
                     qrCodeDataURL = await QRCode.toDataURL(qr, {
-                        width: 300,
-                        margin: 2,
+                        width: 300, margin: 2,
                         color: { dark: '#128C7E', light: '#FFFFFF' }
                     });
                     isConnected = false;
-                    lastError = null;
-                    log('📱', '✅ QR Code ready - scan to connect!');
+                    log('📱', 'QR Code ready!');
                 } catch (err) {
-                    lastError = `QR Error: ${err.message}`;
+                    lastError = err.message;
                 }
             }
             
             if (connection === 'close') {
                 isConnected = false;
                 qrCodeDataURL = null;
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const code = lastDisconnect?.error?.output?.statusCode;
                 
-                log('❌', `Disconnected: ${statusCode}`);
-                
-                if (statusCode === 401 || statusCode === 405 || statusCode === DisconnectReason?.loggedOut) {
-                    try {
-                        fs.rmSync(authPath, { recursive: true, force: true });
-                        log('🗑️', 'Auth cleared');
-                    } catch (e) {}
+                if (code === 401 || code === 405 || code === DisconnectReason?.loggedOut) {
+                    try { fs.rmSync(authPath, { recursive: true, force: true }); } catch (e) {}
                 }
                 
-                botStatus = 'Reconnecting...';
                 setTimeout(startBot, 5000);
                 
             } else if (connection === 'open') {
                 isConnected = true;
                 qrCodeDataURL = null;
-                lastError = null;
-                botStatus = 'Connected';
-                log('✅', '🎉 CONNECTED TO WHATSAPP!');
-                log('👀', 'Listening for messages...');
-                log('💡', 'Send images, then send "." to process');
+                log('✅', '🎉 CONNECTED!');
+                
+                if (CONFIG.ALLOWED_GROUP_ID) {
+                    log('🎯', `Bot active ONLY in: ${CONFIG.ALLOWED_GROUP_ID}`);
+                } else {
+                    log('⚠️', 'No group configured! Send a message in target group to get its ID.');
+                }
             }
         });
 
@@ -411,13 +449,6 @@ async function startBot() {
         
     } catch (error) {
         log('💥', `Error: ${error.message}`);
-        lastError = error.message;
-        botStatus = 'Error - retrying...';
-        
-        try {
-            fs.rmSync(join(__dirname, 'auth_session'), { recursive: true, force: true });
-        } catch (e) {}
-        
         setTimeout(startBot, 10000);
     }
 }
@@ -429,98 +460,115 @@ async function handleMessage(sock, msg) {
     // Skip status broadcasts
     if (chatId === 'status@broadcast') return;
     
+    const isGroup = chatId.endsWith('@g.us');
+    
+    // If it's a group, discover/track it
+    if (isGroup && !discoveredGroups.has(chatId)) {
+        try {
+            const metadata = await sock.groupMetadata(chatId);
+            discoveredGroups.set(chatId, metadata.subject);
+            log('📋', `Discovered group: "${metadata.subject}"`);
+            log('📋', `Group ID: ${chatId}`);
+            console.log('\n' + '='.repeat(50));
+            console.log('🎯 TO USE THIS GROUP, ADD THIS ENVIRONMENT VARIABLE:');
+            console.log(`   ALLOWED_GROUP_ID = ${chatId}`);
+            console.log('='.repeat(50) + '\n');
+        } catch (e) {
+            discoveredGroups.set(chatId, 'Unknown Group');
+        }
+    }
+    
+    // ========== KEY LOGIC ==========
+    // If group is NOT configured OR this is NOT the allowed group → IGNORE
+    if (!isAllowedGroup(chatId)) {
+        // Only log group discoveries, completely ignore the message
+        return;
+    }
+    // ===============================
+    
+    // From here, we're in the ALLOWED GROUP only
     const messageType = Object.keys(msg.message)[0];
+    const senderName = msg.pushName || 'Unknown';
     
     // Handle images
     if (messageType === 'imageMessage') {
-        log('📷', `Image received from ${chatId.split('@')[0]}`);
+        log('📷', `Image from ${senderName}`);
         
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
             
-            // Initialize buffer for this chat if needed
             if (!chatImageBuffers.has(chatId)) {
                 chatImageBuffers.set(chatId, []);
             }
             
-            // Add image to this chat's buffer
             chatImageBuffers.get(chatId).push({
                 data: buffer.toString('base64'),
                 mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
                 timestamp: Date.now()
             });
             
-            const imageCount = chatImageBuffers.get(chatId).length;
-            log('📦', `Chat buffer: ${imageCount} image(s)`);
+            const count = chatImageBuffers.get(chatId).length;
+            log('📦', `Buffer: ${count} image(s)`);
             
-            // Reset timeout for this chat
+            // Reset timeout
             if (chatTimeouts.has(chatId)) {
                 clearTimeout(chatTimeouts.get(chatId));
             }
             
-            // Set auto-clear timeout
             chatTimeouts.set(chatId, setTimeout(() => {
                 if (chatImageBuffers.has(chatId)) {
-                    log('⏰', `Auto-clearing ${chatImageBuffers.get(chatId).length} images for ${chatId.split('@')[0]}`);
+                    log('⏰', 'Auto-clearing images');
                     chatImageBuffers.delete(chatId);
                     chatTimeouts.delete(chatId);
                 }
             }, CONFIG.IMAGE_TIMEOUT_MS));
             
-            // Send acknowledgment for first image
-            if (imageCount === 1) {
+            // Acknowledge
+            if (count === 1) {
                 await sock.sendMessage(chatId, { 
-                    text: `📷 Image received!\n\n_Send more images if needed, then send *.*  (period) to process._` 
+                    text: `📷 *${count} image received*\n\n_Send more if needed, then send *.*  to process._` 
                 });
-            } else {
-                // Just react to subsequent images
+            } else if (count % 5 === 0 || count === 2) {
                 await sock.sendMessage(chatId, { 
-                    react: { text: '📷', key: msg.key }
+                    text: `📷 *${count} images received*\n_Send *.* when ready._` 
                 });
             }
             
         } catch (error) {
-            log('❌', `Download error: ${error.message}`);
+            log('❌', `Error: ${error.message}`);
         }
     }
-    // Handle trigger text "."
+    // Handle text
     else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
         const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
         
-        // Check if it's the trigger
+        // Trigger: "."
         if (text === CONFIG.TRIGGER_TEXT) {
-            log('🔔', `Trigger received from ${chatId.split('@')[0]}`);
+            log('🔔', `Trigger from ${senderName}`);
             
-            // Check if there are images to process
             if (chatImageBuffers.has(chatId) && chatImageBuffers.get(chatId).length > 0) {
-                // Clear timeout
                 if (chatTimeouts.has(chatId)) {
                     clearTimeout(chatTimeouts.get(chatId));
                     chatTimeouts.delete(chatId);
                 }
                 
-                // Get and clear images
                 const images = chatImageBuffers.get(chatId);
                 chatImageBuffers.delete(chatId);
                 
-                log('🔄', `Processing ${images.length} images...`);
-                
-                // Process images
                 await processImages(sock, chatId, images);
             } else {
-                // No images buffered
                 await sock.sendMessage(chatId, { 
-                    text: `❌ No images to process!\n\n_Send image(s) first, then send *.*  to generate the Clinical Profile._` 
+                    text: `❌ *No images to process*\n\n_Send image(s) first, then send *.*_` 
                 });
             }
         }
-        // Help command
+        // Help
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
-                text: `🏥 *WhatsApp Clinical Profile Bot*\n\n*How to use:*\n1️⃣ Send medical report image(s)\n2️⃣ Send more images if needed\n3️⃣ Send *.* (period) to process\n\n_The bot will analyze all images and generate a Clinical Profile._` 
+                text: `🏥 *Clinical Profile Bot*\n\n*Usage:*\n1️⃣ Send medical image(s)\n2️⃣ Send *.* to process\n\n*Commands:*\n• *.* - Process images\n• *clear* - Clear buffer\n• *status* - Check status` 
             });
         }
-        // Clear command
+        // Clear
         else if (text.toLowerCase() === 'clear') {
             if (chatImageBuffers.has(chatId)) {
                 const count = chatImageBuffers.get(chatId).length;
@@ -529,19 +577,22 @@ async function handleMessage(sock, msg) {
                     clearTimeout(chatTimeouts.get(chatId));
                     chatTimeouts.delete(chatId);
                 }
-                await sock.sendMessage(chatId, { 
-                    text: `🗑️ Cleared ${count} buffered image(s).` 
-                });
+                await sock.sendMessage(chatId, { text: `🗑️ Cleared ${count} image(s)` });
             } else {
-                await sock.sendMessage(chatId, { 
-                    text: `ℹ️ No images buffered.` 
-                });
+                await sock.sendMessage(chatId, { text: `ℹ️ No images buffered` });
             }
+        }
+        // Status
+        else if (text.toLowerCase() === 'status') {
+            const count = chatImageBuffers.has(chatId) ? chatImageBuffers.get(chatId).length : 0;
+            await sock.sendMessage(chatId, { 
+                text: `📊 *Status*\n📷 Buffered: ${count}\n✅ Processed: ${processedCount}` 
+            });
         }
     }
 }
 
-// ============== GEMINI PROCESSING ==============
+// ============== GEMINI ==============
 let model;
 try {
     const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
@@ -549,83 +600,78 @@ try {
         model: CONFIG.GEMINI_MODEL,
         systemInstruction: CONFIG.SYSTEM_INSTRUCTION
     });
-    log('✅', 'Gemini AI initialized');
+    log('✅', 'Gemini AI ready');
 } catch (error) {
-    log('❌', `Gemini init error: ${error.message}`);
-    lastError = `Gemini: ${error.message}`;
+    log('❌', `Gemini error: ${error.message}`);
 }
 
 async function processImages(sock, chatId, images) {
     try {
-        log('🤖', `Sending ${images.length} images to Gemini AI...`);
+        log('🤖', `Processing ${images.length} images...`);
         
-        // Send processing message
         await sock.sendMessage(chatId, { 
-            text: `⏳ Processing ${images.length} image(s)...\n\n_Generating Clinical Profile, please wait..._` 
+            text: `⏳ *Processing ${images.length} image(s)...*\n_Please wait..._` 
         });
         
-        // Prepare image parts for Gemini
         const imageParts = images.map(img => ({
             inlineData: { data: img.data, mimeType: img.mimeType }
         }));
         
-        // Call Gemini API
-        const userPrompt = `Analyze these ${images.length} medical document image(s) and generate the Clinical Profile as per your instructions.`;
+        const result = await model.generateContent([
+            `Analyze these ${images.length} medical document image(s) and generate the Clinical Profile.`,
+            ...imageParts
+        ]);
         
-        const result = await model.generateContent([userPrompt, ...imageParts]);
-        const response = await result.response;
-        const clinicalProfile = response.text();
+        const clinicalProfile = result.response.text();
         
-        log('✅', 'Clinical Profile generated!');
+        log('✅', 'Done!');
         processedCount++;
         
         // Log to console
-        console.log('\n' + '═'.repeat(60));
-        console.log(`📸 Images: ${images.length}`);
-        console.log(`⏰ Time: ${new Date().toLocaleString()}`);
-        console.log('═'.repeat(60));
+        console.log('\n' + '═'.repeat(50));
+        console.log(`📸 ${images.length} images | ⏰ ${new Date().toLocaleString()}`);
+        console.log('═'.repeat(50));
         console.log(clinicalProfile);
-        console.log('═'.repeat(60) + '\n');
+        console.log('═'.repeat(50) + '\n');
         
-        // Send to WhatsApp
-        const maxLength = 4000;
-        
-        if (clinicalProfile.length <= maxLength) {
+        // Send response (handle long messages)
+        if (clinicalProfile.length <= 4000) {
             await sock.sendMessage(chatId, { text: clinicalProfile });
         } else {
-            // Split long messages
-            await sock.sendMessage(chatId, { 
-                text: clinicalProfile.substring(0, maxLength - 20) + '\n\n_(continued...)_'
-            });
-            
-            let remaining = clinicalProfile.substring(maxLength - 20);
-            while (remaining.length > 0) {
-                await new Promise(r => setTimeout(r, 1000));
-                const chunk = remaining.substring(0, maxLength);
-                remaining = remaining.substring(maxLength);
-                await sock.sendMessage(chatId, { text: chunk });
+            const chunks = clinicalProfile.match(/.{1,3900}/gs) || [];
+            for (let i = 0; i < chunks.length; i++) {
+                if (i > 0) await new Promise(r => setTimeout(r, 1000));
+                await sock.sendMessage(chatId, { 
+                    text: chunks[i] + (i < chunks.length - 1 ? '\n\n_(continued...)_' : '')
+                });
             }
         }
         
-        log('📤', 'Clinical Profile sent!');
+        log('📤', 'Sent!');
         
     } catch (error) {
-        log('❌', `Gemini Error: ${error.message}`);
-        console.error(error);
-        
+        log('❌', `Error: ${error.message}`);
         await sock.sendMessage(chatId, { 
-            text: `❌ Error generating Clinical Profile\n\n_${error.message}_\n\nPlease try again.` 
+            text: `❌ *Error*\n_${error.message}_\n\nPlease try again.` 
         });
     }
 }
 
 // ============== START ==============
-console.log('\n╔════════════════════════════════════════════════════════╗');
-console.log('║     WhatsApp Patient Bot - Clinical Profile Generator  ║');
-console.log('╚════════════════════════════════════════════════════════╝\n');
+console.log('\n╔═══════════════════════════════════════════════════════╗');
+console.log('║      WhatsApp Clinical Profile Bot                    ║');
+console.log('║                                                       ║');
+console.log('║  🔒 Works ONLY in ONE specific group                  ║');
+console.log('║  💬 Normal WhatsApp everywhere else                   ║');
+console.log('╚═══════════════════════════════════════════════════════╝\n');
 
-log('🏁', 'Initializing...');
-log('🤖', `Model: ${CONFIG.GEMINI_MODEL}`);
-log('🔔', `Trigger: Send "${CONFIG.TRIGGER_TEXT}" to process images`);
+log('🏁', 'Starting...');
+
+if (CONFIG.ALLOWED_GROUP_ID) {
+    log('🎯', `Configured for group: ${CONFIG.ALLOWED_GROUP_ID}`);
+} else {
+    log('⚠️', 'No group configured! Bot will discover groups when you message them.');
+    log('💡', 'After finding your group ID, add ALLOWED_GROUP_ID to Render environment.');
+}
 
 startBot();
