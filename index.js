@@ -12,14 +12,19 @@ const __dirname = dirname(__filename);
 // ============== CONFIGURATION ==============
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    GEMINI_MODEL: 'gemini-3-flash-preview',
+    GEMINI_MODEL: 'gemini-2.0-flash',
     
     // SET THIS TO YOUR GROUP ID (from environment variable)
-    // Leave empty to see group IDs in logs first
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
     
     // Time before auto-clearing media (5 minutes)
     MEDIA_TIMEOUT_MS: 300000,
+    
+    // Time to keep context for replies (30 minutes)
+    CONTEXT_RETENTION_MS: 1800000,
+    
+    // Maximum contexts to store per chat (memory management)
+    MAX_STORED_CONTEXTS: 20,
     
     // Trigger to process media
     TRIGGER_TEXT: '.',
@@ -27,7 +32,7 @@ const CONFIG = {
     // Commands that should NOT be buffered as text
     COMMANDS: ['.', 'help', '?', 'clear', 'status'],
     
-    // Typing delay range (milliseconds) - simulates human thinking
+    // Typing delay range (milliseconds)
     TYPING_DELAY_MIN: 3000,
     TYPING_DELAY_MAX: 6000,
     
@@ -38,6 +43,8 @@ IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE
 FOR AUDIO FILES: Transcribe the audio content carefully and extract all relevant medical information mentioned.
 
 FOR TEXT MESSAGES: These may contain additional clinical context, patient history, or notes that should be incorporated into the Clinical Profile.
+
+FOR FOLLOW-UP REQUESTS: If the user provides additional context or corrections after receiving a Clinical Profile, incorporate that new information and regenerate an updated Clinical Profile.
 
 YOUR RESPONSE MUST BE BASED SOLELY ON THE PROVIDED CONTENT (files AND text).
 
@@ -87,10 +94,17 @@ IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE
 };
 
 // ============== SETUP ==============
-// Media buffer now handles: images, pdfs, audio, voice, AND text
+// Media buffer for new content
 const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
 const discoveredGroups = new Map();
+
+// NEW: Context storage for reply feature
+// Maps: chatId -> Map(messageId -> {mediaFiles, response, timestamp})
+const chatContexts = new Map();
+
+// Track bot's own message IDs
+const botMessageIds = new Map(); // chatId -> Set of message IDs
 
 let sock = null;
 let isConnected = false;
@@ -108,29 +122,91 @@ function log(emoji, message) {
 
 // Check if chat is the allowed group
 function isAllowedGroup(chatId) {
-    // If no group is configured, we're in "discovery mode"
     if (!CONFIG.ALLOWED_GROUP_ID) {
         return false;
     }
     return chatId === CONFIG.ALLOWED_GROUP_ID;
 }
 
-// Check if text is a command (should not be buffered)
+// Check if text is a command
 function isCommand(text) {
     const lowerText = text.toLowerCase().trim();
     return CONFIG.COMMANDS.includes(lowerText);
 }
 
-// Helper function to get media type label
-function getMediaTypeLabel(type) {
-    switch(type) {
-        case 'image': return '📷 Image';
-        case 'pdf': return '📄 PDF';
-        case 'audio': return '🎵 Audio';
-        case 'voice': return '🎤 Voice';
-        case 'text': return '💬 Text';
-        default: return '📎 File';
+// Store context for a bot message
+function storeContext(chatId, messageId, mediaFiles, response) {
+    if (!chatContexts.has(chatId)) {
+        chatContexts.set(chatId, new Map());
     }
+    
+    const contexts = chatContexts.get(chatId);
+    
+    // Clean up old contexts if too many
+    if (contexts.size >= CONFIG.MAX_STORED_CONTEXTS) {
+        // Remove oldest entries
+        const entries = Array.from(contexts.entries());
+        entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+        const toRemove = entries.slice(0, entries.length - CONFIG.MAX_STORED_CONTEXTS + 1);
+        toRemove.forEach(([key]) => contexts.delete(key));
+    }
+    
+    contexts.set(messageId, {
+        mediaFiles: mediaFiles,
+        response: response,
+        timestamp: Date.now()
+    });
+    
+    log('💾', `Stored context for message ${messageId.substring(0, 8)}...`);
+    
+    // Schedule cleanup
+    setTimeout(() => {
+        if (chatContexts.has(chatId)) {
+            const ctx = chatContexts.get(chatId);
+            if (ctx.has(messageId)) {
+                ctx.delete(messageId);
+                log('🧹', `Cleaned up old context ${messageId.substring(0, 8)}...`);
+            }
+        }
+    }, CONFIG.CONTEXT_RETENTION_MS);
+}
+
+// Get stored context for a message
+function getStoredContext(chatId, messageId) {
+    if (!chatContexts.has(chatId)) return null;
+    const contexts = chatContexts.get(chatId);
+    if (!contexts.has(messageId)) return null;
+    
+    const context = contexts.get(messageId);
+    
+    // Check if expired
+    if (Date.now() - context.timestamp > CONFIG.CONTEXT_RETENTION_MS) {
+        contexts.delete(messageId);
+        return null;
+    }
+    
+    return context;
+}
+
+// Track bot message ID
+function trackBotMessage(chatId, messageId) {
+    if (!botMessageIds.has(chatId)) {
+        botMessageIds.set(chatId, new Set());
+    }
+    botMessageIds.get(chatId).add(messageId);
+    
+    // Limit size
+    const ids = botMessageIds.get(chatId);
+    if (ids.size > 100) {
+        const arr = Array.from(ids);
+        arr.slice(0, 50).forEach(id => ids.delete(id));
+    }
+}
+
+// Check if a message ID belongs to bot
+function isBotMessage(chatId, messageId) {
+    if (!botMessageIds.has(chatId)) return false;
+    return botMessageIds.get(chatId).has(messageId);
 }
 
 // ============== WEB SERVER ==============
@@ -148,7 +224,10 @@ app.get('/', (req, res) => {
             else if (m.type === 'text') mediaStats.texts++;
         });
     }
-    const totalBuffered = mediaStats.images + mediaStats.pdfs + mediaStats.audio + mediaStats.texts;
+    
+    const storedContextsCount = chatContexts.has(CONFIG.ALLOWED_GROUP_ID) 
+        ? chatContexts.get(CONFIG.ALLOWED_GROUP_ID).size 
+        : 0;
     
     let html = `
     <!DOCTYPE html>
@@ -286,17 +365,24 @@ app.get('/', (req, res) => {
                 margin-top: 10px;
                 font-size: 12px;
             }
+            .feature-badge {
+                display: inline-block;
+                background: rgba(255,255,255,0.2);
+                padding: 3px 8px;
+                border-radius: 12px;
+                font-size: 10px;
+                margin: 2px;
+            }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>📱 WhatsApp Patient Bot</h1>
-            <p class="subtitle">Medical Image, PDF, Audio & Text Clinical Profile Generator</p>
+            <p class="subtitle">Medical Clinical Profile Generator with Context Memory</p>
     `;
     
     if (isConnected) {
         if (CONFIG.ALLOWED_GROUP_ID) {
-            // Configured - show active status
             const groupName = discoveredGroups.get(CONFIG.ALLOWED_GROUP_ID) || 'Configured Group';
             html += `
                 <div class="status connected">✅ ACTIVE IN GROUP</div>
@@ -309,21 +395,28 @@ app.get('/', (req, res) => {
                     <div class="stat"><div class="stat-value">${mediaStats.pdfs}</div><div class="stat-label">📄 PDFs</div></div>
                     <div class="stat"><div class="stat-value">${mediaStats.audio}</div><div class="stat-label">🎤 Audio</div></div>
                     <div class="stat"><div class="stat-value">${mediaStats.texts}</div><div class="stat-label">💬 Texts</div></div>
+                    <div class="stat"><div class="stat-value">${storedContextsCount}</div><div class="stat-label">🧠 Contexts</div></div>
                     <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
                 </div>
                 <div class="info-box">
                     <h3>✨ Usage:</h3>
-                    <p>1. Send any combination of:<br>
-                    &nbsp;&nbsp;&nbsp;📷 Images, 📄 PDFs, 🎤 Voice notes, 💬 Text<br>
-                    2. Send <strong>.</strong> to process<br>
-                    3. Get Clinical Profile!</p>
+                    <p><strong>New Request:</strong><br>
+                    1. Send files/text → Send <strong>.</strong> → Get profile<br><br>
+                    <strong>Add Context (Reply Feature):</strong><br>
+                    1. Long-press bot's response<br>
+                    2. Tap "Reply"<br>
+                    3. Type additional info<br>
+                    4. Bot regenerates with new context!</p>
                 </div>
                 <div class="media-support">
-                    <strong>Supported:</strong> Images • PDFs • Audio • Voice messages • Text notes • Captions
+                    <span class="feature-badge">📷 Images</span>
+                    <span class="feature-badge">📄 PDFs</span>
+                    <span class="feature-badge">🎤 Voice</span>
+                    <span class="feature-badge">💬 Text</span>
+                    <span class="feature-badge">↩️ Reply Context</span>
                 </div>
             `;
         } else {
-            // Not configured - show discovery mode
             html += `
                 <div class="status warning">⚠️ DISCOVERY MODE</div>
                 <div class="not-configured">
@@ -333,7 +426,7 @@ app.get('/', (req, res) => {
             `;
             
             if (discoveredGroups.size > 0) {
-                html += `<div class="group-list"><h4>📋 Discovered Groups (send message to discover):</h4>`;
+                html += `<div class="group-list"><h4>📋 Discovered Groups:</h4>`;
                 for (const [id, name] of discoveredGroups) {
                     html += `
                         <div class="group-item">
@@ -396,12 +489,17 @@ app.get('/health', (req, res) => {
         });
     }
     
+    const storedContextsCount = chatContexts.has(CONFIG.ALLOWED_GROUP_ID) 
+        ? chatContexts.get(CONFIG.ALLOWED_GROUP_ID).size 
+        : 0;
+    
     res.json({ 
         status: 'running',
         connected: isConnected,
         configuredGroup: CONFIG.ALLOWED_GROUP_ID || 'NOT SET',
         discoveredGroups: Object.fromEntries(discoveredGroups),
         bufferedMedia: mediaStats,
+        storedContexts: storedContextsCount,
         processedCount,
         timestamp: new Date().toISOString()
     });
@@ -523,12 +621,11 @@ async function startBot() {
 async function handleMessage(sock, msg) {
     const chatId = msg.key.remoteJid;
     
-    // Skip status broadcasts
     if (chatId === 'status@broadcast') return;
     
     const isGroup = chatId.endsWith('@g.us');
     
-    // If it's a group, discover/track it
+    // Discover groups
     if (isGroup && !discoveredGroups.has(chatId)) {
         try {
             const metadata = await sock.groupMetadata(chatId);
@@ -544,22 +641,44 @@ async function handleMessage(sock, msg) {
         }
     }
     
-    // ========== KEY LOGIC ==========
-    // If group is NOT configured OR this is NOT the allowed group → IGNORE
     if (!isAllowedGroup(chatId)) {
-        // Only log group discoveries, completely ignore the message
         return;
     }
-    // ===============================
     
-    // From here, we're in the ALLOWED GROUP only
     const messageType = Object.keys(msg.message)[0];
     const senderName = msg.pushName || 'Unknown';
     
-    // Initialize media buffer for this chat if needed
+    // Initialize buffer
     if (!chatMediaBuffers.has(chatId)) {
         chatMediaBuffers.set(chatId, []);
     }
+    
+    // ========== CHECK FOR REPLY TO BOT MESSAGE ==========
+    let quotedMessageId = null;
+    let contextInfo = null;
+    
+    // Check for quoted message in different message types
+    if (messageType === 'extendedTextMessage') {
+        contextInfo = msg.message.extendedTextMessage?.contextInfo;
+    } else if (messageType === 'imageMessage') {
+        contextInfo = msg.message.imageMessage?.contextInfo;
+    } else if (messageType === 'documentMessage') {
+        contextInfo = msg.message.documentMessage?.contextInfo;
+    } else if (messageType === 'audioMessage') {
+        contextInfo = msg.message.audioMessage?.contextInfo;
+    }
+    
+    if (contextInfo?.stanzaId) {
+        quotedMessageId = contextInfo.stanzaId;
+        
+        // Check if this is a reply to a bot message
+        if (isBotMessage(chatId, quotedMessageId)) {
+            log('↩️', `Reply to bot message detected from ${senderName}`);
+            await handleReplyToBot(sock, msg, chatId, quotedMessageId, senderName);
+            return;
+        }
+    }
+    // ====================================================
     
     // Handle IMAGES
     if (messageType === 'imageMessage') {
@@ -577,7 +696,6 @@ async function handleMessage(sock, msg) {
                 timestamp: Date.now()
             });
             
-            // Log caption if present
             if (caption) {
                 log('💬', `  └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
             }
@@ -591,12 +709,11 @@ async function handleMessage(sock, msg) {
             log('❌', `Image error: ${error.message}`);
         }
     }
-    // Handle PDFs (documentMessage)
+    // Handle PDFs
     else if (messageType === 'documentMessage') {
         const docMime = msg.message.documentMessage.mimetype || '';
         const fileName = msg.message.documentMessage.fileName || 'document';
         
-        // Check if it's a PDF
         if (docMime === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')) {
             log('📄', `PDF from ${senderName}: ${fileName}`);
             
@@ -613,7 +730,6 @@ async function handleMessage(sock, msg) {
                     timestamp: Date.now()
                 });
                 
-                // Log caption if present
                 if (caption) {
                     log('💬', `  └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
                 }
@@ -630,9 +746,9 @@ async function handleMessage(sock, msg) {
             log('📎', `Skipping non-PDF document: ${fileName} (${docMime})`);
         }
     }
-    // Handle AUDIO FILES (including voice messages)
+    // Handle AUDIO
     else if (messageType === 'audioMessage') {
-        const isVoice = msg.message.audioMessage.ptt === true; // ptt = push to talk (voice message)
+        const isVoice = msg.message.audioMessage.ptt === true;
         const audioType = isVoice ? 'voice' : 'audio';
         const emoji = isVoice ? '🎤' : '🎵';
         
@@ -647,7 +763,7 @@ async function handleMessage(sock, msg) {
                 data: buffer.toString('base64'),
                 mimeType: mimeType,
                 duration: msg.message.audioMessage.seconds || 0,
-                caption: '', // Audio typically doesn't have captions
+                caption: '',
                 timestamp: Date.now()
             });
             
@@ -660,18 +776,16 @@ async function handleMessage(sock, msg) {
             log('❌', `Audio error: ${error.message}`);
         }
     }
-    // Handle text messages
+    // Handle text
     else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
         const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
         
-        // Skip empty messages
         if (!text) return;
         
         // Trigger: "."
         if (text === CONFIG.TRIGGER_TEXT) {
             log('🔔', `Trigger from ${senderName}`);
             
-            // Wait briefly for any concurrent media downloads to complete
             await new Promise(r => setTimeout(r, 1500));
             
             if (chatMediaBuffers.has(chatId) && chatMediaBuffers.get(chatId).length > 0) {
@@ -683,18 +797,17 @@ async function handleMessage(sock, msg) {
                 const mediaFiles = chatMediaBuffers.get(chatId);
                 chatMediaBuffers.delete(chatId);
                 
-                await processMedia(sock, chatId, mediaFiles);
+                await processMedia(sock, chatId, mediaFiles, false);
             } else {
-                // No media buffered - inform user
                 await sock.sendMessage(chatId, { 
-                    text: `ℹ️ No files buffered. Send images, PDFs, audio, or text first, then send *.*` 
+                    text: `ℹ️ No files buffered.\n\nSend images, PDFs, audio, or text first, then send *.*\n\n💡 _Or reply to my previous response to add context!_` 
                 });
             }
         }
         // Help
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
-                text: `🏥 *Clinical Profile Bot*\n\n*Supported Content:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files\n💬 Text notes & captions\n\n*Usage:*\n1️⃣ Send file(s) and/or text - any combination!\n2️⃣ Send *.* to process\n\n*Examples:*\n• Send image → send "." → get profile\n• Send image + text note → send "." → get profile\n• Send image with caption → send "." → get profile\n\n*Commands:*\n• *.* - Process all content\n• *clear* - Clear buffer\n• *status* - Check status` 
+                text: `🏥 *Clinical Profile Bot*\n\n*Supported Content:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files\n💬 Text notes & captions\n\n*Basic Usage:*\n1️⃣ Send file(s) and/or text\n2️⃣ Send *.* to process\n\n*↩️ Reply Feature (NEW!):*\nTo add more context to a result:\n1️⃣ Long-press my response\n2️⃣ Tap "Reply"\n3️⃣ Type your additional info\n4️⃣ I'll regenerate with new context!\n\n*Commands:*\n• *.* - Process all content\n• *clear* - Clear buffer\n• *status* - Check status` 
             });
         }
         // Clear
@@ -733,11 +846,13 @@ async function handleMessage(sock, msg) {
                 });
             }
             const total = mediaStats.images + mediaStats.pdfs + mediaStats.audio + mediaStats.texts;
+            const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
+            
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n📷 Images: ${mediaStats.images}\n📄 PDFs: ${mediaStats.pdfs}\n🎤 Audio: ${mediaStats.audio}\n💬 Texts: ${mediaStats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${total}\n✅ Processed: ${processedCount}` 
+                text: `📊 *Status*\n\n📷 Images: ${mediaStats.images}\n📄 PDFs: ${mediaStats.pdfs}\n🎤 Audio: ${mediaStats.audio}\n💬 Texts: ${mediaStats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n\n💡 _Reply to any of my responses to add context!_` 
             });
         }
-        // Any other text → Buffer it as a text note
+        // Buffer as text note
         else {
             log('💬', `Text from ${senderName}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
             
@@ -754,6 +869,117 @@ async function handleMessage(sock, msg) {
             resetMediaTimeout(chatId);
         }
     }
+}
+
+// ============== HANDLE REPLY TO BOT MESSAGE ==============
+async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderName) {
+    // Get stored context
+    const storedContext = getStoredContext(chatId, quotedMessageId);
+    
+    if (!storedContext) {
+        log('⚠️', `Context expired or not found for message ${quotedMessageId.substring(0, 8)}...`);
+        await sock.sendMessage(chatId, { 
+            text: `⏰ _Context expired (30 min limit). Please send new files and use "." to process._` 
+        });
+        return;
+    }
+    
+    const messageType = Object.keys(msg.message)[0];
+    const newContent = [];
+    
+    // Extract new content from reply
+    if (messageType === 'extendedTextMessage') {
+        const text = msg.message.extendedTextMessage?.text || '';
+        if (text.trim()) {
+            newContent.push({
+                type: 'text',
+                content: text.trim(),
+                sender: senderName,
+                timestamp: Date.now(),
+                isFollowUp: true
+            });
+            log('💬', `Follow-up text: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+        }
+    }
+    else if (messageType === 'imageMessage') {
+        try {
+            const buffer = await downloadMediaMessage(msg, 'buffer', {});
+            const caption = msg.message.imageMessage.caption || '';
+            
+            newContent.push({
+                type: 'image',
+                data: buffer.toString('base64'),
+                mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
+                caption: caption,
+                timestamp: Date.now(),
+                isFollowUp: true
+            });
+            log('📷', `Follow-up image added`);
+            
+            if (caption) {
+                log('💬', `  └─ Caption: "${caption.substring(0, 50)}..."`);
+            }
+        } catch (error) {
+            log('❌', `Image error: ${error.message}`);
+        }
+    }
+    else if (messageType === 'documentMessage') {
+        const docMime = msg.message.documentMessage.mimetype || '';
+        const fileName = msg.message.documentMessage.fileName || 'document';
+        
+        if (docMime === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')) {
+            try {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                const caption = msg.message.documentMessage.caption || '';
+                
+                newContent.push({
+                    type: 'pdf',
+                    data: buffer.toString('base64'),
+                    mimeType: 'application/pdf',
+                    fileName: fileName,
+                    caption: caption,
+                    timestamp: Date.now(),
+                    isFollowUp: true
+                });
+                log('📄', `Follow-up PDF added: ${fileName}`);
+            } catch (error) {
+                log('❌', `PDF error: ${error.message}`);
+            }
+        }
+    }
+    else if (messageType === 'audioMessage') {
+        try {
+            const buffer = await downloadMediaMessage(msg, 'buffer', {});
+            const isVoice = msg.message.audioMessage.ptt === true;
+            
+            newContent.push({
+                type: isVoice ? 'voice' : 'audio',
+                data: buffer.toString('base64'),
+                mimeType: msg.message.audioMessage.mimetype || 'audio/ogg',
+                duration: msg.message.audioMessage.seconds || 0,
+                timestamp: Date.now(),
+                isFollowUp: true
+            });
+            log(isVoice ? '🎤' : '🎵', `Follow-up ${isVoice ? 'voice' : 'audio'} added`);
+        } catch (error) {
+            log('❌', `Audio error: ${error.message}`);
+        }
+    }
+    
+    if (newContent.length === 0) {
+        await sock.sendMessage(chatId, { 
+            text: `ℹ️ _Please include text, image, PDF, or audio in your reply._` 
+        });
+        return;
+    }
+    
+    // Combine old context with new content
+    const combinedMedia = [...storedContext.mediaFiles, ...newContent];
+    
+    log('🔄', `Regenerating with ${storedContext.mediaFiles.length} original + ${newContent.length} new item(s)`);
+    
+    // Process with combined context
+    await processMedia(sock, chatId, combinedMedia, true, storedContext.response);
 }
 
 // Helper function to reset the auto-clear timeout
@@ -785,24 +1011,39 @@ try {
     log('❌', `Gemini error: ${error.message}`);
 }
 
-async function processMedia(sock, chatId, mediaFiles) {
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null) {
     try {
-        // Count and categorize media types
-        const counts = { images: 0, pdfs: 0, audio: 0, texts: 0 };
+        // Count and categorize
+        const counts = { images: 0, pdfs: 0, audio: 0, texts: 0, followUps: 0 };
         const textContents = [];
         const captions = [];
         const binaryMedia = [];
+        const followUpTexts = [];
         
         mediaFiles.forEach(m => {
+            if (m.isFollowUp) counts.followUps++;
+            
             if (m.type === 'image') {
                 counts.images++;
                 binaryMedia.push(m);
-                if (m.caption) captions.push(`[Image caption]: ${m.caption}`);
+                if (m.caption) {
+                    if (m.isFollowUp) {
+                        followUpTexts.push(`[Additional image caption]: ${m.caption}`);
+                    } else {
+                        captions.push(`[Image caption]: ${m.caption}`);
+                    }
+                }
             }
             else if (m.type === 'pdf') {
                 counts.pdfs++;
                 binaryMedia.push(m);
-                if (m.caption) captions.push(`[PDF caption]: ${m.caption}`);
+                if (m.caption) {
+                    if (m.isFollowUp) {
+                        followUpTexts.push(`[Additional PDF caption]: ${m.caption}`);
+                    } else {
+                        captions.push(`[PDF caption]: ${m.caption}`);
+                    }
+                }
             }
             else if (m.type === 'audio' || m.type === 'voice') {
                 counts.audio++;
@@ -810,16 +1051,22 @@ async function processMedia(sock, chatId, mediaFiles) {
             }
             else if (m.type === 'text') {
                 counts.texts++;
-                textContents.push(`[Text note from ${m.sender}]: ${m.content}`);
+                if (m.isFollowUp) {
+                    followUpTexts.push(`[Additional context from ${m.sender}]: ${m.content}`);
+                } else {
+                    textContents.push(`[Text note from ${m.sender}]: ${m.content}`);
+                }
             }
         });
         
-        log('🤖', `Processing: ${counts.images} image(s), ${counts.pdfs} PDF(s), ${counts.audio} audio, ${counts.texts} text(s)...`);
+        if (isFollowUp) {
+            log('🤖', `Processing follow-up: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.texts} text (${counts.followUps} new)`);
+        } else {
+            log('🤖', `Processing: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.texts} text`);
+        }
         
-        // Build content parts for Gemini
+        // Build content parts
         const contentParts = [];
-        
-        // Add binary media (images, PDFs, audio)
         binaryMedia.forEach(media => {
             contentParts.push({
                 inlineData: { 
@@ -829,41 +1076,54 @@ async function processMedia(sock, chatId, mediaFiles) {
             });
         });
         
-        // Build descriptive prompt
+        // Build prompt
         let promptParts = [];
         if (counts.images > 0) promptParts.push(`${counts.images} image(s)`);
         if (counts.pdfs > 0) promptParts.push(`${counts.pdfs} PDF document(s)`);
         if (counts.audio > 0) promptParts.push(`${counts.audio} audio/voice recording(s)`);
         
-        // Combine all text content (captions + standalone texts)
-        const allTextContent = [...captions, ...textContents];
-        
+        const allOriginalText = [...captions, ...textContents];
         let promptText = '';
         
-        if (binaryMedia.length > 0 && allTextContent.length > 0) {
-            // Both files and text
+        if (isFollowUp && previousResponse) {
+            // FOLLOW-UP REQUEST
+            promptText = `This is a FOLLOW-UP request. The user has provided additional context to refine the Clinical Profile.
+
+=== PREVIOUS CLINICAL PROFILE GENERATED ===
+${previousResponse}
+=== END PREVIOUS RESPONSE ===
+
+=== ORIGINAL CONTEXT ===
+${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original files are attached below)'}
+=== END ORIGINAL CONTEXT ===
+
+=== NEW ADDITIONAL CONTEXT FROM USER ===
+${followUpTexts.join('\n\n')}
+=== END NEW CONTEXT ===
+
+Please analyze ALL the content (original files + original text + NEW additional context) and generate an UPDATED Clinical Profile that incorporates the new information. The new information may include corrections, additional history, clarifications, or new findings.`;
+            
+        } else if (binaryMedia.length > 0 && allOriginalText.length > 0) {
             promptText = `Analyze these ${promptParts.join(', ')} along with the following additional text notes/context, and generate the Clinical Profile.
 
 === ADDITIONAL TEXT NOTES ===
-${allTextContent.join('\n\n')}
+${allOriginalText.join('\n\n')}
 === END OF TEXT NOTES ===
 
-For audio files, transcribe the content first, then extract medical information. Incorporate all relevant information from both the files AND the text notes into the Clinical Profile.`;
+For audio files, transcribe the content first, then extract medical information.`;
         } 
         else if (binaryMedia.length > 0) {
-            // Only files (no text)
-            promptText = `Analyze these ${promptParts.join(', ')} containing medical information and generate the Clinical Profile. For audio files, transcribe the content first, then extract medical information.`;
+            promptText = `Analyze these ${promptParts.join(', ')} containing medical information and generate the Clinical Profile. For audio files, transcribe the content first.`;
         }
-        else if (allTextContent.length > 0) {
-            // Only text (no files)
+        else if (allOriginalText.length > 0) {
             promptText = `Analyze the following text notes containing medical information and generate the Clinical Profile.
 
 === TEXT NOTES ===
-${allTextContent.join('\n\n')}
+${allOriginalText.join('\n\n')}
 === END OF TEXT NOTES ===`;
         }
         
-        // Build final request
+        // Build request
         let requestContent;
         if (binaryMedia.length > 0) {
             requestContent = [promptText, ...contentParts];
@@ -872,7 +1132,6 @@ ${allTextContent.join('\n\n')}
         }
         
         const result = await model.generateContent(requestContent);
-        
         const clinicalProfile = result.response.text();
         
         log('✅', 'Done!');
@@ -880,43 +1139,45 @@ ${allTextContent.join('\n\n')}
         
         // Log to console
         console.log('\n' + '═'.repeat(60));
-        console.log(`📊 ${counts.images} images, ${counts.pdfs} PDFs, ${counts.audio} audio, ${counts.texts} texts`);
-        console.log(`⏰ ${new Date().toLocaleString()}`);
-        if (allTextContent.length > 0) {
-            console.log(`💬 Text content included: ${allTextContent.length} item(s)`);
+        if (isFollowUp) {
+            console.log(`🔄 FOLLOW-UP RESPONSE`);
         }
+        console.log(`📊 ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.texts} text`);
+        console.log(`⏰ ${new Date().toLocaleString()}`);
         console.log('═'.repeat(60));
         console.log(clinicalProfile);
         console.log('═'.repeat(60) + '\n');
         
-        // ========== HUMAN-LIKE BEHAVIOR ==========
-        // 1. Tell WhatsApp "I am typing..."
+        // Human-like typing
         await sock.sendPresenceUpdate('composing', chatId);
-        
-        // 2. Wait for a random time (3 to 6 seconds) to simulate thinking
         const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
         log('⌨️', `Simulating typing for ${(delay/1000).toFixed(1)}s...`);
         await new Promise(resolve => setTimeout(resolve, delay));
-        
-        // 3. Stop typing indicator (optional - sending message stops it automatically)
         await sock.sendPresenceUpdate('paused', chatId);
-        // ==========================================
         
-        // Send response (handle long messages)
+        // Send response
+        let sentMessage;
         if (clinicalProfile.length <= 4000) {
-            await sock.sendMessage(chatId, { text: clinicalProfile });
+            sentMessage = await sock.sendMessage(chatId, { text: clinicalProfile });
         } else {
             const chunks = clinicalProfile.match(/.{1,3900}/gs) || [];
             for (let i = 0; i < chunks.length; i++) {
                 if (i > 0) {
-                    // Show typing for subsequent chunks too
                     await sock.sendPresenceUpdate('composing', chatId);
                     await new Promise(r => setTimeout(r, 2000));
                 }
-                await sock.sendMessage(chatId, { 
+                sentMessage = await sock.sendMessage(chatId, { 
                     text: chunks[i] + (i < chunks.length - 1 ? '\n\n_(continued...)_' : '')
                 });
             }
+        }
+        
+        // Store context for future replies
+        if (sentMessage?.key?.id) {
+            const messageId = sentMessage.key.id;
+            trackBotMessage(chatId, messageId);
+            storeContext(chatId, messageId, mediaFiles, clinicalProfile);
+            log('💾', `Context stored for replies (ID: ${messageId.substring(0, 8)}...)`);
         }
         
         log('📤', 'Sent!');
@@ -924,7 +1185,6 @@ ${allTextContent.join('\n\n')}
     } catch (error) {
         log('❌', `Error: ${error.message}`);
         
-        // Still show typing before error message (human-like)
         await sock.sendPresenceUpdate('composing', chatId);
         await new Promise(r => setTimeout(r, 1500));
         
@@ -935,14 +1195,15 @@ ${allTextContent.join('\n\n')}
 }
 
 // ============== START ==============
-console.log('\n╔═══════════════════════════════════════════════════════╗');
-console.log('║      WhatsApp Clinical Profile Bot                    ║');
-console.log('║                                                       ║');
-console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  💬 Text      ║');
-console.log('║                                                       ║');
-console.log('║  🔒 Works ONLY in ONE specific group                  ║');
-console.log('║  💬 Normal WhatsApp everywhere else                   ║');
-console.log('╚═══════════════════════════════════════════════════════╝\n');
+console.log('\n╔═══════════════════════════════════════════════════════════╗');
+console.log('║        WhatsApp Clinical Profile Bot                      ║');
+console.log('║                                                           ║');
+console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  💬 Text          ║');
+console.log('║                                                           ║');
+console.log('║  ✨ NEW: Reply to bot response to add context!           ║');
+console.log('║                                                           ║');
+console.log('║  🔒 Works ONLY in ONE specific group                      ║');
+console.log('╚═══════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Starting...');
 
