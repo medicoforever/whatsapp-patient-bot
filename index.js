@@ -523,17 +523,6 @@ async function handleMessage(sock, msg) {
                 }
             }, CONFIG.IMAGE_TIMEOUT_MS));
             
-            // Acknowledge
-            if (count === 1) {
-                await sock.sendMessage(chatId, { 
-                    text: `📷 *${count} image received*\n\n_Send more if needed, then send *.*  to process._` 
-                });
-            } else if (count % 5 === 0 || count === 2) {
-                await sock.sendMessage(chatId, { 
-                    text: `📷 *${count} images received*\n_Send *.* when ready._` 
-                });
-            }
-            
         } catch (error) {
             log('❌', `Error: ${error.message}`);
         }
@@ -546,6 +535,9 @@ async function handleMessage(sock, msg) {
         if (text === CONFIG.TRIGGER_TEXT) {
             log('🔔', `Trigger from ${senderName}`);
             
+            // Wait briefly for any concurrent image downloads to complete
+            await new Promise(r => setTimeout(r, 1500));
+            
             if (chatImageBuffers.has(chatId) && chatImageBuffers.get(chatId).length > 0) {
                 if (chatTimeouts.has(chatId)) {
                     clearTimeout(chatTimeouts.get(chatId));
@@ -556,10 +548,6 @@ async function handleMessage(sock, msg) {
                 chatImageBuffers.delete(chatId);
                 
                 await processImages(sock, chatId, images);
-            } else {
-                await sock.sendMessage(chatId, { 
-                    text: `❌ *No images to process*\n\n_Send image(s) first, then send *.*_` 
-                });
             }
         }
         // Help
@@ -608,10 +596,6 @@ try {
 async function processImages(sock, chatId, images) {
     try {
         log('🤖', `Processing ${images.length} images...`);
-        
-        await sock.sendMessage(chatId, { 
-            text: `⏳ *Processing ${images.length} image(s)...*\n_Please wait..._` 
-        });
         
         const imageParts = images.map(img => ({
             inlineData: { data: img.data, mimeType: img.mimeType }
