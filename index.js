@@ -10,9 +10,16 @@ import mongoose from 'mongoose';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// Helper to parse keys from comma-separated string
+const getApiKeys = () => {
+    const keys = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
+    return keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
+};
+
 const CONFIG = {
-    GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    GEMINI_MODEL: 'gemini-3-flash-preview',
+    // We now store an array of keys
+    API_KEYS: getApiKeys(),
+    GEMINI_MODEL: 'gemini-3-flash-preview', // Updated to latest faster model, change back if needed
     MONGODB_URI: process.env.MONGODB_URI,
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
     MEDIA_TIMEOUT_MS: 300000,
@@ -662,6 +669,7 @@ app.get('/', (req, res) => {
             <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
                 ${mongoConnected ? '🗄️ MongoDB Connected (Persistent Sessions)' : '⚠️ MongoDB Not Connected'}
             </div>
+            <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
     `;
     
     if (isConnected) {
@@ -771,6 +779,7 @@ app.get('/health', (req, res) => {
         bufferedMedia: stats,
         storedContexts: storedContextsCount,
         processedCount,
+        activeKeys: CONFIG.API_KEYS.length,
         timestamp: new Date().toISOString()
     });
 });
@@ -1274,7 +1283,7 @@ async function handleMessage(sock, msg) {
             const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
             
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Group Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}` 
+                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Group Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available` 
             });
         }
         else {
@@ -1479,17 +1488,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
 
-let model;
-try {
-    const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
-    model = genAI.getGenerativeModel({ 
-        model: CONFIG.GEMINI_MODEL,
-        systemInstruction: CONFIG.SYSTEM_INSTRUCTION
-    });
-    log('✅', 'Gemini AI ready');
-} catch (error) {
-    log('❌', `Gemini init error: ${error.message}`);
-}
+// NOTE: Global model init is removed. We now init per-request for key rotation.
 
 async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null) {
     const shortId = getShortSenderId(senderId);
@@ -1662,8 +1661,52 @@ ${allOriginalText.join('\n\n')}
             requestContent = [promptText];
         }
         
-        const result = await model.generateContent(requestContent);
-        const responseText = result.response.text();
+        // --- API KEY ROTATION LOGIC START ---
+        
+        let responseText = null;
+        let success = false;
+        let lastErrorMsg = '';
+        
+        const keys = CONFIG.API_KEYS;
+        
+        if (keys.length === 0) {
+            throw new Error('No API keys configured!');
+        }
+        
+        // Try each key one by one
+        for (let i = 0; i < keys.length; i++) {
+            try {
+                // If this isn't the first key, log that we are switching
+                if (i > 0) {
+                    log('⚠️', `Retrying with Backup Key #${i + 1}...`);
+                }
+
+                const genAI = new GoogleGenerativeAI(keys[i]);
+                const model = genAI.getGenerativeModel({ 
+                    model: CONFIG.GEMINI_MODEL,
+                    systemInstruction: CONFIG.SYSTEM_INSTRUCTION
+                });
+                
+                const result = await model.generateContent(requestContent);
+                responseText = result.response.text();
+                success = true;
+                
+                // If successful, break the loop
+                break;
+                
+            } catch (error) {
+                lastErrorMsg = error.message;
+                log('❌', `Key #${i + 1} failed: ${error.message}`);
+                
+                // Continue to next key in loop automatically
+            }
+        }
+        
+        if (!success) {
+            throw new Error(`All ${keys.length} API keys failed. Last error: ${lastErrorMsg}`);
+        }
+        
+        // --- API KEY ROTATION LOGIC END ---
         
         if (!responseText || responseText.trim() === '') {
             log('⚠️', `Empty response from AI for ...${shortId}`);
@@ -1718,14 +1761,14 @@ ${allOriginalText.join('\n\n')}
         await new Promise(r => setTimeout(r, 1500));
         
         await sock.sendMessage(chatId, { 
-            text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again.`,
+            text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
             mentions: [senderId]
         });
     }
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.2                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v2.3                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
@@ -1735,14 +1778,17 @@ console.log('║                                                            ║'
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
 console.log('║  🗄️ MongoDB Persistent Sessions                           ║');
+console.log('║  🔑 Multi-Key Failover System Active                      ║');
 console.log('║                                                            ║');
 console.log('║  🔒 Works ONLY in ONE specific group                       ║');
 console.log('╚════════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Starting...');
 
-if (!CONFIG.GEMINI_API_KEY) {
-    log('❌', 'GEMINI_API_KEY not set!');
+if (CONFIG.API_KEYS.length === 0) {
+    log('❌', 'No API Keys found! Set GEMINI_API_KEYS environment variable.');
+} else {
+    log('🔑', `Loaded ${CONFIG.API_KEYS.length} Gemini API Key(s)`);
 }
 
 if (CONFIG.ALLOWED_GROUP_ID) {
