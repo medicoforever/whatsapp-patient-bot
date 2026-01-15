@@ -12,7 +12,7 @@ const __dirname = dirname(__filename);
 
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    GEMINI_MODEL: 'gemini-3-flash-preview',
+    GEMINI_MODEL: 'gemini-2.0-flash',
     MONGODB_URI: process.env.MONGODB_URI,
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
     MEDIA_TIMEOUT_MS: 300000,
@@ -33,63 +33,36 @@ const CONFIG = {
         'video/quicktime', 'video/x-matroska', 'video/mkv', 'video/3gpp', 'video/3gp'
     ],
     SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
-    SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded files (images, PDFs, audio recordings, or video files). You may also receive additional text context provided by the user. Your task is to analyze all content to create a concise and comprehensive "Clinical Profile".
+    SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology and clinical documentation. You have two modes of operation:
 
-IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT
+**MODE 1 - CLINICAL PROFILE GENERATION:**
+When asked to generate or update a Clinical Profile, extract transcript/raw text from uploaded files (images, PDFs, audio recordings, or video files) and any text context provided. Create a concise and comprehensive "Clinical Profile".
 
-FOR AUDIO FILES: Transcribe the audio content carefully and extract all relevant medical information mentioned.
+IMPORTANT: IF HANDWRITTEN TEXT IS NOT LEGIBLE, USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER IT.
 
-FOR VIDEO FILES: Analyze the video content, transcribe any audio, and extract all visible medical information including any text, scans, or documents shown.
+FOR AUDIO FILES: Transcribe the audio content carefully and extract all relevant medical information.
+FOR VIDEO FILES: Analyze the video content, transcribe any audio, and extract all visible medical information.
+FOR TEXT MESSAGES: Incorporate additional clinical context, patient history, or notes into the Clinical Profile.
 
-FOR TEXT MESSAGES: These may contain additional clinical context, patient history, or notes that should be incorporated into the Clinical Profile.
+Follow these instructions for Clinical Profile generation:
+- Analyze all provided content meticulously
+- Extract key information: scan types, dates, findings, measurements, impressions, clinical history
+- Synthesize into a single cohesive paragraph
+- Frame sentences concisely but DO NOT omit important clinical details
+- EXCLUDE patient's name, age, or gender
+- Arrange dated scan reports chronologically in ascending order
+- For scans without dates, refer to them as "Previous [Scan Type]..."
+- Output format: A single paragraph starting with "*Clinical Profile:" wrapped in asterisks
 
-FOR FOLLOW-UP REQUESTS: If the user provides additional context or corrections after receiving a Clinical Profile, incorporate that new information and regenerate an updated Clinical Profile.
+**MODE 2 - FOLLOW-UP QUESTIONS AND CLARIFICATIONS:**
+When a user asks a question or requests clarification about a previously generated Clinical Profile:
+- Answer the question directly and informatively
+- Provide medical explanations in clear, understandable language
+- Reference the Clinical Profile and attached files as needed
+- Do NOT regenerate the Clinical Profile unless explicitly asked
+- Be helpful, professional, and thorough in your response
 
-YOUR RESPONSE MUST BE BASED SOLELY ON THE PROVIDED CONTENT (files AND text).
-
-Follow these strict instructions:
-
-Analyze All Content: Meticulously examine all provided files - images, PDFs, audio recordings, and video files, as well as any accompanying text messages. This may include prior medical scan reports (like USG, CT, MRI), clinical notes, voice memos, video recordings, or other relevant documents.
-
-Extract Key Information: From the content, identify and extract all pertinent information, such as:
-
-Scan types (e.g., USG, CT Brain).
-
-Dates of scans or documents.
-
-Key findings, measurements, or impressions from reports.
-
-Relevant clinical history mentioned in notes, audio, video, or text messages.
-
-Synthesize into a Clinical Profile:
-
-Combine all extracted information into a single, cohesive paragraph. This represents a 100% recreation of the relevant clinical details from the provided content.
-
-If there are repeated or vague findings across multiple documents, synthesize them into a single, concise statement.
-
-Frame sentences properly to be concise, but you MUST NOT omit any important clinical details. Prioritize completeness of clinical information over extreme brevity.
-
-You MUST strictly exclude any mention of the patient's name, age, or gender.
-
-If multiple dated scan reports are present, you MUST arrange their summaries chronologically in ascending order based on their dates.
-
-If a date is not available for a scan, refer to it as "Previous [Scan Type]...".
-
-Formatting:
-
-The final output MUST be a single paragraph.
-
-This paragraph MUST start with "Clinical Profile:" and the entire content (including the prefix) must be wrapped in single asterisks. For example: "*Clinical Profile: Previous USG dated 01/01/2023 showed mild hepatomegaly. Patient also has a H/o hypertension as noted in the clinical sheet.*"
-
-Output:
-
-Do not output the raw transcribed text.
-
-Do not output JSON or Markdown code blocks.
-
-Return ONLY the single formatted paragraph described above.
-
-IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT`
+Determine which mode to use based on the user's request.`
 };
 
 function isAudioMime(mimeType) {
@@ -451,6 +424,63 @@ function isBotMessage(chatId, messageId) {
     return botMessageIds.get(chatId).has(messageId);
 }
 
+// Helper function to detect if text is a question or request
+function isQuestionOrRequest(text) {
+    if (!text) return false;
+    const lowerText = text.toLowerCase().trim();
+    
+    // Check for question marks
+    if (lowerText.includes('?')) return true;
+    
+    // Check for question words at the start
+    const questionStarters = [
+        'what', 'why', 'how', 'when', 'where', 'who', 'which',
+        'is ', 'are ', 'was ', 'were ', 'do ', 'does ', 'did ',
+        'can ', 'could ', 'would ', 'should ', 'will ', 'shall ',
+        'have ', 'has ', 'had ',
+        'explain', 'tell me', 'describe', 'clarify', 'elaborate',
+        'meaning', 'means', 'mean ',
+        'significance', 'significant',
+        'serious', 'concern', 'worried', 'normal', 'abnormal',
+        'treatment', 'therapy', 'medication', 'medicine',
+        'diagnosis', 'prognosis', 'cause', 'reason',
+        'next step', 'recommend', 'suggestion', 'advice',
+        'please explain', 'please tell', 'please clarify',
+        'i want to know', 'i need to know', 'i\'d like to know',
+        'can you', 'could you', 'would you', 'please'
+    ];
+    
+    for (const starter of questionStarters) {
+        if (lowerText.startsWith(starter) || lowerText.includes(' ' + starter)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// Helper function to extract text from any message type
+function extractTextFromMessage(msg) {
+    const messageType = Object.keys(msg.message || {})[0];
+    
+    if (!messageType) return '';
+    
+    switch (messageType) {
+        case 'conversation':
+            return msg.message.conversation || '';
+        case 'extendedTextMessage':
+            return msg.message.extendedTextMessage?.text || '';
+        case 'imageMessage':
+            return msg.message.imageMessage?.caption || '';
+        case 'videoMessage':
+            return msg.message.videoMessage?.caption || '';
+        case 'documentMessage':
+            return msg.message.documentMessage?.caption || '';
+        default:
+            return '';
+    }
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -652,7 +682,7 @@ app.get('/', (req, res) => {
                     <strong>👥 Multi-User Support:</strong><br>
                     Each user's files are processed separately!<br><br>
                     <strong>↩️ Reply Feature:</strong><br>
-                    Reply to bot's response to add more context!</p>
+                    Reply to bot's response to ask questions or add context!</p>
                 </div>
                 <div class="media-support">
                     <span class="feature-badge">📷 Images</span>
@@ -661,7 +691,7 @@ app.get('/', (req, res) => {
                     <span class="feature-badge">🎵 MP3/WAV</span>
                     <span class="feature-badge">🎬 MP4/Video</span>
                     <span class="feature-badge">💬 Text</span>
-                    <span class="feature-badge">👥 Per-User</span>
+                    <span class="feature-badge">❓ Q&A</span>
                 </div>
             `;
         } else {
@@ -986,6 +1016,7 @@ async function handleMessage(sock, msg) {
     let quotedMessageId = null;
     let contextInfo = null;
     
+    // Extract context info from various message types
     if (messageType === 'extendedTextMessage') {
         contextInfo = msg.message.extendedTextMessage?.contextInfo;
     } else if (messageType === 'imageMessage') {
@@ -996,6 +1027,10 @@ async function handleMessage(sock, msg) {
         contextInfo = msg.message.audioMessage?.contextInfo;
     } else if (messageType === 'videoMessage') {
         contextInfo = msg.message.videoMessage?.contextInfo;
+    } else if (messageType === 'conversation') {
+        // Conversation type doesn't typically have contextInfo for replies
+        // but check anyway
+        contextInfo = msg.message.conversation?.contextInfo;
     }
     
     if (contextInfo?.stanzaId) {
@@ -1195,14 +1230,14 @@ async function handleMessage(sock, msg) {
                 await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName);
             } else {
                 await sock.sendMessage(chatId, { 
-                    text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend images, PDFs, audio (.mp3, .wav), video (.mp4), or text first, then send *.*\n\n💡 _Or reply to my previous response to add context!_`,
+                    text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend images, PDFs, audio (.mp3, .wav), video (.mp4), or text first, then send *.*\n\n💡 _Or reply to my previous response to ask questions or add context!_`,
                     mentions: [senderId]
                 });
             }
         }
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
-                text: `🏥 *Clinical Profile Bot*\n\n*Supported Files:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files (.mp3, .wav, .ogg, .m4a)\n🎬 Video files (.mp4, .mkv, .avi, .mov)\n💬 Text notes & captions\n\n*Basic Usage:*\n1️⃣ Send file(s) and/or text\n2️⃣ Send *.* to process\n\n*👥 Multi-User:*\nEach user's files are tracked separately!\n\n*↩️ Reply Feature:*\nReply to my response to add more context.\n\n*Commands:*\n• *.* - Process YOUR content\n• *clear* - Clear YOUR buffer\n• *status* - Check status` 
+                text: `🏥 *Clinical Profile Bot*\n\n*Supported Files:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files (.mp3, .wav, .ogg, .m4a)\n🎬 Video files (.mp4, .mkv, .avi, .mov)\n💬 Text notes & captions\n\n*Basic Usage:*\n1️⃣ Send file(s) and/or text\n2️⃣ Send *.* to process\n\n*👥 Multi-User:*\nEach user's files are tracked separately!\n\n*↩️ Reply Feature:*\n• Reply to my response to ask questions\n• Reply with more files/text to refine the profile\n\n*Commands:*\n• *.* - Process YOUR content\n• *clear* - Clear YOUR buffer\n• *status* - Check status` 
             });
         }
         else if (text.toLowerCase() === 'clear') {
@@ -1270,24 +1305,44 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     
     const messageType = Object.keys(msg.message)[0];
     const newContent = [];
+    let replyText = '';
     
-    if (messageType === 'extendedTextMessage') {
-        const text = msg.message.extendedTextMessage?.text || '';
-        if (text.trim()) {
+    // Handle conversation type (simple text reply)
+    if (messageType === 'conversation') {
+        const text = msg.message.conversation || '';
+        replyText = text.trim();
+        if (replyText) {
             newContent.push({
                 type: 'text',
-                content: text.trim(),
+                content: replyText,
                 sender: senderName,
                 timestamp: Date.now(),
                 isFollowUp: true
             });
-            log('💬', `Follow-up text from ...${shortId}`);
+            log('💬', `Follow-up text (conversation) from ...${shortId}: "${replyText.substring(0, 50)}${replyText.length > 50 ? '...' : ''}"`);
         }
     }
+    // Handle extended text message (text with reply context)
+    else if (messageType === 'extendedTextMessage') {
+        const text = msg.message.extendedTextMessage?.text || '';
+        replyText = text.trim();
+        if (replyText) {
+            newContent.push({
+                type: 'text',
+                content: replyText,
+                sender: senderName,
+                timestamp: Date.now(),
+                isFollowUp: true
+            });
+            log('💬', `Follow-up text from ...${shortId}: "${replyText.substring(0, 50)}${replyText.length > 50 ? '...' : ''}"`);
+        }
+    }
+    // Handle image reply
     else if (messageType === 'imageMessage') {
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
             const caption = msg.message.imageMessage.caption || '';
+            replyText = caption;
             
             newContent.push({
                 type: 'image',
@@ -1298,14 +1353,27 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
                 isFollowUp: true
             });
             log('📷', `Follow-up image from ...${shortId}`);
+            
+            if (caption) {
+                newContent.push({
+                    type: 'text',
+                    content: caption,
+                    sender: senderName,
+                    timestamp: Date.now(),
+                    isFollowUp: true,
+                    isCaption: true
+                });
+            }
         } catch (error) {
             log('❌', `Image error: ${error.message}`);
         }
     }
+    // Handle video reply
     else if (messageType === 'videoMessage') {
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
             const caption = msg.message.videoMessage.caption || '';
+            replyText = caption;
             
             newContent.push({
                 type: 'video',
@@ -1317,10 +1385,22 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
                 isFollowUp: true
             });
             log('🎬', `Follow-up video from ...${shortId}`);
+            
+            if (caption) {
+                newContent.push({
+                    type: 'text',
+                    content: caption,
+                    sender: senderName,
+                    timestamp: Date.now(),
+                    isFollowUp: true,
+                    isCaption: true
+                });
+            }
         } catch (error) {
             log('❌', `Video error: ${error.message}`);
         }
     }
+    // Handle audio reply
     else if (messageType === 'audioMessage') {
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
@@ -1339,10 +1419,12 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
             log('❌', `Audio error: ${error.message}`);
         }
     }
+    // Handle document reply
     else if (messageType === 'documentMessage') {
         const docMime = msg.message.documentMessage.mimetype || '';
         const fileName = msg.message.documentMessage.fileName || 'document';
         const caption = msg.message.documentMessage.caption || '';
+        replyText = caption;
         
         const fileType = getFileType(docMime, fileName);
         
@@ -1410,11 +1492,14 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
         return;
     }
     
+    // Determine if this is a question or additional context
+    const isQuestion = isQuestionOrRequest(replyText);
+    
     const combinedMedia = [...storedContext.mediaFiles, ...newContent];
     
-    log('🔄', `Regenerating for ...${shortId}: ${storedContext.mediaFiles.length} original + ${newContent.length} new`);
+    log('🔄', `Processing reply for ...${shortId}: ${storedContext.mediaFiles.length} original + ${newContent.length} new (isQuestion: ${isQuestion})`);
     
-    await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName);
+    await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, isQuestion, replyText);
 }
 
 let model;
@@ -1429,7 +1514,7 @@ try {
     log('❌', `Gemini init error: ${error.message}`);
 }
 
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName) {
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, isQuestion = false, userQuery = '') {
     const shortId = getShortSenderId(senderId);
     
     try {
@@ -1445,59 +1530,43 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
             if (m.type === 'image') {
                 counts.images++;
                 binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional image caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[Image caption]: ${m.caption}`);
-                    }
+                if (m.caption && !m.isFollowUp) {
+                    captions.push(`[Image caption]: ${m.caption}`);
                 }
             }
             else if (m.type === 'pdf') {
                 counts.pdfs++;
                 binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional PDF caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[PDF caption]: ${m.caption}`);
-                    }
+                if (m.caption && !m.isFollowUp) {
+                    captions.push(`[PDF caption]: ${m.caption}`);
                 }
             }
             else if (m.type === 'audio' || m.type === 'voice') {
                 counts.audio++;
                 binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional audio caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[Audio caption]: ${m.caption}`);
-                    }
+                if (m.caption && !m.isFollowUp) {
+                    captions.push(`[Audio caption]: ${m.caption}`);
                 }
             }
             else if (m.type === 'video') {
                 counts.video++;
                 binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional video caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[Video caption]: ${m.caption}`);
-                    }
+                if (m.caption && !m.isFollowUp) {
+                    captions.push(`[Video caption]: ${m.caption}`);
                 }
             }
             else if (m.type === 'text') {
                 counts.texts++;
-                if (m.isFollowUp) {
-                    followUpTexts.push(`[Additional context from ${m.sender}]: ${m.content}`);
-                } else {
+                if (m.isFollowUp && !m.isCaption) {
+                    followUpTexts.push(`[User's follow-up message]: ${m.content}`);
+                } else if (!m.isFollowUp) {
                     textContents.push(`[Text note from ${m.sender}]: ${m.content}`);
                 }
             }
         });
         
         if (isFollowUp) {
-            log('🤖', `Processing follow-up for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
+            log('🤖', `Processing follow-up for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text (question: ${isQuestion})`);
         } else {
             log('🤖', `Processing for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
         }
@@ -1522,22 +1591,48 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
         let promptText = '';
         
         if (isFollowUp && previousResponse) {
-            promptText = `This is a FOLLOW-UP request. The user has provided additional context to refine the Clinical Profile.
+            // Check if user is asking a question or providing additional context
+            if (isQuestion && userQuery) {
+                // User is asking a question about the Clinical Profile
+                promptText = `The user is asking a QUESTION or making a REQUEST about the previously generated Clinical Profile. Please answer their question directly and helpfully.
+
+=== PREVIOUS CLINICAL PROFILE YOU GENERATED ===
+${previousResponse}
+=== END PREVIOUS CLINICAL PROFILE ===
+
+=== USER'S QUESTION/REQUEST ===
+${userQuery}
+=== END QUESTION ===
+
+${followUpTexts.length > 0 ? `=== ADDITIONAL CONTEXT FROM USER ===\n${followUpTexts.join('\n\n')}\n=== END ADDITIONAL CONTEXT ===\n\n` : ''}
+Please provide a helpful, informative response to the user's question. You may reference the Clinical Profile and any attached medical files. 
+
+IMPORTANT: 
+- Answer the question directly and conversationally
+- Provide clear medical explanations in understandable language
+- If the user asks about significance, prognosis, or recommendations, provide appropriate medical guidance
+- Do NOT regenerate the Clinical Profile unless explicitly asked to do so
+- Be professional, thorough, and helpful`;
+            } else {
+                // User is providing additional context to refine the profile
+                promptText = `This is a FOLLOW-UP request to refine the Clinical Profile. The user has provided additional context or information.
 
 === PREVIOUS CLINICAL PROFILE GENERATED ===
 ${previousResponse}
 === END PREVIOUS RESPONSE ===
 
 === ORIGINAL CONTEXT ===
-${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original files are attached below)'}
+${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original files are attached)'}
 === END ORIGINAL CONTEXT ===
 
-=== NEW ADDITIONAL CONTEXT FROM USER ===
+=== NEW ADDITIONAL INFORMATION FROM USER ===
 ${followUpTexts.join('\n\n')}
-=== END NEW CONTEXT ===
+=== END NEW INFORMATION ===
 
-Please analyze ALL the content (original files + original text + NEW additional context) and generate an UPDATED Clinical Profile that incorporates the new information.`;
-            
+Please analyze ALL the content (original files + original text + NEW additional information) and generate an UPDATED Clinical Profile that incorporates the new information. 
+
+The Clinical Profile should be a single paragraph starting with "*Clinical Profile:" and wrapped in single asterisks. Maintain the same format as before but include the new information appropriately.`;
+            }
         } else if (binaryMedia.length > 0 && allOriginalText.length > 0) {
             promptText = `Analyze these ${promptParts.join(', ')} along with the following additional text notes/context, and generate the Clinical Profile.
 
@@ -1566,19 +1661,39 @@ ${allOriginalText.join('\n\n')}
             requestContent = [promptText];
         }
         
-        const result = await model.generateContent(requestContent);
-        const clinicalProfile = result.response.text();
+        // Add safety check for empty prompt
+        if (!promptText || promptText.trim() === '') {
+            log('⚠️', `Empty prompt for ...${shortId}`);
+            await sock.sendMessage(chatId, { 
+                text: `⚠️ @${senderId.split('@')[0]}, I couldn't process your request. Please try again with more content.`,
+                mentions: [senderId]
+            });
+            return;
+        }
         
-        log('✅', `Done for ...${shortId}!`);
+        log('📝', `Sending to Gemini (prompt length: ${promptText.length}, media items: ${contentParts.length})`);
+        
+        const result = await model.generateContent(requestContent);
+        let responseText = result.response.text();
+        
+        // Check for empty response
+        if (!responseText || responseText.trim() === '') {
+            log('⚠️', `Empty response from Gemini for ...${shortId}`);
+            responseText = `I apologize, but I couldn't generate a proper response. Please try again or provide more context.`;
+        }
+        
+        log('✅', `Response received for ...${shortId} (length: ${responseText.length})`);
         processedCount++;
         
         console.log('\n' + '═'.repeat(60));
         console.log(`👤 User: ${senderName} (...${shortId})`);
-        if (isFollowUp) console.log(`🔄 FOLLOW-UP RESPONSE`);
+        if (isFollowUp) {
+            console.log(`🔄 FOLLOW-UP ${isQuestion ? '(QUESTION)' : '(ADDITIONAL CONTEXT)'}`);
+        }
         console.log(`📊 ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
         console.log(`⏰ ${new Date().toLocaleString()}`);
         console.log('═'.repeat(60));
-        console.log(clinicalProfile);
+        console.log(responseText);
         console.log('═'.repeat(60) + '\n');
         
         await sock.sendPresenceUpdate('composing', chatId);
@@ -1587,19 +1702,19 @@ ${allOriginalText.join('\n\n')}
         await sock.sendPresenceUpdate('paused', chatId);
         
         let sentMessage;
-        const responseText = clinicalProfile.length <= 3800 
-            ? clinicalProfile 
-            : clinicalProfile.substring(0, 3800) + '\n\n_(truncated)_';
+        const finalResponse = responseText.length <= 3800 
+            ? responseText 
+            : responseText.substring(0, 3800) + '\n\n_(truncated)_';
         
         sentMessage = await sock.sendMessage(chatId, { 
-            text: responseText,
+            text: finalResponse,
             mentions: [senderId]
         });
         
         if (sentMessage?.key?.id) {
             const messageId = sentMessage.key.id;
             trackBotMessage(chatId, messageId);
-            storeContext(chatId, messageId, mediaFiles, clinicalProfile, senderId);
+            storeContext(chatId, messageId, mediaFiles, responseText, senderId);
             log('💾', `Context stored for ...${shortId}`);
         }
         
@@ -1612,15 +1727,24 @@ ${allOriginalText.join('\n\n')}
         await sock.sendPresenceUpdate('composing', chatId);
         await new Promise(r => setTimeout(r, 1500));
         
+        let errorMessage = error.message;
+        if (error.message.includes('SAFETY')) {
+            errorMessage = 'Content was flagged by safety filters. Please try with different content.';
+        } else if (error.message.includes('quota') || error.message.includes('limit')) {
+            errorMessage = 'API quota exceeded. Please try again later.';
+        } else if (error.message.includes('timeout')) {
+            errorMessage = 'Request timed out. Please try again.';
+        }
+        
         await sock.sendMessage(chatId, { 
-            text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again.`,
+            text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${errorMessage}_\n\nPlease try again.`,
             mentions: [senderId]
         });
     }
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.1                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v2.2                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
@@ -1628,7 +1752,8 @@ console.log('║  🎵 Supports: MP3, WAV, OGG, M4A, AAC, FLAC               ║
 console.log('║  🎬 Supports: MP4, MKV, AVI, MOV, WEBM                    ║');
 console.log('║                                                            ║');
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
-console.log('║  ↩️ Reply to bot response to add context                   ║');
+console.log('║  ↩️ Reply to bot response to ask questions or add context  ║');
+console.log('║  ❓ Smart Q&A - Detects questions vs additional context   ║');
 console.log('║  🗄️ MongoDB Persistent Sessions                           ║');
 console.log('║                                                            ║');
 console.log('║  🔒 Works ONLY in ONE specific group                       ║');
