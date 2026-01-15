@@ -5,6 +5,7 @@ import express from 'express';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import mongoose from 'mongoose';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -13,29 +14,15 @@ const __dirname = dirname(__filename);
 const CONFIG = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
     GEMINI_MODEL: 'gemini-3-flash-preview',
-    
-    // SET THIS TO YOUR GROUP ID (from environment variable)
+    MONGODB_URI: process.env.MONGODB_URI,
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
-    
-    // Time before auto-clearing media (5 minutes)
     MEDIA_TIMEOUT_MS: 300000,
-    
-    // Time to keep context for replies (30 minutes)
     CONTEXT_RETENTION_MS: 1800000,
-    
-    // Maximum contexts to store per chat (memory management)
     MAX_STORED_CONTEXTS: 20,
-    
-    // Trigger to process media
     TRIGGER_TEXT: '.',
-    
-    // Commands that should NOT be buffered as text
     COMMANDS: ['.', 'help', '?', 'clear', 'status'],
-    
-    // Typing delay range (milliseconds)
     TYPING_DELAY_MIN: 3000,
     TYPING_DELAY_MAX: 6000,
-    
     SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have to extract transcript / raw text from one or more uploaded files (images, PDFs, or audio recordings). You may also receive additional text context provided by the user. Your task is to analyze all content to create a concise and comprehensive "Clinical Profile".
 
 IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT
@@ -93,18 +80,97 @@ Return ONLY the single formatted paragraph described above.
 IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT`
 };
 
+// ============== MONGODB SESSION STORAGE ==============
+const sessionSchema = new mongoose.Schema({
+    sessionId: { type: String, required: true, unique: true },
+    data: { type: String, required: true },
+    updatedAt: { type: Date, default: Date.now }
+});
+
+const Session = mongoose.model('Session', sessionSchema);
+
+// Custom auth state using MongoDB
+async function useMongoDBAuthState() {
+    const sessionId = 'whatsapp-auth';
+    
+    const writeData = async (data, file) => {
+        const key = `${sessionId}-${file}`;
+        const jsonStr = JSON.stringify(data, (k, v) => {
+            if (typeof v === 'bigint') return v.toString() + 'n';
+            if (v instanceof Uint8Array) return { type: 'Uint8Array', data: Array.from(v) };
+            if (v instanceof Buffer) return { type: 'Buffer', data: Array.from(v) };
+            return v;
+        });
+        
+        await Session.findOneAndUpdate(
+            { sessionId: key },
+            { sessionId: key, data: jsonStr, updatedAt: new Date() },
+            { upsert: true }
+        );
+    };
+    
+    const readData = async (file) => {
+        const key = `${sessionId}-${file}`;
+        const doc = await Session.findOne({ sessionId: key });
+        if (!doc) return null;
+        
+        return JSON.parse(doc.data, (k, v) => {
+            if (typeof v === 'string' && v.endsWith('n') && !isNaN(v.slice(0, -1))) {
+                return BigInt(v.slice(0, -1));
+            }
+            if (v && typeof v === 'object') {
+                if (v.type === 'Uint8Array') return new Uint8Array(v.data);
+                if (v.type === 'Buffer') return Buffer.from(v.data);
+            }
+            return v;
+        });
+    };
+    
+    const removeData = async (file) => {
+        const key = `${sessionId}-${file}`;
+        await Session.deleteOne({ sessionId: key });
+    };
+    
+    const creds = await readData('creds') || null;
+    const keys = {};
+    
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    for (const id of ids) {
+                        const value = await readData(`${type}-${id}`);
+                        if (value) data[id] = value;
+                    }
+                    return data;
+                },
+                set: async (data) => {
+                    for (const [type, entries] of Object.entries(data)) {
+                        for (const [id, value] of Object.entries(entries)) {
+                            if (value) {
+                                await writeData(value, `${type}-${id}`);
+                            } else {
+                                await removeData(`${type}-${id}`);
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        saveCreds: async () => {
+            if (creds) await writeData(creds, 'creds');
+        }
+    };
+}
+
 // ============== SETUP ==============
-// Media buffer for new content
 const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
 const discoveredGroups = new Map();
-
-// NEW: Context storage for reply feature
-// Maps: chatId -> Map(messageId -> {mediaFiles, response, timestamp})
 const chatContexts = new Map();
-
-// Track bot's own message IDs
-const botMessageIds = new Map(); // chatId -> Set of message IDs
+const botMessageIds = new Map();
 
 let sock = null;
 let isConnected = false;
@@ -112,29 +178,25 @@ let qrCodeDataURL = null;
 let processedCount = 0;
 let botStatus = 'Starting...';
 let lastError = null;
+let mongoConnected = false;
 
-let makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion;
+let makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion, initAuthCreds;
 
 function log(emoji, message) {
     const time = new Date().toLocaleTimeString();
     console.log(`[${time}] ${emoji} ${message}`);
 }
 
-// Check if chat is the allowed group
 function isAllowedGroup(chatId) {
-    if (!CONFIG.ALLOWED_GROUP_ID) {
-        return false;
-    }
+    if (!CONFIG.ALLOWED_GROUP_ID) return false;
     return chatId === CONFIG.ALLOWED_GROUP_ID;
 }
 
-// Check if text is a command
 function isCommand(text) {
     const lowerText = text.toLowerCase().trim();
     return CONFIG.COMMANDS.includes(lowerText);
 }
 
-// Store context for a bot message
 function storeContext(chatId, messageId, mediaFiles, response) {
     if (!chatContexts.has(chatId)) {
         chatContexts.set(chatId, new Map());
@@ -142,9 +204,7 @@ function storeContext(chatId, messageId, mediaFiles, response) {
     
     const contexts = chatContexts.get(chatId);
     
-    // Clean up old contexts if too many
     if (contexts.size >= CONFIG.MAX_STORED_CONTEXTS) {
-        // Remove oldest entries
         const entries = Array.from(contexts.entries());
         entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
         const toRemove = entries.slice(0, entries.length - CONFIG.MAX_STORED_CONTEXTS + 1);
@@ -159,7 +219,6 @@ function storeContext(chatId, messageId, mediaFiles, response) {
     
     log('💾', `Stored context for message ${messageId.substring(0, 8)}...`);
     
-    // Schedule cleanup
     setTimeout(() => {
         if (chatContexts.has(chatId)) {
             const ctx = chatContexts.get(chatId);
@@ -171,7 +230,6 @@ function storeContext(chatId, messageId, mediaFiles, response) {
     }, CONFIG.CONTEXT_RETENTION_MS);
 }
 
-// Get stored context for a message
 function getStoredContext(chatId, messageId) {
     if (!chatContexts.has(chatId)) return null;
     const contexts = chatContexts.get(chatId);
@@ -179,7 +237,6 @@ function getStoredContext(chatId, messageId) {
     
     const context = contexts.get(messageId);
     
-    // Check if expired
     if (Date.now() - context.timestamp > CONFIG.CONTEXT_RETENTION_MS) {
         contexts.delete(messageId);
         return null;
@@ -188,14 +245,12 @@ function getStoredContext(chatId, messageId) {
     return context;
 }
 
-// Track bot message ID
 function trackBotMessage(chatId, messageId) {
     if (!botMessageIds.has(chatId)) {
         botMessageIds.set(chatId, new Set());
     }
     botMessageIds.get(chatId).add(messageId);
     
-    // Limit size
     const ids = botMessageIds.get(chatId);
     if (ids.size > 100) {
         const arr = Array.from(ids);
@@ -203,7 +258,6 @@ function trackBotMessage(chatId, messageId) {
     }
 }
 
-// Check if a message ID belongs to bot
 function isBotMessage(chatId, messageId) {
     if (!botMessageIds.has(chatId)) return false;
     return botMessageIds.get(chatId).has(messageId);
@@ -271,6 +325,7 @@ app.get('/', (req, res) => {
             .connected { background: #4CAF50; }
             .waiting { background: rgba(255,255,255,0.2); }
             .warning { background: #FF9800; }
+            .error { background: #f44336; }
             .qr-container {
                 background: white;
                 padding: 15px;
@@ -358,6 +413,15 @@ app.get('/', (req, res) => {
                 border-radius: 8px;
                 margin: 15px 0;
             }
+            .db-status {
+                font-size: 11px;
+                padding: 5px 10px;
+                border-radius: 20px;
+                display: inline-block;
+                margin-bottom: 15px;
+            }
+            .db-connected { background: rgba(76, 175, 80, 0.3); }
+            .db-disconnected { background: rgba(244, 67, 54, 0.3); }
             .media-support {
                 background: rgba(0,0,0,0.15);
                 padding: 10px;
@@ -379,6 +443,9 @@ app.get('/', (req, res) => {
         <div class="container">
             <h1>📱 WhatsApp Patient Bot</h1>
             <p class="subtitle">Medical Clinical Profile Generator with Context Memory</p>
+            <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
+                ${mongoConnected ? '🗄️ MongoDB Connected (Persistent Sessions)' : '⚠️ MongoDB Not Connected'}
+            </div>
     `;
     
     if (isConnected) {
@@ -414,6 +481,7 @@ app.get('/', (req, res) => {
                     <span class="feature-badge">🎤 Voice</span>
                     <span class="feature-badge">💬 Text</span>
                     <span class="feature-badge">↩️ Reply Context</span>
+                    <span class="feature-badge">🗄️ Persistent</span>
                 </div>
             `;
         } else {
@@ -496,6 +564,7 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'running',
         connected: isConnected,
+        mongoConnected: mongoConnected,
         configuredGroup: CONFIG.ALLOWED_GROUP_ID || 'NOT SET',
         discoveredGroups: Object.fromEntries(discoveredGroups),
         bufferedMedia: mediaStats,
@@ -521,12 +590,33 @@ async function loadBaileys() {
         DisconnectReason = baileys.DisconnectReason;
         downloadMediaMessage = baileys.downloadMediaMessage;
         fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
+        initAuthCreds = baileys.initAuthCreds;
         
         log('✅', 'Baileys loaded!');
         return true;
     } catch (error) {
         log('❌', `Failed: ${error.message}`);
         throw error;
+    }
+}
+
+// ============== MONGODB CONNECTION ==============
+async function connectMongoDB() {
+    if (!CONFIG.MONGODB_URI) {
+        log('⚠️', 'No MONGODB_URI configured - using file-based auth (will lose session on restart)');
+        return false;
+    }
+    
+    try {
+        log('🔄', 'Connecting to MongoDB...');
+        await mongoose.connect(CONFIG.MONGODB_URI);
+        mongoConnected = true;
+        log('✅', 'MongoDB connected! Sessions will persist.');
+        return true;
+    } catch (error) {
+        log('❌', `MongoDB connection failed: ${error.message}`);
+        mongoConnected = false;
+        return false;
     }
 }
 
@@ -538,8 +628,29 @@ async function startBot() {
         
         if (!makeWASocket) await loadBaileys();
         
-        const authPath = join(__dirname, 'auth_session');
-        const { state, saveCreds } = await useMultiFileAuthState(authPath);
+        // Try MongoDB first, fallback to file auth
+        let authState;
+        if (mongoConnected) {
+            try {
+                authState = await useMongoDBAuthState();
+                log('✅', 'Using MongoDB for session storage');
+            } catch (e) {
+                log('⚠️', `MongoDB auth failed: ${e.message}, falling back to file auth`);
+                const authPath = join(__dirname, 'auth_session');
+                authState = await useMultiFileAuthState(authPath);
+            }
+        } else {
+            const authPath = join(__dirname, 'auth_session');
+            authState = await useMultiFileAuthState(authPath);
+            log('📁', 'Using file-based auth (session will be lost on restart)');
+        }
+        
+        const { state, saveCreds } = authState;
+        
+        // Initialize creds if null
+        if (!state.creds) {
+            state.creds = initAuthCreds();
+        }
         
         let version;
         try {
@@ -571,7 +682,7 @@ async function startBot() {
                         color: { dark: '#128C7E', light: '#FFFFFF' }
                     });
                     isConnected = false;
-                    log('📱', 'QR Code ready!');
+                    log('📱', 'QR Code ready - scan to connect!');
                 } catch (err) {
                     lastError = err.message;
                 }
@@ -582,8 +693,23 @@ async function startBot() {
                 qrCodeDataURL = null;
                 const code = lastDisconnect?.error?.output?.statusCode;
                 
+                log('🔌', `Connection closed. Code: ${code}`);
+                
                 if (code === 401 || code === 405 || code === DisconnectReason?.loggedOut) {
-                    try { fs.rmSync(authPath, { recursive: true, force: true }); } catch (e) {}
+                    log('🔐', 'Session logged out - clearing auth...');
+                    // Clear MongoDB sessions if using MongoDB
+                    if (mongoConnected) {
+                        try {
+                            await Session.deleteMany({});
+                            log('🗑️', 'Cleared MongoDB sessions');
+                        } catch (e) {
+                            log('⚠️', `Failed to clear MongoDB: ${e.message}`);
+                        }
+                    }
+                    // Also try to clear file auth
+                    try { 
+                        fs.rmSync(join(__dirname, 'auth_session'), { recursive: true, force: true }); 
+                    } catch (e) {}
                 }
                 
                 setTimeout(startBot, 5000);
@@ -591,7 +717,10 @@ async function startBot() {
             } else if (connection === 'open') {
                 isConnected = true;
                 qrCodeDataURL = null;
-                log('✅', '🎉 CONNECTED!');
+                log('✅', '🎉 CONNECTED TO WHATSAPP!');
+                
+                // Save credentials
+                await saveCreds();
                 
                 if (CONFIG.ALLOWED_GROUP_ID) {
                     log('🎯', `Bot active ONLY in: ${CONFIG.ALLOWED_GROUP_ID}`);
@@ -625,7 +754,6 @@ async function handleMessage(sock, msg) {
     
     const isGroup = chatId.endsWith('@g.us');
     
-    // Discover groups
     if (isGroup && !discoveredGroups.has(chatId)) {
         try {
             const metadata = await sock.groupMetadata(chatId);
@@ -648,16 +776,14 @@ async function handleMessage(sock, msg) {
     const messageType = Object.keys(msg.message)[0];
     const senderName = msg.pushName || 'Unknown';
     
-    // Initialize buffer
     if (!chatMediaBuffers.has(chatId)) {
         chatMediaBuffers.set(chatId, []);
     }
     
-    // ========== CHECK FOR REPLY TO BOT MESSAGE ==========
+    // Check for reply to bot message
     let quotedMessageId = null;
     let contextInfo = null;
     
-    // Check for quoted message in different message types
     if (messageType === 'extendedTextMessage') {
         contextInfo = msg.message.extendedTextMessage?.contextInfo;
     } else if (messageType === 'imageMessage') {
@@ -671,14 +797,12 @@ async function handleMessage(sock, msg) {
     if (contextInfo?.stanzaId) {
         quotedMessageId = contextInfo.stanzaId;
         
-        // Check if this is a reply to a bot message
         if (isBotMessage(chatId, quotedMessageId)) {
             log('↩️', `Reply to bot message detected from ${senderName}`);
             await handleReplyToBot(sock, msg, chatId, quotedMessageId, senderName);
             return;
         }
     }
-    // ====================================================
     
     // Handle IMAGES
     if (messageType === 'imageMessage') {
@@ -782,7 +906,6 @@ async function handleMessage(sock, msg) {
         
         if (!text) return;
         
-        // Trigger: "."
         if (text === CONFIG.TRIGGER_TEXT) {
             log('🔔', `Trigger from ${senderName}`);
             
@@ -804,13 +927,11 @@ async function handleMessage(sock, msg) {
                 });
             }
         }
-        // Help
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
                 text: `🏥 *Clinical Profile Bot*\n\n*Supported Content:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files\n💬 Text notes & captions\n\n*Basic Usage:*\n1️⃣ Send file(s) and/or text\n2️⃣ Send *.* to process\n\n*↩️ Reply Feature (NEW!):*\nTo add more context to a result:\n1️⃣ Long-press my response\n2️⃣ Tap "Reply"\n3️⃣ Type your additional info\n4️⃣ I'll regenerate with new context!\n\n*Commands:*\n• *.* - Process all content\n• *clear* - Clear buffer\n• *status* - Check status` 
             });
         }
-        // Clear
         else if (text.toLowerCase() === 'clear') {
             if (chatMediaBuffers.has(chatId)) {
                 const items = chatMediaBuffers.get(chatId);
@@ -833,7 +954,6 @@ async function handleMessage(sock, msg) {
                 await sock.sendMessage(chatId, { text: `ℹ️ No content buffered` });
             }
         }
-        // Status
         else if (text.toLowerCase() === 'status') {
             let mediaStats = { images: 0, pdfs: 0, audio: 0, texts: 0 };
             if (chatMediaBuffers.has(chatId)) {
@@ -849,10 +969,9 @@ async function handleMessage(sock, msg) {
             const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
             
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n📷 Images: ${mediaStats.images}\n📄 PDFs: ${mediaStats.pdfs}\n🎤 Audio: ${mediaStats.audio}\n💬 Texts: ${mediaStats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n\n💡 _Reply to any of my responses to add context!_` 
+                text: `📊 *Status*\n\n📷 Images: ${mediaStats.images}\n📄 PDFs: ${mediaStats.pdfs}\n🎤 Audio: ${mediaStats.audio}\n💬 Texts: ${mediaStats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n\n💡 _Reply to any of my responses to add context!_` 
             });
         }
-        // Buffer as text note
         else {
             log('💬', `Text from ${senderName}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
             
@@ -873,7 +992,6 @@ async function handleMessage(sock, msg) {
 
 // ============== HANDLE REPLY TO BOT MESSAGE ==============
 async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderName) {
-    // Get stored context
     const storedContext = getStoredContext(chatId, quotedMessageId);
     
     if (!storedContext) {
@@ -887,7 +1005,6 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderName) 
     const messageType = Object.keys(msg.message)[0];
     const newContent = [];
     
-    // Extract new content from reply
     if (messageType === 'extendedTextMessage') {
         const text = msg.message.extendedTextMessage?.text || '';
         if (text.trim()) {
@@ -973,16 +1090,13 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderName) 
         return;
     }
     
-    // Combine old context with new content
     const combinedMedia = [...storedContext.mediaFiles, ...newContent];
     
     log('🔄', `Regenerating with ${storedContext.mediaFiles.length} original + ${newContent.length} new item(s)`);
     
-    // Process with combined context
     await processMedia(sock, chatId, combinedMedia, true, storedContext.response);
 }
 
-// Helper function to reset the auto-clear timeout
 function resetMediaTimeout(chatId) {
     if (chatTimeouts.has(chatId)) {
         clearTimeout(chatTimeouts.get(chatId));
@@ -1013,7 +1127,6 @@ try {
 
 async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null) {
     try {
-        // Count and categorize
         const counts = { images: 0, pdfs: 0, audio: 0, texts: 0, followUps: 0 };
         const textContents = [];
         const captions = [];
@@ -1065,7 +1178,6 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
             log('🤖', `Processing: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.texts} text`);
         }
         
-        // Build content parts
         const contentParts = [];
         binaryMedia.forEach(media => {
             contentParts.push({
@@ -1076,7 +1188,6 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
             });
         });
         
-        // Build prompt
         let promptParts = [];
         if (counts.images > 0) promptParts.push(`${counts.images} image(s)`);
         if (counts.pdfs > 0) promptParts.push(`${counts.pdfs} PDF document(s)`);
@@ -1086,7 +1197,6 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
         let promptText = '';
         
         if (isFollowUp && previousResponse) {
-            // FOLLOW-UP REQUEST
             promptText = `This is a FOLLOW-UP request. The user has provided additional context to refine the Clinical Profile.
 
 === PREVIOUS CLINICAL PROFILE GENERATED ===
@@ -1123,7 +1233,6 @@ ${allOriginalText.join('\n\n')}
 === END OF TEXT NOTES ===`;
         }
         
-        // Build request
         let requestContent;
         if (binaryMedia.length > 0) {
             requestContent = [promptText, ...contentParts];
@@ -1137,7 +1246,6 @@ ${allOriginalText.join('\n\n')}
         log('✅', 'Done!');
         processedCount++;
         
-        // Log to console
         console.log('\n' + '═'.repeat(60));
         if (isFollowUp) {
             console.log(`🔄 FOLLOW-UP RESPONSE`);
@@ -1148,14 +1256,12 @@ ${allOriginalText.join('\n\n')}
         console.log(clinicalProfile);
         console.log('═'.repeat(60) + '\n');
         
-        // Human-like typing
         await sock.sendPresenceUpdate('composing', chatId);
         const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
         log('⌨️', `Simulating typing for ${(delay/1000).toFixed(1)}s...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         await sock.sendPresenceUpdate('paused', chatId);
         
-        // Send response
         let sentMessage;
         if (clinicalProfile.length <= 4000) {
             sentMessage = await sock.sendMessage(chatId, { text: clinicalProfile });
@@ -1172,7 +1278,6 @@ ${allOriginalText.join('\n\n')}
             }
         }
         
-        // Store context for future replies
         if (sentMessage?.key?.id) {
             const messageId = sentMessage.key.id;
             trackBotMessage(chatId, messageId);
@@ -1201,6 +1306,7 @@ console.log('║                                                           ║')
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  💬 Text          ║');
 console.log('║                                                           ║');
 console.log('║  ✨ NEW: Reply to bot response to add context!           ║');
+console.log('║  🗄️ MongoDB Persistent Sessions                          ║');
 console.log('║                                                           ║');
 console.log('║  🔒 Works ONLY in ONE specific group                      ║');
 console.log('╚═══════════════════════════════════════════════════════════╝\n');
@@ -1214,4 +1320,7 @@ if (CONFIG.ALLOWED_GROUP_ID) {
     log('💡', 'After finding your group ID, add ALLOWED_GROUP_ID to Render environment.');
 }
 
-startBot();
+// Connect MongoDB first, then start bot
+connectMongoDB().then(() => {
+    startBot();
+});
