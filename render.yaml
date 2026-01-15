@@ -7,7 +7,7 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: GEMINI_API_KEY
+      - key: GEMINI_API_KEYS
         sync: false
       - key: NODE_VERSION
         value: 20.10.0
