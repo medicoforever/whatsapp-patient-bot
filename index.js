@@ -25,7 +25,7 @@ const getApiKeys = () => {
 const CONFIG = {
     API_KEYS: getApiKeys(),
     // Using flash model which is faster and cheaper (free tier friendly)
-    GEMINI_MODEL: 'gemini-1.5-flash', 
+    GEMINI_MODEL: 'gemini-3-flash-preview', 
     MONGODB_URI: process.env.MONGODB_URI,
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
     MEDIA_TIMEOUT_MS: 300000,
