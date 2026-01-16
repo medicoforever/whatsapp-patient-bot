@@ -25,14 +25,14 @@ const getApiKeys = () => {
 const CONFIG = {
     // We now store an array of keys
     API_KEYS: getApiKeys(),
-    GEMINI_MODEL: 'gemini-3-flash-preview', 
+    GEMINI_MODEL: 'gemini-2.0-flash', 
     MONGODB_URI: process.env.MONGODB_URI,
-    ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
+    // REMOVED ALLOWED_GROUP_ID constraint. Bot is now public.
     MEDIA_TIMEOUT_MS: 300000,
     CONTEXT_RETENTION_MS: 1800000,
     MAX_STORED_CONTEXTS: 20,
-    TRIGGER_TEXT: '.',
-    COMMANDS: ['.', 'help', '?', 'clear', 'status'],
+    // Trigger text is now dynamic (handled in code), but base commands remain
+    COMMANDS: ['.', '.1', '.2', '.3', 'help', '?', 'clear', 'status'],
     TYPING_DELAY_MIN: 3000,
     TYPING_DELAY_MAX: 6000,
     SUPPORTED_AUDIO_MIMES: [
@@ -301,7 +301,6 @@ async function useMongoDBAuthState() {
 
 const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
-const discoveredGroups = new Map();
 const chatContexts = new Map();
 const botMessageIds = new Map();
 
@@ -337,16 +336,6 @@ function getShortSenderId(senderId) {
         return phone.slice(-4);
     }
     return phone;
-}
-
-function isAllowedGroup(chatId) {
-    if (!CONFIG.ALLOWED_GROUP_ID) return false;
-    return chatId === CONFIG.ALLOWED_GROUP_ID;
-}
-
-function isCommand(text) {
-    const lowerText = text.toLowerCase().trim();
-    return CONFIG.COMMANDS.includes(lowerText);
 }
 
 function getUserBuffer(chatId, senderId) {
@@ -502,8 +491,8 @@ function isBotMessage(chatId, messageId) {
     return botMessageIds.get(chatId).has(messageId);
 }
 
-// === NEW VIDEO PROCESSING LOGIC ===
-async function extractFramesFromVideo(videoBuffer) {
+// === SMART VIDEO PROCESSING LOGIC (Oversample -> Filter) ===
+async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
     return new Promise((resolve, reject) => {
         const tempId = Math.random().toString(36).substring(7);
         const tempDir = os.tmpdir();
@@ -512,18 +501,32 @@ async function extractFramesFromVideo(videoBuffer) {
 
         fs.writeFileSync(inputPath, videoBuffer);
 
-        // We capture at 3 frames per second (fps=3) to catch fast page turns
+        // INTELLIGENT FILTER LOGIC:
+        // We use the 'thumbnail' filter. It picks the most representative frame (highest variance/sharpness)
+        // from a batch of frames.
+        // batchSize = 3 (we compare 3 frames and pick 1).
+        // inputFps = targetFps * 3. 
+        // Example for Default (.): Target 3fps. We grab 9fps, group by 3, pick best of 3 => Result 3fps sharpest.
+        
+        const batchSize = 3;
+        const inputFps = targetFps * batchSize;
+
+        const videoFilter = `fps=${inputFps},thumbnail=${batchSize}`;
+
+        log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize})`);
+
         ffmpeg(inputPath)
             .outputOptions([
-                '-vf fps=3',       // 3 frames per second
-                '-q:v 2'           // High quality JPEG
+                `-vf ${videoFilter}`, // The magic intelligent filter
+                '-vsync 0',           // Prevent dropping frames arbitrarily
+                '-q:v 2'              // High quality JPEG
             ])
             .output(outputPattern)
             .on('end', () => {
                 try {
                     const files = fs.readdirSync(tempDir)
                         .filter(f => f.startsWith(`frame_${tempId}_`) && f.endsWith('.jpg'))
-                        .sort(); // Ensure order
+                        .sort(); 
 
                     const frames = files.map(file => {
                         const path = join(tempDir, file);
@@ -551,11 +554,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    const stats = getTotalBufferStats(CONFIG.ALLOWED_GROUP_ID);
-    
-    const storedContextsCount = chatContexts.has(CONFIG.ALLOWED_GROUP_ID) 
-        ? chatContexts.get(CONFIG.ALLOWED_GROUP_ID).size 
-        : 0;
+    // Just grab stats from first available chat buffer for demo, or sum all
+    let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
+    for (const [chatId, _] of chatMediaBuffers) {
+         const s = getTotalBufferStats(chatId);
+         stats.users += s.users;
+         stats.images += s.images;
+         stats.pdfs += s.pdfs;
+         stats.audio += s.audio;
+         stats.video += s.video;
+         stats.texts += s.texts;
+         stats.total += s.total;
+    }
     
     let html = `
     <!DOCTYPE html>
@@ -598,8 +608,6 @@ app.get('/', (req, res) => {
             }
             .connected { background: #4CAF50; }
             .waiting { background: rgba(255,255,255,0.2); }
-            .warning { background: #FF9800; }
-            .error { background: #f44336; }
             .qr-container {
                 background: white;
                 padding: 15px;
@@ -617,47 +625,6 @@ app.get('/', (req, res) => {
                 font-size: 13px;
             }
             .info-box h3 { margin: 0 0 10px 0; font-size: 15px; }
-            .info-box code {
-                background: rgba(0,0,0,0.3);
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-size: 11px;
-                word-break: break-all;
-            }
-            .group-list {
-                text-align: left;
-                background: rgba(255,255,255,0.1);
-                padding: 15px;
-                border-radius: 12px;
-                margin-top: 15px;
-            }
-            .group-list h4 { margin: 0 0 10px 0; }
-            .group-item {
-                background: rgba(0,0,0,0.2);
-                padding: 10px;
-                border-radius: 8px;
-                margin: 8px 0;
-                font-size: 12px;
-            }
-            .group-item strong { display: block; margin-bottom: 5px; }
-            .group-item code {
-                background: rgba(0,0,0,0.3);
-                padding: 3px 6px;
-                border-radius: 4px;
-                font-size: 10px;
-                word-break: break-all;
-                display: block;
-            }
-            .copy-btn {
-                background: rgba(255,255,255,0.2);
-                border: none;
-                color: white;
-                padding: 3px 8px;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 10px;
-                margin-top: 5px;
-            }
             .stats {
                 display: flex;
                 justify-content: center;
@@ -673,20 +640,6 @@ app.get('/', (req, res) => {
             }
             .stat-value { font-size: 16px; font-weight: bold; }
             .stat-label { font-size: 8px; opacity: 0.8; }
-            .configured {
-                background: rgba(76, 175, 80, 0.3);
-                border: 1px solid rgba(76, 175, 80, 0.5);
-                padding: 10px;
-                border-radius: 8px;
-                margin: 15px 0;
-            }
-            .not-configured {
-                background: rgba(255, 152, 0, 0.3);
-                border: 1px solid rgba(255, 152, 0, 0.5);
-                padding: 10px;
-                border-radius: 8px;
-                margin: 15px 0;
-            }
             .db-status {
                 font-size: 11px;
                 padding: 5px 10px;
@@ -696,13 +649,6 @@ app.get('/', (req, res) => {
             }
             .db-connected { background: rgba(76, 175, 80, 0.3); }
             .db-disconnected { background: rgba(244, 67, 54, 0.3); }
-            .media-support {
-                background: rgba(0,0,0,0.15);
-                padding: 10px;
-                border-radius: 8px;
-                margin-top: 10px;
-                font-size: 12px;
-            }
             .feature-badge {
                 display: inline-block;
                 background: rgba(255,255,255,0.2);
@@ -716,86 +662,34 @@ app.get('/', (req, res) => {
     <body>
         <div class="container">
             <h1>📱 WhatsApp Patient Bot</h1>
-            <p class="subtitle">Medical Clinical Profile Generator (High-Speed Video Support)</p>
+            <p class="subtitle">Medical Clinical Profile Generator</p>
             <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
-                ${mongoConnected ? '🗄️ MongoDB Connected (Persistent Sessions)' : '⚠️ MongoDB Not Connected'}
+                ${mongoConnected ? '🗄️ MongoDB Connected' : '⚠️ MongoDB Not Connected'}
             </div>
             <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
     `;
     
     if (isConnected) {
-        if (CONFIG.ALLOWED_GROUP_ID) {
-            const groupName = discoveredGroups.get(CONFIG.ALLOWED_GROUP_ID) || 'Configured Group';
-            html += `
-                <div class="status connected">✅ ACTIVE IN GROUP</div>
-                <div class="configured">
-                    <strong>🎯 Active Group:</strong> ${groupName}<br>
-                    <code style="font-size:10px">${CONFIG.ALLOWED_GROUP_ID}</code>
-                </div>
-                <div class="stats">
-                    <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">👥 Users</div></div>
-                    <div class="stat"><div class="stat-value">${stats.images}</div><div class="stat-label">📷 Images</div></div>
-                    <div class="stat"><div class="stat-value">${stats.pdfs}</div><div class="stat-label">📄 PDFs</div></div>
-                    <div class="stat"><div class="stat-value">${stats.audio}</div><div class="stat-label">🎤 Audio</div></div>
-                    <div class="stat"><div class="stat-value">${stats.video}</div><div class="stat-label">🎬 Video</div></div>
-                    <div class="stat"><div class="stat-value">${stats.texts}</div><div class="stat-label">💬 Texts</div></div>
-                    <div class="stat"><div class="stat-value">${storedContextsCount}</div><div class="stat-label">🧠 Ctx</div></div>
-                    <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
-                </div>
-                <div class="info-box">
-                    <h3>✨ Usage:</h3>
-                    <p><strong>New Request:</strong><br>
-                    1. Send files/text → Send <strong>.</strong> → Get profile<br><br>
-                    <strong>👥 Multi-User Support:</strong><br>
-                    Each user's files are processed separately!<br><br>
-                    <strong>🎥 Fast Flipping Video:</strong><br>
-                    Send video of flipping pages - I will extract every frame!<br><br>
-                    <strong>↩️ Reply Feature:</strong><br>
-                    Reply to bot's response to ask questions or add context!</p>
-                </div>
-                <div class="media-support">
-                    <span class="feature-badge">📷 Images</span>
-                    <span class="feature-badge">📄 PDFs</span>
-                    <span class="feature-badge">🎤 Voice</span>
-                    <span class="feature-badge">🎵 MP3/WAV</span>
-                    <span class="feature-badge">🎬 MP4/Video</span>
-                    <span class="feature-badge">💬 Text</span>
-                    <span class="feature-badge">❓ Q&A</span>
-                </div>
-            `;
-        } else {
-            html += `
-                <div class="status warning">⚠️ DISCOVERY MODE</div>
-                <div class="not-configured">
-                    <strong>No group configured yet!</strong><br>
-                    Send a message in your target group to discover its ID.
-                </div>
-            `;
-            
-            if (discoveredGroups.size > 0) {
-                html += `<div class="group-list"><h4>📋 Discovered Groups:</h4>`;
-                for (const [id, name] of discoveredGroups) {
-                    html += `
-                        <div class="group-item">
-                            <strong>${name}</strong>
-                            <code>${id}</code>
-                            <button class="copy-btn" onclick="navigator.clipboard.writeText('${id}')">📋 Copy ID</button>
-                        </div>
-                    `;
-                }
-                html += `</div>`;
-                
-                html += `
-                    <div class="info-box">
-                        <h3>🔧 Next Steps:</h3>
-                        <p>1. Copy the Group ID above<br>
-                        2. Go to Render Dashboard → Environment<br>
-                        3. Add: <code>ALLOWED_GROUP_ID</code> = (paste ID)<br>
-                        4. Click "Save Changes" and redeploy</p>
-                    </div>
-                `;
-            }
-        }
+        html += `
+            <div class="status connected">✅ UNIVERSAL MODE ACTIVE</div>
+            <p>Bot is active for all incoming messages (Private & Group)</p>
+            <div class="stats">
+                <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
+                <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
+                <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
+            </div>
+            <div class="info-box">
+                <h3>✨ Features:</h3>
+                <p>
+                <strong>🌍 Public Access:</strong> Works in any chat/group.<br>
+                <strong>🎥 Smart Video:</strong><br>
+                - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
+                - Send <strong>.2</strong> for Smart 2 FPS<br>
+                - Send <strong>.1</strong> for Smart 1 FPS<br>
+                <strong>↩️ Reply:</strong> Reply to bot to ask questions.
+                </p>
+            </div>
+        `;
     } else if (qrCodeDataURL) {
         html += `
             <div class="status waiting">📲 SCAN QR CODE</div>
@@ -817,20 +711,11 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    const stats = getTotalBufferStats(CONFIG.ALLOWED_GROUP_ID);
-    
-    const storedContextsCount = chatContexts.has(CONFIG.ALLOWED_GROUP_ID) 
-        ? chatContexts.get(CONFIG.ALLOWED_GROUP_ID).size 
-        : 0;
-    
     res.json({ 
         status: 'running',
         connected: isConnected,
         mongoConnected: mongoConnected,
-        configuredGroup: CONFIG.ALLOWED_GROUP_ID || 'NOT SET',
-        discoveredGroups: Object.fromEntries(discoveredGroups),
-        bufferedMedia: stats,
-        storedContexts: storedContextsCount,
+        mode: 'universal',
         processedCount,
         activeKeys: CONFIG.API_KEYS.length,
         timestamp: new Date().toISOString()
@@ -1015,11 +900,7 @@ async function startBot() {
                     log('💾', 'Credentials saved');
                 }
                 
-                if (CONFIG.ALLOWED_GROUP_ID) {
-                    log('🎯', `Bot active ONLY in: ${CONFIG.ALLOWED_GROUP_ID}`);
-                } else {
-                    log('⚠️', 'No group configured! Send a message in target group to get its ID.');
-                }
+                log('🌍', 'Universal Mode: Bot is active for ALL chats.');
             }
         });
 
@@ -1057,29 +938,17 @@ async function handleMessage(sock, msg) {
     
     if (chatId === 'status@broadcast') return;
     
-    const isGroup = chatId.endsWith('@g.us');
     const senderId = getSenderId(msg);
     const senderName = getSenderName(msg);
     const shortId = getShortSenderId(senderId);
     
-    if (isGroup && !discoveredGroups.has(chatId)) {
-        try {
-            const metadata = await sock.groupMetadata(chatId);
-            discoveredGroups.set(chatId, metadata.subject);
-            log('📋', `Discovered group: "${metadata.subject}"`);
-            log('📋', `Group ID: ${chatId}`);
-            console.log('\n' + '='.repeat(50));
-            console.log('🎯 TO USE THIS GROUP, ADD THIS ENVIRONMENT VARIABLE:');
-            console.log(`   ALLOWED_GROUP_ID = ${chatId}`);
-            console.log('='.repeat(50) + '\n');
-        } catch (e) {
-            discoveredGroups.set(chatId, 'Unknown Group');
-        }
+    // Group discovery logging (optional, no longer restricts access)
+    const isGroup = chatId.endsWith('@g.us');
+    if (isGroup) {
+         log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
     }
-    
-    if (!isAllowedGroup(chatId)) {
-        return;
-    }
+
+    // No isAllowedGroup check here -> Public Bot
     
     const messageType = Object.keys(msg.message)[0];
     
@@ -1279,9 +1148,12 @@ async function handleMessage(sock, msg) {
         const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
         
         if (!text) return;
+
+        // CHECK FOR TRIGGER COMMANDS: ., .1, .2
+        const isTrigger = text === '.' || text === '.1' || text === '.2' || text === '.3';
         
-        if (text === CONFIG.TRIGGER_TEXT) {
-            log('🔔', `Trigger from ${senderName} (...${shortId})`);
+        if (isTrigger) {
+            log('🔔', `Trigger command "${text}" from ${senderName} (...${shortId})`);
             
             await new Promise(r => setTimeout(r, 1000));
             
@@ -1291,18 +1163,24 @@ async function handleMessage(sock, msg) {
                 clearUserTimeout(chatId, senderId);
                 const mediaFiles = clearUserBuffer(chatId, senderId);
                 
-                log('🤖', `Processing ${mediaFiles.length} item(s) for ...${shortId}`);
-                await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null);
+                // DETERMINE VIDEO FPS based on command
+                let targetFps = 3; // Default for '.'
+                if (text === '.1') targetFps = 1;
+                if (text === '.2') targetFps = 2;
+                
+                log('🤖', `Processing ${mediaFiles.length} item(s) with FPS=${targetFps}`);
+                
+                await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null, targetFps);
             } else {
                 await sock.sendMessage(chatId, { 
-                    text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend images, PDFs, audio (.mp3, .wav), video (.mp4), or text first, then send *.*\n\n💡 _Or reply to my previous response to ask questions or add context!_`,
+                    text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (or .1, .2 for video speed control).\n\n💡 _Or reply to my previous response to ask questions or add context!_`,
                     mentions: [senderId]
                 });
             }
         }
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
-                text: `🏥 *Clinical Profile Bot*\n\n*Supported Files:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files (.mp3, .wav, .ogg, .m4a)\n🎬 Video files (.mp4, .mkv, .avi, .mov)\n💬 Text notes & captions\n\n*Basic Usage:*\n1️⃣ Send file(s) and/or text\n2️⃣ Send *.* to process\n\n*👥 Multi-User:*\nEach user's files are tracked separately!\n\n*🎥 Fast Flipping Video:*\nSend video of flipping pages - I will extract frames automatically!\n\n*↩️ Reply Feature:*\nReply to my response to:\n• Ask questions about findings\n• Add more context/corrections\n• Send additional files\n\n*Commands:*\n• *.* - Process YOUR content\n• *clear* - Clear YOUR buffer\n• *status* - Check status` 
+                text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.*  - Process with Smart 3 FPS (Best for fast flipping pages)\n• *.2* - Process with Smart 2 FPS\n• *.1* - Process with Smart 1 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!` 
             });
         }
         else if (text.toLowerCase() === 'clear') {
@@ -1336,7 +1214,7 @@ async function handleMessage(sock, msg) {
             const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
             
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Group Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available` 
+                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available` 
             });
         }
         else {
@@ -1541,9 +1419,8 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
 
-// NOTE: Global model init is removed. We now init per-request for key rotation.
-
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null) {
+// Added targetFps argument to function signature
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3) {
     const shortId = getShortSenderId(senderId);
     
     try {
@@ -1559,12 +1436,12 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
         
         for (const m of mediaFiles) {
             if (m.type === 'video') {
-                log('🎬', `Processing video frame extraction for ...${shortId}`);
+                log('🎬', `Processing video for ...${shortId} (Target FPS: ${targetFps})`);
                 try {
                     const videoBuffer = Buffer.from(m.data, 'base64');
-                    // Extract frames using ffmpeg at 3 frames per second
-                    const frames = await extractFramesFromVideo(videoBuffer);
-                    log('📸', `Extracted ${frames.length} frames from video`);
+                    // Extract frames using ffmpeg with smart filter
+                    const frames = await extractFramesFromVideo(videoBuffer, targetFps);
+                    log('📸', `Extracted ${frames.length} smart frames from video`);
                     
                     // Add extracted frames as individual images
                     frames.forEach(frameData => {
@@ -1856,20 +1733,18 @@ ${allOriginalText.join('\n\n')}
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.4                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v2.5                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
-console.log('║  🎵 Supports: MP3, WAV, OGG, M4A, AAC, FLAC               ║');
-console.log('║  🎬 Supports: MP4, MKV, AVI, MOV, WEBM                    ║');
-console.log('║  ⏩ Video: Auto-frame extraction for fast flipping pages  ║');
+console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)  ║');
+console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║');
+console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
 console.log('║                                                            ║');
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
 console.log('║  🗄️ MongoDB Persistent Sessions                           ║');
 console.log('║  🔑 Multi-Key Failover System Active                      ║');
-console.log('║                                                            ║');
-console.log('║  🔒 Works ONLY in ONE specific group                       ║');
 console.log('╚════════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Starting...');
@@ -1878,12 +1753,6 @@ if (CONFIG.API_KEYS.length === 0) {
     log('❌', 'No API Keys found! Set GEMINI_API_KEYS environment variable.');
 } else {
     log('🔑', `Loaded ${CONFIG.API_KEYS.length} Gemini API Key(s)`);
-}
-
-if (CONFIG.ALLOWED_GROUP_ID) {
-    log('🎯', `Configured for group: ${CONFIG.ALLOWED_GROUP_ID}`);
-} else {
-    log('⚠️', 'No group configured! Bot will discover groups when you message them.');
 }
 
 (async () => {
