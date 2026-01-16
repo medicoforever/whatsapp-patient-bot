@@ -6,6 +6,12 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import mongoose from 'mongoose';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegPath from 'ffmpeg-static';
+import os from 'os';
+
+// Configure FFmpeg
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -17,9 +23,9 @@ const getApiKeys = () => {
 };
 
 const CONFIG = {
-    // We now store an array of keys
     API_KEYS: getApiKeys(),
-    GEMINI_MODEL: 'gemini-3-flash-preview', // Updated to latest faster model, change back if needed
+    // Using flash model which is faster and cheaper (free tier friendly)
+    GEMINI_MODEL: 'gemini-1.5-flash', 
     MONGODB_URI: process.env.MONGODB_URI,
     ALLOWED_GROUP_ID: process.env.ALLOWED_GROUP_ID || '',
     MEDIA_TIMEOUT_MS: 300000,
@@ -101,6 +107,101 @@ When a user replies to a previously generated Clinical Profile, you should:
 IMPORTANT: Always identify whether the user is asking a question or providing additional information, and respond appropriately.`
 };
 
+// --- VIDEO PROCESSING HELPERS ---
+
+// Helper function to create a delay
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function processSmartVideo(buffer, mimeType) {
+    const tempDir = os.tmpdir();
+    const uniqueId = Date.now() + Math.random().toString(36).substring(7);
+    const inputPath = join(tempDir, `input_${uniqueId}.mp4`); // FFmpeg usually handles input formats well
+    const outputPattern = join(tempDir, `frame_${uniqueId}_%03d.jpg`);
+    const audioPath = join(tempDir, `audio_${uniqueId}.mp3`);
+
+    try {
+        // Write buffer to temp file
+        fs.writeFileSync(inputPath, Buffer.from(buffer, 'base64'));
+
+        const parts = [];
+
+        // 1. Extract Audio
+        await new Promise((resolve, reject) => {
+            ffmpeg(inputPath)
+                .noVideo()
+                .audioCodec('libmp3lame')
+                .save(audioPath)
+                .on('end', resolve)
+                .on('error', (err) => {
+                    // It's okay if audio extraction fails (video might be silent)
+                    resolve(); 
+                });
+        });
+
+        if (fs.existsSync(audioPath)) {
+            const audioData = fs.readFileSync(audioPath);
+            parts.push({
+                inlineData: {
+                    data: audioData.toString('base64'),
+                    mimeType: 'audio/mpeg'
+                }
+            });
+        }
+
+        // 2. Extract Frames at 3 FPS (Good balance for reading text while flipping)
+        await new Promise((resolve, reject) => {
+            ffmpeg(inputPath)
+                .outputOptions([
+                    '-vf fps=3',       // Extract 3 frames per second
+                    '-q:v 2'           // High quality JPEG
+                ])
+                .save(outputPattern)
+                .on('end', resolve)
+                .on('error', reject);
+        });
+
+        // 3. Collect all frames
+        const files = fs.readdirSync(tempDir).filter(f => f.startsWith(`frame_${uniqueId}_`) && f.endsWith('.jpg'));
+        
+        // Sort files to ensure order
+        files.sort((a, b) => {
+            const numA = parseInt(a.match(/(\d+)\.jpg$/)[1]);
+            const numB = parseInt(b.match(/(\d+)\.jpg$/)[1]);
+            return numA - numB;
+        });
+
+        // Limit frames to avoid hitting payload limits (max ~150 frames for safety on free tier)
+        const processFiles = files.length > 150 ? files.filter((_, i) => i % 2 === 0) : files;
+
+        for (const file of processFiles) {
+            const frameData = fs.readFileSync(join(tempDir, file));
+            parts.push({
+                inlineData: {
+                    data: frameData.toString('base64'),
+                    mimeType: 'image/jpeg'
+                }
+            });
+        }
+
+        // Cleanup
+        try {
+            if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+            if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+            files.forEach(f => {
+                if (fs.existsSync(join(tempDir, f))) fs.unlinkSync(join(tempDir, f));
+            });
+        } catch (e) { console.error("Cleanup error", e); }
+
+        return { success: true, parts: parts, count: processFiles.length };
+
+    } catch (error) {
+        console.error("Smart video processing failed:", error);
+        return { success: false, error: error };
+    }
+}
+
+// --- END VIDEO PROCESSING HELPERS ---
+
 function isAudioMime(mimeType) {
     if (!mimeType) return false;
     return CONFIG.SUPPORTED_AUDIO_MIMES.some(m => mimeType.toLowerCase().includes(m.split('/')[1])) ||
@@ -141,11 +242,7 @@ function getFileType(mimeType, fileName) {
 function isQuestion(text) {
     if (!text) return false;
     const lowerText = text.toLowerCase().trim();
-    
-    // Check if ends with question mark
     if (lowerText.endsWith('?')) return true;
-    
-    // Check for question words at the start
     const questionStarters = [
         'what', 'why', 'how', 'when', 'where', 'who', 'which', 'whose', 'whom',
         'is ', 'are ', 'was ', 'were ', 'do ', 'does ', 'did ', 'will ', 'would ',
@@ -154,23 +251,18 @@ function isQuestion(text) {
         'what\'s', 'what is', 'what are', 'what does', 'what do',
         'is this', 'is it', 'is there', 'are there', 'does this', 'does it'
     ];
-    
     for (const starter of questionStarters) {
         if (lowerText.startsWith(starter)) return true;
     }
-    
-    // Check for question phrases anywhere
     const questionPhrases = [
         'what does', 'what is', 'what are', 'can you explain', 'could you explain',
         'please explain', 'i don\'t understand', 'what about', 'how about',
         'is it', 'are they', 'does it mean', 'does this mean', 'mean by',
         'significance of', 'implications of', 'serious', 'normal', 'abnormal'
     ];
-    
     for (const phrase of questionPhrases) {
         if (lowerText.includes(phrase)) return true;
     }
-    
     return false;
 }
 
@@ -501,7 +593,6 @@ const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
     const stats = getTotalBufferStats(CONFIG.ALLOWED_GROUP_ID);
-    
     const storedContextsCount = chatContexts.has(CONFIG.ALLOWED_GROUP_ID) 
         ? chatContexts.get(CONFIG.ALLOWED_GROUP_ID).size 
         : 0;
@@ -515,248 +606,41 @@ app.get('/', (req, res) => {
         <meta http-equiv="refresh" content="5">
         <style>
             * { box-sizing: border-box; }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                min-height: 100vh;
-                margin: 0;
-                background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
-                color: white;
-                padding: 20px;
-            }
-            .container {
-                text-align: center;
-                background: rgba(255,255,255,0.15);
-                padding: 30px;
-                border-radius: 20px;
-                backdrop-filter: blur(10px);
-                max-width: 600px;
-                width: 100%;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            }
+            body { font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #25D366 0%, #128C7E 100%); color: white; padding: 20px; }
+            .container { text-align: center; background: rgba(255,255,255,0.15); padding: 30px; border-radius: 20px; backdrop-filter: blur(10px); max-width: 600px; width: 100%; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
             h1 { margin: 0 0 10px 0; font-size: 24px; }
-            .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; }
-            .status {
-                padding: 15px 20px;
-                border-radius: 12px;
-                margin: 20px 0;
-                font-size: 16px;
-                font-weight: 600;
-            }
+            .status { padding: 15px 20px; border-radius: 12px; margin: 20px 0; font-size: 16px; font-weight: 600; }
             .connected { background: #4CAF50; }
             .waiting { background: rgba(255,255,255,0.2); }
-            .warning { background: #FF9800; }
-            .error { background: #f44336; }
-            .qr-container {
-                background: white;
-                padding: 15px;
-                border-radius: 15px;
-                display: inline-block;
-                margin: 20px 0;
-            }
+            .qr-container { background: white; padding: 15px; border-radius: 15px; display: inline-block; margin: 20px 0; }
             .qr-container img { display: block; max-width: 250px; width: 100%; }
-            .info-box {
-                text-align: left;
-                background: rgba(0,0,0,0.2);
-                padding: 15px;
-                border-radius: 12px;
-                margin-top: 15px;
-                font-size: 13px;
-            }
-            .info-box h3 { margin: 0 0 10px 0; font-size: 15px; }
-            .info-box code {
-                background: rgba(0,0,0,0.3);
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-size: 11px;
-                word-break: break-all;
-            }
-            .group-list {
-                text-align: left;
-                background: rgba(255,255,255,0.1);
-                padding: 15px;
-                border-radius: 12px;
-                margin-top: 15px;
-            }
-            .group-list h4 { margin: 0 0 10px 0; }
-            .group-item {
-                background: rgba(0,0,0,0.2);
-                padding: 10px;
-                border-radius: 8px;
-                margin: 8px 0;
-                font-size: 12px;
-            }
-            .group-item strong { display: block; margin-bottom: 5px; }
-            .group-item code {
-                background: rgba(0,0,0,0.3);
-                padding: 3px 6px;
-                border-radius: 4px;
-                font-size: 10px;
-                word-break: break-all;
-                display: block;
-            }
-            .copy-btn {
-                background: rgba(255,255,255,0.2);
-                border: none;
-                color: white;
-                padding: 3px 8px;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 10px;
-                margin-top: 5px;
-            }
-            .stats {
-                display: flex;
-                justify-content: center;
-                gap: 6px;
-                margin-top: 20px;
-                flex-wrap: wrap;
-            }
-            .stat {
-                background: rgba(255,255,255,0.1);
-                padding: 8px 10px;
-                border-radius: 10px;
-                min-width: 50px;
-            }
+            .stats { display: flex; justify-content: center; gap: 6px; margin-top: 20px; flex-wrap: wrap; }
+            .stat { background: rgba(255,255,255,0.1); padding: 8px 10px; border-radius: 10px; min-width: 50px; }
             .stat-value { font-size: 16px; font-weight: bold; }
             .stat-label { font-size: 8px; opacity: 0.8; }
-            .configured {
-                background: rgba(76, 175, 80, 0.3);
-                border: 1px solid rgba(76, 175, 80, 0.5);
-                padding: 10px;
-                border-radius: 8px;
-                margin: 15px 0;
-            }
-            .not-configured {
-                background: rgba(255, 152, 0, 0.3);
-                border: 1px solid rgba(255, 152, 0, 0.5);
-                padding: 10px;
-                border-radius: 8px;
-                margin: 15px 0;
-            }
-            .db-status {
-                font-size: 11px;
-                padding: 5px 10px;
-                border-radius: 20px;
-                display: inline-block;
-                margin-bottom: 15px;
-            }
-            .db-connected { background: rgba(76, 175, 80, 0.3); }
-            .db-disconnected { background: rgba(244, 67, 54, 0.3); }
-            .media-support {
-                background: rgba(0,0,0,0.15);
-                padding: 10px;
-                border-radius: 8px;
-                margin-top: 10px;
-                font-size: 12px;
-            }
-            .feature-badge {
-                display: inline-block;
-                background: rgba(255,255,255,0.2);
-                padding: 3px 8px;
-                border-radius: 12px;
-                font-size: 10px;
-                margin: 2px;
-            }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>📱 WhatsApp Patient Bot</h1>
-            <p class="subtitle">Medical Clinical Profile Generator (Per-User Buffers)</p>
-            <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
-                ${mongoConnected ? '🗄️ MongoDB Connected (Persistent Sessions)' : '⚠️ MongoDB Not Connected'}
-            </div>
+            <p>Smart Video & Medical Profile Generator</p>
             <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
     `;
     
     if (isConnected) {
+        html += `<div class="status connected">✅ ACTIVE</div>`;
         if (CONFIG.ALLOWED_GROUP_ID) {
-            const groupName = discoveredGroups.get(CONFIG.ALLOWED_GROUP_ID) || 'Configured Group';
             html += `
-                <div class="status connected">✅ ACTIVE IN GROUP</div>
-                <div class="configured">
-                    <strong>🎯 Active Group:</strong> ${groupName}<br>
-                    <code style="font-size:10px">${CONFIG.ALLOWED_GROUP_ID}</code>
-                </div>
                 <div class="stats">
                     <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">👥 Users</div></div>
-                    <div class="stat"><div class="stat-value">${stats.images}</div><div class="stat-label">📷 Images</div></div>
-                    <div class="stat"><div class="stat-value">${stats.pdfs}</div><div class="stat-label">📄 PDFs</div></div>
-                    <div class="stat"><div class="stat-value">${stats.audio}</div><div class="stat-label">🎤 Audio</div></div>
                     <div class="stat"><div class="stat-value">${stats.video}</div><div class="stat-label">🎬 Video</div></div>
-                    <div class="stat"><div class="stat-value">${stats.texts}</div><div class="stat-label">💬 Texts</div></div>
-                    <div class="stat"><div class="stat-value">${storedContextsCount}</div><div class="stat-label">🧠 Ctx</div></div>
                     <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
-                </div>
-                <div class="info-box">
-                    <h3>✨ Usage:</h3>
-                    <p><strong>New Request:</strong><br>
-                    1. Send files/text → Send <strong>.</strong> → Get profile<br><br>
-                    <strong>👥 Multi-User Support:</strong><br>
-                    Each user's files are processed separately!<br><br>
-                    <strong>↩️ Reply Feature:</strong><br>
-                    Reply to bot's response to ask questions or add context!</p>
-                </div>
-                <div class="media-support">
-                    <span class="feature-badge">📷 Images</span>
-                    <span class="feature-badge">📄 PDFs</span>
-                    <span class="feature-badge">🎤 Voice</span>
-                    <span class="feature-badge">🎵 MP3/WAV</span>
-                    <span class="feature-badge">🎬 MP4/Video</span>
-                    <span class="feature-badge">💬 Text</span>
-                    <span class="feature-badge">❓ Q&A</span>
-                </div>
-            `;
-        } else {
-            html += `
-                <div class="status warning">⚠️ DISCOVERY MODE</div>
-                <div class="not-configured">
-                    <strong>No group configured yet!</strong><br>
-                    Send a message in your target group to discover its ID.
-                </div>
-            `;
-            
-            if (discoveredGroups.size > 0) {
-                html += `<div class="group-list"><h4>📋 Discovered Groups:</h4>`;
-                for (const [id, name] of discoveredGroups) {
-                    html += `
-                        <div class="group-item">
-                            <strong>${name}</strong>
-                            <code>${id}</code>
-                            <button class="copy-btn" onclick="navigator.clipboard.writeText('${id}')">📋 Copy ID</button>
-                        </div>
-                    `;
-                }
-                html += `</div>`;
-                
-                html += `
-                    <div class="info-box">
-                        <h3>🔧 Next Steps:</h3>
-                        <p>1. Copy the Group ID above<br>
-                        2. Go to Render Dashboard → Environment<br>
-                        3. Add: <code>ALLOWED_GROUP_ID</code> = (paste ID)<br>
-                        4. Click "Save Changes" and redeploy</p>
-                    </div>
-                `;
-            }
+                </div>`;
         }
     } else if (qrCodeDataURL) {
-        html += `
-            <div class="status waiting">📲 SCAN QR CODE</div>
-            <div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>
-            <div class="info-box">
-                <h3>📋 To connect:</h3>
-                <p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device</p>
-            </div>
-        `;
+        html += `<div class="status waiting">📲 SCAN QR CODE</div><div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>`;
     } else {
-        html += `
-            <div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>
-            <p>Please wait...</p>
-        `;
+        html += `<div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>`;
     }
     
     html += `</div></body></html>`;
@@ -764,24 +648,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    const stats = getTotalBufferStats(CONFIG.ALLOWED_GROUP_ID);
-    
-    const storedContextsCount = chatContexts.has(CONFIG.ALLOWED_GROUP_ID) 
-        ? chatContexts.get(CONFIG.ALLOWED_GROUP_ID).size 
-        : 0;
-    
-    res.json({ 
-        status: 'running',
-        connected: isConnected,
-        mongoConnected: mongoConnected,
-        configuredGroup: CONFIG.ALLOWED_GROUP_ID || 'NOT SET',
-        discoveredGroups: Object.fromEntries(discoveredGroups),
-        bufferedMedia: stats,
-        storedContexts: storedContextsCount,
-        processedCount,
-        activeKeys: CONFIG.API_KEYS.length,
-        timestamp: new Date().toISOString()
-    });
+    res.json({ status: 'running', connected: isConnected, processedCount });
 });
 
 app.listen(PORT, () => {
@@ -790,19 +657,14 @@ app.listen(PORT, () => {
 
 async function loadBaileys() {
     botStatus = 'Loading WhatsApp library...';
-    
     try {
         const baileys = await import('@whiskeysockets/baileys');
-        
         makeWASocket = baileys.default || baileys.makeWASocket;
         DisconnectReason = baileys.DisconnectReason;
         downloadMediaMessage = baileys.downloadMediaMessage;
         fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
-        
-        log('✅', 'Baileys loaded!');
         return true;
     } catch (error) {
-        log('❌', `Baileys load failed: ${error.message}`);
         throw error;
     }
 }
@@ -812,33 +674,15 @@ async function connectMongoDB() {
         log('⚠️', 'No MONGODB_URI configured - sessions will not persist!');
         return false;
     }
-    
     try {
-        log('🔄', 'Connecting to MongoDB...');
-        
-        mongoose.connection.on('connected', () => {
-            log('✅', 'MongoDB connection established');
-        });
-        
-        mongoose.connection.on('error', (err) => {
-            log('❌', `MongoDB connection error: ${err.message}`);
-        });
-        
-        mongoose.connection.on('disconnected', () => {
-            log('⚠️', 'MongoDB disconnected');
-            mongoConnected = false;
-        });
-        
         await mongoose.connect(CONFIG.MONGODB_URI, {
             serverSelectionTimeoutMS: 10000,
             socketTimeoutMS: 45000,
         });
-        
         mongoConnected = true;
         log('✅', 'MongoDB connected! Sessions will persist.');
         return true;
     } catch (error) {
-        log('❌', `MongoDB connection failed: ${error.message}`);
         mongoConnected = false;
         return false;
     }
@@ -854,26 +698,17 @@ async function startBot() {
         let state, saveCreds, clearAll;
         
         if (mongoConnected) {
-            try {
-                const mongoAuth = await useMongoDBAuthState();
-                state = mongoAuth.state;
-                saveCreds = mongoAuth.saveCreds;
-                clearAll = mongoAuth.clearAll;
-                log('✅', 'Using MongoDB for session storage');
-            } catch (e) {
-                log('❌', `MongoDB auth failed: ${e.message}`);
-                throw e;
-            }
+            const mongoAuth = await useMongoDBAuthState();
+            state = mongoAuth.state;
+            saveCreds = mongoAuth.saveCreds;
+            clearAll = mongoAuth.clearAll;
         } else {
             const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
             const authPath = join(__dirname, 'auth_session');
             const fileAuth = await useMultiFileAuthState(authPath);
             state = fileAuth.state;
             saveCreds = fileAuth.saveCreds;
-            clearAll = async () => {
-                try { fs.rmSync(authPath, { recursive: true, force: true }); } catch(e) {}
-            };
-            log('📁', 'Using file-based auth (session will be lost on restart)');
+            clearAll = async () => { try { fs.rmSync(authPath, { recursive: true, force: true }); } catch(e) {} };
         }
         
         authState = { state, saveCreds, clearAll };
@@ -882,10 +717,8 @@ async function startBot() {
         try {
             const v = await fetchLatestBaileysVersion();
             version = v.version;
-            log('📱', `Using WA version: ${version.join('.')}`);
         } catch (e) {
             version = [2, 3000, 1015901307];
-            log('⚠️', 'Using fallback WA version');
         }
         
         botStatus = 'Connecting...';
@@ -896,57 +729,27 @@ async function startBot() {
             logger: pino({ level: 'silent' }),
             browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
             markOnlineOnConnect: false,
-            syncFullHistory: false,
-            getMessage: async (key) => {
-                return { conversation: '' };
-            }
+            syncFullHistory: false
         });
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
-                try {
-                    botStatus = 'QR Code ready';
-                    qrCodeDataURL = await QRCode.toDataURL(qr, {
-                        width: 300, 
-                        margin: 2,
-                        color: { dark: '#128C7E', light: '#FFFFFF' }
-                    });
-                    isConnected = false;
-                    log('📱', 'QR Code generated - please scan!');
-                } catch (err) {
-                    log('❌', `QR generation error: ${err.message}`);
-                    lastError = err.message;
-                }
+                botStatus = 'QR Code ready';
+                qrCodeDataURL = await QRCode.toDataURL(qr, { width: 300, margin: 2, color: { dark: '#128C7E', light: '#FFFFFF' } });
+                isConnected = false;
             }
             
             if (connection === 'close') {
                 isConnected = false;
                 qrCodeDataURL = null;
-                
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const reason = lastDisconnect?.error?.output?.payload?.message || 'Unknown';
                 
-                log('🔌', `Connection closed. Code: ${statusCode}, Reason: ${reason}`);
-                
-                const loggedOut = statusCode === DisconnectReason.loggedOut || 
-                                  statusCode === 401 || 
-                                  statusCode === 405;
-                
-                if (loggedOut) {
-                    log('🔐', 'Session logged out - clearing credentials...');
-                    botStatus = 'Logged out - clearing session...';
-                    
-                    if (authState?.clearAll) {
-                        await authState.clearAll();
-                    }
-                    
-                    log('🔄', 'Restarting with fresh session in 5 seconds...');
+                if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405) {
+                    if (authState?.clearAll) await authState.clearAll();
                     setTimeout(startBot, 5000);
                 } else {
-                    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                    log('🔄', `Reconnecting in 5 seconds... (shouldReconnect: ${shouldReconnect})`);
                     setTimeout(startBot, 5000);
                 }
                 
@@ -954,35 +757,25 @@ async function startBot() {
                 isConnected = true;
                 qrCodeDataURL = null;
                 botStatus = 'Connected';
-                
                 log('✅', '🎉 CONNECTED TO WHATSAPP!');
                 
-                if (authState?.saveCreds) {
-                    await authState.saveCreds();
-                    log('💾', 'Credentials saved');
-                }
+                if (authState?.saveCreds) await authState.saveCreds();
                 
                 if (CONFIG.ALLOWED_GROUP_ID) {
                     log('🎯', `Bot active ONLY in: ${CONFIG.ALLOWED_GROUP_ID}`);
-                } else {
-                    log('⚠️', 'No group configured! Send a message in target group to get its ID.');
                 }
             }
         });
 
         sock.ev.on('creds.update', async () => {
-            if (authState?.saveCreds) {
-                await authState.saveCreds();
-            }
+            if (authState?.saveCreds) await authState.saveCreds();
         });
 
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
-            
             for (const msg of messages) {
                 if (msg.key.fromMe) continue;
                 if (!msg.message) continue;
-                
                 try {
                     await handleMessage(sock, msg);
                 } catch (error) {
@@ -992,16 +785,12 @@ async function startBot() {
         });
         
     } catch (error) {
-        log('💥', `Bot error: ${error.message}`);
-        console.error(error);
-        botStatus = 'Error - restarting...';
         setTimeout(startBot, 10000);
     }
 }
 
 async function handleMessage(sock, msg) {
     const chatId = msg.key.remoteJid;
-    
     if (chatId === 'status@broadcast') return;
     
     const isGroup = chatId.endsWith('@g.us');
@@ -1013,290 +802,132 @@ async function handleMessage(sock, msg) {
         try {
             const metadata = await sock.groupMetadata(chatId);
             discoveredGroups.set(chatId, metadata.subject);
-            log('📋', `Discovered group: "${metadata.subject}"`);
-            log('📋', `Group ID: ${chatId}`);
-            console.log('\n' + '='.repeat(50));
-            console.log('🎯 TO USE THIS GROUP, ADD THIS ENVIRONMENT VARIABLE:');
-            console.log(`   ALLOWED_GROUP_ID = ${chatId}`);
-            console.log('='.repeat(50) + '\n');
+            log('📋', `Discovered Group ID: ${chatId}`);
         } catch (e) {
             discoveredGroups.set(chatId, 'Unknown Group');
         }
     }
     
-    if (!isAllowedGroup(chatId)) {
-        return;
-    }
+    if (!isAllowedGroup(chatId)) return;
     
     const messageType = Object.keys(msg.message)[0];
     
     let quotedMessageId = null;
     let contextInfo = null;
     
-    if (messageType === 'extendedTextMessage') {
-        contextInfo = msg.message.extendedTextMessage?.contextInfo;
-    } else if (messageType === 'imageMessage') {
-        contextInfo = msg.message.imageMessage?.contextInfo;
-    } else if (messageType === 'documentMessage') {
-        contextInfo = msg.message.documentMessage?.contextInfo;
-    } else if (messageType === 'audioMessage') {
-        contextInfo = msg.message.audioMessage?.contextInfo;
-    } else if (messageType === 'videoMessage') {
-        contextInfo = msg.message.videoMessage?.contextInfo;
-    }
+    if (messageType === 'extendedTextMessage') contextInfo = msg.message.extendedTextMessage?.contextInfo;
+    else if (messageType === 'imageMessage') contextInfo = msg.message.imageMessage?.contextInfo;
+    else if (messageType === 'videoMessage') contextInfo = msg.message.videoMessage?.contextInfo;
     
     if (contextInfo?.stanzaId) {
         quotedMessageId = contextInfo.stanzaId;
-        
         if (isBotMessage(chatId, quotedMessageId)) {
-            log('↩️', `Reply to bot from ${senderName} (...${shortId})`);
             await handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType);
             return;
         }
     }
     
+    // --- HANDLING DIFFERENT MESSAGE TYPES ---
+    
     if (messageType === 'imageMessage') {
         log('📷', `Image from ${senderName} (...${shortId})`);
-        
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.imageMessage.caption || '';
-            
-            const count = addToUserBuffer(chatId, senderId, {
+            addToUserBuffer(chatId, senderId, {
                 type: 'image',
                 data: buffer.toString('base64'),
                 mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
-                caption: caption,
+                caption: msg.message.imageMessage.caption || '',
                 timestamp: Date.now()
             });
-            
-            if (caption) {
-                log('💬', `  └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
-            }
-            
-            log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
             resetUserTimeout(chatId, senderId, senderName);
-            
-        } catch (error) {
-            log('❌', `Image error: ${error.message}`);
-        }
+        } catch (error) { log('❌', `Image error: ${error.message}`); }
     }
     else if (messageType === 'videoMessage') {
         log('🎬', `Video from ${senderName} (...${shortId})`);
-        
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.videoMessage.caption || '';
-            const mimeType = msg.message.videoMessage.mimetype || 'video/mp4';
+            const duration = msg.message.videoMessage.seconds || 0;
             
-            const count = addToUserBuffer(chatId, senderId, {
+            addToUserBuffer(chatId, senderId, {
                 type: 'video',
-                data: buffer.toString('base64'),
-                mimeType: mimeType,
-                caption: caption,
-                duration: msg.message.videoMessage.seconds || 0,
+                data: buffer.toString('base64'), // Store base64 for now
+                mimeType: msg.message.videoMessage.mimetype || 'video/mp4',
+                caption: msg.message.videoMessage.caption || '',
+                duration: duration,
                 timestamp: Date.now()
             });
             
-            if (caption) {
-                log('💬', `  └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
-            }
-            
-            log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+            log('📦', `Video buffered. Duration: ${duration}s`);
             resetUserTimeout(chatId, senderId, senderName);
-            
-        } catch (error) {
-            log('❌', `Video error: ${error.message}`);
-        }
+        } catch (error) { log('❌', `Video error: ${error.message}`); }
     }
     else if (messageType === 'audioMessage') {
         const isVoice = msg.message.audioMessage.ptt === true;
-        const emoji = isVoice ? '🎤' : '🎵';
-        
-        log(emoji, `${isVoice ? 'Voice' : 'Audio'} from ${senderName} (...${shortId})`);
-        
+        log(isVoice ? '🎤' : '🎵', `Audio from ${senderName}`);
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            
-            const count = addToUserBuffer(chatId, senderId, {
+            addToUserBuffer(chatId, senderId, {
                 type: isVoice ? 'voice' : 'audio',
                 data: buffer.toString('base64'),
                 mimeType: msg.message.audioMessage.mimetype || 'audio/ogg',
-                duration: msg.message.audioMessage.seconds || 0,
                 timestamp: Date.now()
             });
-            
-            log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
             resetUserTimeout(chatId, senderId, senderName);
-            
-        } catch (error) {
-            log('❌', `Audio error: ${error.message}`);
-        }
+        } catch (error) {}
     }
     else if (messageType === 'documentMessage') {
         const docMime = msg.message.documentMessage.mimetype || '';
         const fileName = msg.message.documentMessage.fileName || 'document';
-        const caption = msg.message.documentMessage.caption || '';
-        
         const fileType = getFileType(docMime, fileName);
         
-        if (fileType === 'pdf') {
-            log('📄', `PDF from ${senderName} (...${shortId}): ${fileName}`);
-            
+        if (fileType !== 'unknown') {
             try {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                
-                const count = addToUserBuffer(chatId, senderId, {
-                    type: 'pdf',
+                addToUserBuffer(chatId, senderId, {
+                    type: fileType,
                     data: buffer.toString('base64'),
-                    mimeType: 'application/pdf',
+                    mimeType: docMime,
                     fileName: fileName,
-                    caption: caption,
                     timestamp: Date.now()
                 });
-                
-                if (caption) {
-                    log('💬', `  └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
-                }
-                
-                log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+                log('📎', `Document (${fileType}) buffered`);
                 resetUserTimeout(chatId, senderId, senderName);
-                
-            } catch (error) {
-                log('❌', `PDF error: ${error.message}`);
-            }
-        }
-        else if (fileType === 'audio') {
-            log('🎵', `Audio file from ${senderName} (...${shortId}): ${fileName}`);
-            
-            try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                
-                const count = addToUserBuffer(chatId, senderId, {
-                    type: 'audio',
-                    data: buffer.toString('base64'),
-                    mimeType: docMime || 'audio/mpeg',
-                    fileName: fileName,
-                    caption: caption,
-                    timestamp: Date.now()
-                });
-                
-                if (caption) {
-                    log('💬', `  └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
-                }
-                
-                log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
-                resetUserTimeout(chatId, senderId, senderName);
-                
-            } catch (error) {
-                log('❌', `Audio file error: ${error.message}`);
-            }
-        }
-        else if (fileType === 'video') {
-            log('🎬', `Video file from ${senderName} (...${shortId}): ${fileName}`);
-            
-            try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                
-                const count = addToUserBuffer(chatId, senderId, {
-                    type: 'video',
-                    data: buffer.toString('base64'),
-                    mimeType: docMime || 'video/mp4',
-                    fileName: fileName,
-                    caption: caption,
-                    timestamp: Date.now()
-                });
-                
-                if (caption) {
-                    log('💬', `  └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
-                }
-                
-                log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
-                resetUserTimeout(chatId, senderId, senderName);
-                
-            } catch (error) {
-                log('❌', `Video file error: ${error.message}`);
-            }
-        }
-        else {
-            log('📎', `Skipping unsupported file: ${fileName} (${docMime})`);
+            } catch (e) {}
         }
     }
     else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
         const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
-        
         if (!text) return;
         
         if (text === CONFIG.TRIGGER_TEXT) {
-            log('🔔', `Trigger from ${senderName} (...${shortId})`);
-            
+            log('🔔', `Trigger from ${senderName}`);
             await new Promise(r => setTimeout(r, 1000));
-            
             const userBufferCount = getUserBufferCount(chatId, senderId);
             
             if (userBufferCount > 0) {
                 clearUserTimeout(chatId, senderId);
                 const mediaFiles = clearUserBuffer(chatId, senderId);
-                
-                log('🤖', `Processing ${mediaFiles.length} item(s) for ...${shortId}`);
                 await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null);
             } else {
-                await sock.sendMessage(chatId, { 
-                    text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend images, PDFs, audio (.mp3, .wav), video (.mp4), or text first, then send *.*\n\n💡 _Or reply to my previous response to ask questions or add context!_`,
-                    mentions: [senderId]
-                });
+                await sock.sendMessage(chatId, { text: `ℹ️ Please send files first, then send *.*` });
             }
-        }
-        else if (text.toLowerCase() === 'help' || text === '?') {
-            await sock.sendMessage(chatId, { 
-                text: `🏥 *Clinical Profile Bot*\n\n*Supported Files:*\n📷 Images (photos, scans)\n📄 PDFs (reports, documents)\n🎤 Voice messages\n🎵 Audio files (.mp3, .wav, .ogg, .m4a)\n🎬 Video files (.mp4, .mkv, .avi, .mov)\n💬 Text notes & captions\n\n*Basic Usage:*\n1️⃣ Send file(s) and/or text\n2️⃣ Send *.* to process\n\n*👥 Multi-User:*\nEach user's files are tracked separately!\n\n*↩️ Reply Feature:*\nReply to my response to:\n• Ask questions about findings\n• Add more context/corrections\n• Send additional files\n\n*Commands:*\n• *.* - Process YOUR content\n• *clear* - Clear YOUR buffer\n• *status* - Check status` 
-            });
         }
         else if (text.toLowerCase() === 'clear') {
-            const userItems = clearUserBuffer(chatId, senderId);
+            clearUserBuffer(chatId, senderId);
             clearUserTimeout(chatId, senderId);
-            
-            if (userItems.length > 0) {
-                const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
-                userItems.forEach(m => {
-                    if (m.type === 'image') counts.images++;
-                    else if (m.type === 'pdf') counts.pdfs++;
-                    else if (m.type === 'audio' || m.type === 'voice') counts.audio++;
-                    else if (m.type === 'video') counts.video++;
-                    else if (m.type === 'text') counts.texts++;
-                });
-                
-                await sock.sendMessage(chatId, { 
-                    text: `🗑️ @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
-                    mentions: [senderId]
-                });
-            } else {
-                await sock.sendMessage(chatId, { 
-                    text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
-                    mentions: [senderId]
-                });
-            }
+            await sock.sendMessage(chatId, { text: `🗑️ Buffer cleared.` });
         }
         else if (text.toLowerCase() === 'status') {
-            const stats = getTotalBufferStats(chatId);
-            const userCount = getUserBufferCount(chatId, senderId);
-            const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
-            
-            await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Group Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available` 
-            });
+             await sock.sendMessage(chatId, { text: `✅ Bot is running. Active keys: ${CONFIG.API_KEYS.length}` });
         }
-        else {
-            log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
-            
-            const count = addToUserBuffer(chatId, senderId, {
+        else if (!isCommand(text)) {
+            addToUserBuffer(chatId, senderId, {
                 type: 'text',
                 content: text,
                 sender: senderName,
                 timestamp: Date.now()
             });
-            
-            log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
             resetUserTimeout(chatId, senderId, senderName);
         }
     }
@@ -1304,383 +935,99 @@ async function handleMessage(sock, msg) {
 
 async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType) {
     const storedContext = getStoredContext(chatId, quotedMessageId);
-    const shortId = getShortSenderId(senderId);
+    if (!storedContext) return;
     
-    if (!storedContext) {
-        log('⚠️', `Context expired for ...${shortId}`);
-        await sock.sendMessage(chatId, { 
-            text: `⏰ @${senderId.split('@')[0]}, that context has expired (30 min limit).\n\nPlease send new files and use "." to process.`,
-            mentions: [senderId]
-        });
-        return;
-    }
+    let text = '';
+    if (messageType === 'conversation') text = msg.message.conversation;
+    else if (messageType === 'extendedTextMessage') text = msg.message.extendedTextMessage?.text;
     
-    const newContent = [];
-    let userTextInput = '';
-    
-    // Handle both conversation and extendedTextMessage for text replies
-    if (messageType === 'conversation') {
-        const text = msg.message.conversation || '';
-        if (text.trim()) {
-            userTextInput = text.trim();
-            newContent.push({
-                type: 'text',
-                content: text.trim(),
-                sender: senderName,
-                timestamp: Date.now(),
-                isFollowUp: true
-            });
-            log('💬', `Follow-up text (conversation) from ...${shortId}: "${text.substring(0, 50)}..."`);
-        }
-    }
-    else if (messageType === 'extendedTextMessage') {
-        const text = msg.message.extendedTextMessage?.text || '';
-        if (text.trim()) {
-            userTextInput = text.trim();
-            newContent.push({
-                type: 'text',
-                content: text.trim(),
-                sender: senderName,
-                timestamp: Date.now(),
-                isFollowUp: true
-            });
-            log('💬', `Follow-up text (extended) from ...${shortId}: "${text.substring(0, 50)}..."`);
-        }
-    }
-    else if (messageType === 'imageMessage') {
-        try {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.imageMessage.caption || '';
-            
-            newContent.push({
-                type: 'image',
-                data: buffer.toString('base64'),
-                mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
-                caption: caption,
-                timestamp: Date.now(),
-                isFollowUp: true
-            });
-            if (caption) userTextInput = caption;
-            log('📷', `Follow-up image from ...${shortId}`);
-        } catch (error) {
-            log('❌', `Image error: ${error.message}`);
-        }
-    }
-    else if (messageType === 'videoMessage') {
-        try {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.videoMessage.caption || '';
-            
-            newContent.push({
-                type: 'video',
-                data: buffer.toString('base64'),
-                mimeType: msg.message.videoMessage.mimetype || 'video/mp4',
-                caption: caption,
-                duration: msg.message.videoMessage.seconds || 0,
-                timestamp: Date.now(),
-                isFollowUp: true
-            });
-            if (caption) userTextInput = caption;
-            log('🎬', `Follow-up video from ...${shortId}`);
-        } catch (error) {
-            log('❌', `Video error: ${error.message}`);
-        }
-    }
-    else if (messageType === 'audioMessage') {
-        try {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const isVoice = msg.message.audioMessage.ptt === true;
-            
-            newContent.push({
-                type: isVoice ? 'voice' : 'audio',
-                data: buffer.toString('base64'),
-                mimeType: msg.message.audioMessage.mimetype || 'audio/ogg',
-                duration: msg.message.audioMessage.seconds || 0,
-                timestamp: Date.now(),
-                isFollowUp: true
-            });
-            log(isVoice ? '🎤' : '🎵', `Follow-up audio from ...${shortId}`);
-        } catch (error) {
-            log('❌', `Audio error: ${error.message}`);
-        }
-    }
-    else if (messageType === 'documentMessage') {
-        const docMime = msg.message.documentMessage.mimetype || '';
-        const fileName = msg.message.documentMessage.fileName || 'document';
-        const caption = msg.message.documentMessage.caption || '';
+    if (text) {
+        const newContent = [{
+            type: 'text',
+            content: text,
+            sender: senderName,
+            isFollowUp: true
+        }];
         
-        const fileType = getFileType(docMime, fileName);
-        
-        if (fileType === 'pdf') {
-            try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                
-                newContent.push({
-                    type: 'pdf',
-                    data: buffer.toString('base64'),
-                    mimeType: 'application/pdf',
-                    fileName: fileName,
-                    caption: caption,
-                    timestamp: Date.now(),
-                    isFollowUp: true
-                });
-                if (caption) userTextInput = caption;
-                log('📄', `Follow-up PDF from ...${shortId}`);
-            } catch (error) {
-                log('❌', `PDF error: ${error.message}`);
-            }
-        }
-        else if (fileType === 'audio') {
-            try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                
-                newContent.push({
-                    type: 'audio',
-                    data: buffer.toString('base64'),
-                    mimeType: docMime || 'audio/mpeg',
-                    fileName: fileName,
-                    caption: caption,
-                    timestamp: Date.now(),
-                    isFollowUp: true
-                });
-                if (caption) userTextInput = caption;
-                log('🎵', `Follow-up audio file from ...${shortId}`);
-            } catch (error) {
-                log('❌', `Audio file error: ${error.message}`);
-            }
-        }
-        else if (fileType === 'video') {
-            try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                
-                newContent.push({
-                    type: 'video',
-                    data: buffer.toString('base64'),
-                    mimeType: docMime || 'video/mp4',
-                    fileName: fileName,
-                    caption: caption,
-                    timestamp: Date.now(),
-                    isFollowUp: true
-                });
-                if (caption) userTextInput = caption;
-                log('🎬', `Follow-up video file from ...${shortId}`);
-            } catch (error) {
-                log('❌', `Video file error: ${error.message}`);
-            }
-        }
+        const combinedMedia = [...storedContext.mediaFiles, ...newContent];
+        await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, text);
     }
-    
-    if (newContent.length === 0) {
-        await sock.sendMessage(chatId, { 
-            text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
-            mentions: [senderId]
-        });
-        return;
-    }
-    
-    // Determine if this is a question or additional context
-    const isUserQuestion = isQuestion(userTextInput);
-    
-    const combinedMedia = [...storedContext.mediaFiles, ...newContent];
-    
-    log('🔄', `Regenerating for ...${shortId}: ${storedContext.mediaFiles.length} original + ${newContent.length} new (isQuestion: ${isUserQuestion})`);
-    
-    await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
-
-// NOTE: Global model init is removed. We now init per-request for key rotation.
 
 async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null) {
     const shortId = getShortSenderId(senderId);
     
     try {
-        const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, followUps: 0 };
-        const textContents = [];
-        const captions = [];
-        const binaryMedia = [];
-        const followUpTexts = [];
-        
-        mediaFiles.forEach(m => {
-            if (m.isFollowUp) counts.followUps++;
-            
-            if (m.type === 'image') {
-                counts.images++;
-                binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional image caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[Image caption]: ${m.caption}`);
-                    }
-                }
-            }
-            else if (m.type === 'pdf') {
-                counts.pdfs++;
-                binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional PDF caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[PDF caption]: ${m.caption}`);
-                    }
-                }
-            }
-            else if (m.type === 'audio' || m.type === 'voice') {
-                counts.audio++;
-                binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional audio caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[Audio caption]: ${m.caption}`);
-                    }
-                }
-            }
-            else if (m.type === 'video') {
-                counts.video++;
-                binaryMedia.push(m);
-                if (m.caption) {
-                    if (m.isFollowUp) {
-                        followUpTexts.push(`[Additional video caption]: ${m.caption}`);
-                    } else {
-                        captions.push(`[Video caption]: ${m.caption}`);
-                    }
-                }
-            }
-            else if (m.type === 'text') {
-                counts.texts++;
-                if (m.isFollowUp) {
-                    followUpTexts.push(`[User follow-up from ${m.sender}]: ${m.content}`);
-                } else {
-                    textContents.push(`[Text note from ${m.sender}]: ${m.content}`);
-                }
-            }
-        });
-        
-        if (isFollowUp) {
-            log('🤖', `Processing follow-up for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
-        } else {
-            log('🤖', `Processing for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
-        }
-        
+        await sock.sendMessage(chatId, { text: `⏳ Processing... (Analysing video/images)` }, { quoted: { key: { id: isFollowUp ? null : 'status-msg' } } });
+
         const contentParts = [];
-        binaryMedia.forEach(media => {
-            contentParts.push({
-                inlineData: { 
-                    data: media.data, 
-                    mimeType: media.mimeType 
-                }
-            });
-        });
+        const textNotes = [];
         
-        let promptParts = [];
-        if (counts.images > 0) promptParts.push(`${counts.images} image(s)`);
-        if (counts.pdfs > 0) promptParts.push(`${counts.pdfs} PDF document(s)`);
-        if (counts.audio > 0) promptParts.push(`${counts.audio} audio/voice recording(s)`);
-        if (counts.video > 0) promptParts.push(`${counts.video} video file(s)`);
-        
-        const allOriginalText = [...captions, ...textContents];
-        let promptText = '';
-        
-        if (isFollowUp && previousResponse) {
-            // Determine if this is a question or additional context
-            const isUserQuestion = userTextInput ? isQuestion(userTextInput) : false;
-            
-            if (isUserQuestion) {
-                // User is asking a question - answer it based on context
-                promptText = `The user is replying to a previously generated Clinical Profile with a QUESTION or request for clarification.
-
-=== PREVIOUS CLINICAL PROFILE ===
-${previousResponse}
-=== END PREVIOUS CLINICAL PROFILE ===
-
-=== ORIGINAL MEDICAL CONTENT CONTEXT ===
-${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original medical files are attached for reference)'}
-=== END ORIGINAL CONTEXT ===
-
-=== USER'S QUESTION/REQUEST ===
-${followUpTexts.join('\n\n')}
-=== END USER'S QUESTION ===
-
-Please answer the user's question directly and helpfully based on the Clinical Profile and original medical content. 
-- Provide clear, understandable explanations
-- If appropriate, explain medical terms in simple language
-- Be informative and thorough
-- If they ask about specific findings, explain what those findings typically mean
-- Remind them this is AI analysis for informational purposes only and not a substitute for professional medical advice
-
-DO NOT regenerate the Clinical Profile unless specifically asked. Just answer their question.`;
-            } else {
-                // User is providing additional context or corrections - regenerate profile
-                promptText = `The user is replying to a previously generated Clinical Profile with ADDITIONAL CONTEXT, CORRECTIONS, or NEW INFORMATION.
-
-=== PREVIOUS CLINICAL PROFILE ===
-${previousResponse}
-=== END PREVIOUS CLINICAL PROFILE ===
-
-=== ORIGINAL CONTEXT ===
-${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original files are attached below)'}
-=== END ORIGINAL CONTEXT ===
-
-=== NEW ADDITIONAL INFORMATION FROM USER ===
-${followUpTexts.join('\n\n')}
-=== END NEW INFORMATION ===
-
-Please analyze ALL the content (original files + original text + NEW additional information) and generate an UPDATED Clinical Profile that incorporates the new information. Follow the standard Clinical Profile format:
-- Single paragraph starting with "Clinical Profile:"
-- Wrapped in single asterisks
-- Chronological order for dated scans
-- Exclude patient name, age, gender`;
+        for (const media of mediaFiles) {
+            if (media.type === 'text') {
+                textNotes.push(media.content);
+            } 
+            else if (media.type === 'image' || media.type === 'pdf') {
+                contentParts.push({
+                    inlineData: { data: media.data, mimeType: media.mimeType }
+                });
+                if (media.caption) textNotes.push(`[Caption]: ${media.caption}`);
             }
-            
-        } else if (binaryMedia.length > 0 && allOriginalText.length > 0) {
-            promptText = `Analyze these ${promptParts.join(', ')} along with the following additional text notes/context, and generate the Clinical Profile.
-
-=== ADDITIONAL TEXT NOTES ===
-${allOriginalText.join('\n\n')}
-=== END OF TEXT NOTES ===
-
-For audio files, transcribe the content first, then extract medical information.
-For video files, analyze visual content and transcribe any audio.`;
-        } 
-        else if (binaryMedia.length > 0) {
-            promptText = `Analyze these ${promptParts.join(', ')} containing medical information and generate the Clinical Profile. For audio files, transcribe the content first. For video files, analyze visual content and transcribe any audio.`;
-        }
-        else if (allOriginalText.length > 0) {
-            promptText = `Analyze the following text notes containing medical information and generate the Clinical Profile.
-
-=== TEXT NOTES ===
-${allOriginalText.join('\n\n')}
-=== END OF TEXT NOTES ===`;
+            else if (media.type === 'audio' || media.type === 'voice') {
+                contentParts.push({
+                    inlineData: { data: media.data, mimeType: media.mimeType }
+                });
+            }
+            else if (media.type === 'video') {
+                // SMART VIDEO PROCESSING START
+                if (media.duration > 0 && media.duration < 120) {
+                    // It's a short video (under 2 mins), break it into frames
+                    log('🎬', `Smart processing video for ...${shortId}`);
+                    const result = await processSmartVideo(media.data, media.mimeType);
+                    
+                    if (result.success) {
+                        log('✅', `Extracted ${result.count} frames from video`);
+                        // Add audio and frames to payload
+                        result.parts.forEach(p => contentParts.push(p));
+                        textNotes.push(`[System Note]: The user provided a video. I have broken it down into ${result.count} frames (3 images per second) to capture fast page flipping. Read these sequential images as a video stream.`);
+                        if (media.caption) textNotes.push(`[Video Caption]: ${media.caption}`);
+                    } else {
+                        // Fallback to standard video
+                        contentParts.push({
+                            inlineData: { data: media.data, mimeType: media.mimeType }
+                        });
+                    }
+                } else {
+                    // Long video, use standard processing (1 FPS limited by Gemini)
+                    contentParts.push({
+                        inlineData: { data: media.data, mimeType: media.mimeType }
+                    });
+                }
+                // SMART VIDEO PROCESSING END
+            }
         }
         
-        let requestContent;
-        if (binaryMedia.length > 0) {
-            requestContent = [promptText, ...contentParts];
+        // Construct Prompt
+        let promptText = '';
+        if (isFollowUp && previousResponse) {
+             const isUserQuestion = userTextInput ? isQuestion(userTextInput) : false;
+             if (isUserQuestion) {
+                 promptText = `User Question: "${userTextInput}"\n\nPrevious Profile:\n${previousResponse}\n\nAnswer the question based on the medical evidence provided in the images/video frames.`;
+             } else {
+                 promptText = `Update the Clinical Profile based on this new info: "${userTextInput}"\n\nPrevious Profile:\n${previousResponse}`;
+             }
         } else {
-            requestContent = [promptText];
+             promptText = "Analyze these medical files (extracted frames from video or images). " + (textNotes.length > 0 ? "Additional context: " + textNotes.join('\n') : "");
         }
         
-        // --- API KEY ROTATION LOGIC START ---
+        const requestContent = [promptText, ...contentParts];
         
+        // API Call
         let responseText = null;
-        let success = false;
-        let lastErrorMsg = '';
-        
         const keys = CONFIG.API_KEYS;
         
-        if (keys.length === 0) {
-            throw new Error('No API keys configured!');
-        }
-        
-        // Try each key one by one
         for (let i = 0; i < keys.length; i++) {
             try {
-                // If this isn't the first key, log that we are switching
-                if (i > 0) {
-                    log('⚠️', `Retrying with Backup Key #${i + 1}...`);
-                }
-
                 const genAI = new GoogleGenerativeAI(keys[i]);
                 const model = genAI.getGenerativeModel({ 
                     model: CONFIG.GEMINI_MODEL,
@@ -1689,121 +1036,40 @@ ${allOriginalText.join('\n\n')}
                 
                 const result = await model.generateContent(requestContent);
                 responseText = result.response.text();
-                success = true;
-                
-                // If successful, break the loop
                 break;
-                
             } catch (error) {
-                lastErrorMsg = error.message;
-                log('❌', `Key #${i + 1} failed: ${error.message}`);
-                
-                // Continue to next key in loop automatically
+                log('⚠️', `Key ${i} failed: ${error.message}`);
+                if (i === keys.length - 1) throw error;
             }
         }
-        
-        if (!success) {
-            throw new Error(`All ${keys.length} API keys failed. Last error: ${lastErrorMsg}`);
-        }
-        
-        // --- API KEY ROTATION LOGIC END ---
-        
-        if (!responseText || responseText.trim() === '') {
-            log('⚠️', `Empty response from AI for ...${shortId}`);
-            await sock.sendMessage(chatId, { 
-                text: `⚠️ @${senderId.split('@')[0]}, I received an empty response. Please try again.`,
-                mentions: [senderId]
-            });
-            return;
-        }
-        
-        log('✅', `Done for ...${shortId}!`);
-        processedCount++;
-        
-        console.log('\n' + '═'.repeat(60));
-        console.log(`👤 User: ${senderName} (...${shortId})`);
-        if (isFollowUp) console.log(`🔄 FOLLOW-UP RESPONSE`);
-        console.log(`📊 ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
-        console.log(`⏰ ${new Date().toLocaleString()}`);
-        console.log('═'.repeat(60));
-        console.log(responseText);
-        console.log('═'.repeat(60) + '\n');
-        
-        await sock.sendPresenceUpdate('composing', chatId);
-        const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
-        await new Promise(resolve => setTimeout(resolve, delay));
-        await sock.sendPresenceUpdate('paused', chatId);
-        
-        let sentMessage;
-        const finalResponseText = responseText.length <= 3800 
-            ? responseText 
-            : responseText.substring(0, 3800) + '\n\n_(truncated)_';
-        
-        sentMessage = await sock.sendMessage(chatId, { 
-            text: finalResponseText,
+
+        if (!responseText) throw new Error("Empty response");
+
+        const sentMessage = await sock.sendMessage(chatId, { 
+            text: responseText,
             mentions: [senderId]
         });
         
         if (sentMessage?.key?.id) {
-            const messageId = sentMessage.key.id;
-            trackBotMessage(chatId, messageId);
-            storeContext(chatId, messageId, mediaFiles, responseText, senderId);
-            log('💾', `Context stored for ...${shortId}`);
+            trackBotMessage(chatId, sentMessage.key.id);
+            storeContext(chatId, sentMessage.key.id, mediaFiles, responseText, senderId);
         }
         
-        log('📤', `Sent to ...${shortId}!`);
-        
     } catch (error) {
-        log('❌', `Error for ...${shortId}: ${error.message}`);
-        console.error(error);
-        
-        await sock.sendPresenceUpdate('composing', chatId);
-        await new Promise(r => setTimeout(r, 1500));
-        
-        await sock.sendMessage(chatId, { 
-            text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-            mentions: [senderId]
-        });
+        log('❌', `Error: ${error.message}`);
+        await sock.sendMessage(chatId, { text: `❌ Error: ${error.message}` });
     }
 }
 
-console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.3                 ║');
-console.log('║                                                            ║');
-console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
-console.log('║                                                            ║');
-console.log('║  🎵 Supports: MP3, WAV, OGG, M4A, AAC, FLAC               ║');
-console.log('║  🎬 Supports: MP4, MKV, AVI, MOV, WEBM                    ║');
-console.log('║                                                            ║');
-console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
-console.log('║  ↩️ Reply to ask questions OR add context                  ║');
-console.log('║  🗄️ MongoDB Persistent Sessions                           ║');
-console.log('║  🔑 Multi-Key Failover System Active                      ║');
-console.log('║                                                            ║');
-console.log('║  🔒 Works ONLY in ONE specific group                       ║');
-console.log('╚════════════════════════════════════════════════════════════╝\n');
-
-log('🏁', 'Starting...');
-
-if (CONFIG.API_KEYS.length === 0) {
-    log('❌', 'No API Keys found! Set GEMINI_API_KEYS environment variable.');
-} else {
-    log('🔑', `Loaded ${CONFIG.API_KEYS.length} Gemini API Key(s)`);
-}
-
-if (CONFIG.ALLOWED_GROUP_ID) {
-    log('🎯', `Configured for group: ${CONFIG.ALLOWED_GROUP_ID}`);
-} else {
-    log('⚠️', 'No group configured! Bot will discover groups when you message them.');
-}
+// Initial Startup
+if (CONFIG.API_KEYS.length === 0) log('❌', 'No API Keys found!');
+if (!CONFIG.ALLOWED_GROUP_ID) log('⚠️', 'No group configured!');
 
 (async () => {
     try {
         await connectMongoDB();
         await startBot();
     } catch (error) {
-        log('💥', `Startup error: ${error.message}`);
         console.error(error);
-        process.exit(1);
     }
 })();
