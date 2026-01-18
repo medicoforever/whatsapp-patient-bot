@@ -22,6 +22,16 @@ const getApiKeys = () => {
     return keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
 };
 
+// ==============================================================================
+// 🟢 NEW CONFIGURATION AREA (Integrated from Telegram Bot)
+// ==============================================================================
+
+const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist. When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
+
+const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from the patient's reports. Please analyze this profile according to your system instructions and provide the final output.`;
+
+// ==============================================================================
+
 const CONFIG = {
     // We now store an array of keys
     API_KEYS: getApiKeys(),
@@ -32,7 +42,7 @@ const CONFIG = {
     CONTEXT_RETENTION_MS: 1800000,
     MAX_STORED_CONTEXTS: 20,
     // Trigger text is now dynamic (handled in code), but base commands remain
-    COMMANDS: ['.', '.1', '.2', '.3', 'help', '?', 'clear', 'status'],
+    COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
     TYPING_DELAY_MIN: 3000,
     TYPING_DELAY_MAX: 6000,
     SUPPORTED_AUDIO_MIMES: [
@@ -686,6 +696,8 @@ app.get('/', (req, res) => {
                 - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
                 - Send <strong>.2</strong> for Smart 2 FPS<br>
                 - Send <strong>.1</strong> for Smart 1 FPS<br>
+                <strong>🧠 Secondary Analysis:</strong><br>
+                - Send <strong>..</strong> (double dot) for Chained Analysis<br>
                 <strong>↩️ Reply:</strong> Reply to bot to ask questions.
                 </p>
             </div>
@@ -1149,10 +1161,13 @@ async function handleMessage(sock, msg) {
         
         if (!text) return;
 
-        // CHECK FOR TRIGGER COMMANDS: ., .1, .2
-        const isTrigger = text === '.' || text === '.1' || text === '.2' || text === '.3';
+        // CHECK FOR TRIGGERS
+        // Primary: . .1 .2 .3
+        const isPrimaryTrigger = /^(\.|(\.[1-3]))$/.test(text);
+        // Secondary: .. ..1 ..2 ..3
+        const isSecondaryTrigger = /^(\.\.|(\.\.[1-3]))$/.test(text);
         
-        if (isTrigger) {
+        if (isPrimaryTrigger || isSecondaryTrigger) {
             log('🔔', `Trigger command "${text}" from ${senderName} (...${shortId})`);
             
             await new Promise(r => setTimeout(r, 1000));
@@ -1163,24 +1178,30 @@ async function handleMessage(sock, msg) {
                 clearUserTimeout(chatId, senderId);
                 const mediaFiles = clearUserBuffer(chatId, senderId);
                 
-                // DETERMINE VIDEO FPS based on command
-                let targetFps = 3; // Default for '.'
-                if (text === '.1') targetFps = 1;
-                if (text === '.2') targetFps = 2;
+                // DETERMINE VIDEO FPS based on command suffix
+                // . or .. = 3fps
+                // .1 or ..1 = 1fps
+                // .2 or ..2 = 2fps
+                const lastChar = text.slice(-1);
+                let targetFps = 3; 
+                if (!isNaN(parseInt(lastChar))) {
+                    targetFps = parseInt(lastChar);
+                }
                 
-                log('🤖', `Processing ${mediaFiles.length} item(s) with FPS=${targetFps}`);
+                log('🤖', `Processing ${mediaFiles.length} item(s) with FPS=${targetFps}. Mode: ${isSecondaryTrigger ? 'SECONDARY/CHAINED' : 'PRIMARY'}`);
                 
-                await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null, targetFps);
+                // Pass the isSecondaryMode flag (true if .. is used)
+                await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger);
             } else {
                 await sock.sendMessage(chatId, { 
-                    text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (or .1, .2 for video speed control).\n\n💡 _Or reply to my previous response to ask questions or add context!_`,
+                    text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
                     mentions: [senderId]
                 });
             }
         }
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
-                text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.*  - Process with Smart 3 FPS (Best for fast flipping pages)\n• *.2* - Process with Smart 2 FPS\n• *.1* - Process with Smart 1 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!` 
+                text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.*  - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!` 
             });
         }
         else if (text.toLowerCase() === 'clear') {
@@ -1419,8 +1440,41 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
 
-// Added targetFps argument to function signature
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3) {
+// Helper Function for Gemini API Calls with Rotation
+async function generateGeminiContent(requestContent, systemInstruction) {
+    const keys = CONFIG.API_KEYS;
+    if (keys.length === 0) {
+        throw new Error('No API keys configured!');
+    }
+
+    let responseText = null;
+    let lastErrorMsg = '';
+
+    for (let i = 0; i < keys.length; i++) {
+        try {
+            if (i > 0) log('⚠️', `Retrying with Backup Key #${i + 1}...`);
+
+            const genAI = new GoogleGenerativeAI(keys[i]);
+            const model = genAI.getGenerativeModel({ 
+                model: CONFIG.GEMINI_MODEL,
+                systemInstruction: systemInstruction
+            });
+            
+            const result = await model.generateContent(requestContent);
+            responseText = result.response.text();
+            return responseText; // Success
+
+        } catch (error) {
+            lastErrorMsg = error.message;
+            log('❌', `Key #${i + 1} failed: ${error.message}`);
+        }
+    }
+    throw new Error(`All ${keys.length} API keys failed. Last error: ${lastErrorMsg}`);
+}
+
+
+// Updated processMedia with isSecondaryMode argument
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false) {
     const shortId = getShortSenderId(senderId);
     
     try {
@@ -1626,54 +1680,69 @@ ${allOriginalText.join('\n\n')}
             requestContent = [promptText];
         }
         
-        // --- API KEY ROTATION LOGIC START ---
+        // --- STEP 1: Generate Primary Clinical Profile ---
+        log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
+        const primaryResponseText = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
         
-        let responseText = null;
-        let success = false;
-        let lastErrorMsg = '';
-        
-        const keys = CONFIG.API_KEYS;
-        
-        if (keys.length === 0) {
-            throw new Error('No API keys configured!');
-        }
-        
-        // Try each key one by one
-        for (let i = 0; i < keys.length; i++) {
-            try {
-                // If this isn't the first key, log that we are switching
-                if (i > 0) {
-                    log('⚠️', `Retrying with Backup Key #${i + 1}...`);
-                }
+        // If Secondary Mode is active, we need to send the primary response first, then continue
+        if (isSecondaryMode && !isFollowUp) {
+            await sock.sendMessage(chatId, { 
+                text: `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`,
+                mentions: [senderId]
+            });
+            log('📤', `Sent Primary (Step 1) to ...${shortId}`);
 
-                const genAI = new GoogleGenerativeAI(keys[i]);
-                const model = genAI.getGenerativeModel({ 
-                    model: CONFIG.GEMINI_MODEL,
-                    systemInstruction: CONFIG.SYSTEM_INSTRUCTION
-                });
-                
-                const result = await model.generateContent(requestContent);
-                responseText = result.response.text();
-                success = true;
-                
-                // If successful, break the loop
-                break;
-                
-            } catch (error) {
-                lastErrorMsg = error.message;
-                log('❌', `Key #${i + 1} failed: ${error.message}`);
-                
-                // Continue to next key in loop automatically
+            // --- STEP 2: Generate Secondary Analysis ---
+            log('🔄', `Generating Secondary Analysis...`);
+            
+            const secondaryPrompt = `${SECONDARY_TRIGGER_PROMPT}
+
+=== CLINICAL PROFILE ===
+${primaryResponseText}
+=== END PROFILE ===`;
+
+            const secondaryRequestContent = [secondaryPrompt]; // Text only request based on profile
+            const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
+            
+            // The final response we want to store and send is the Secondary one (or a combo)
+            // We'll treat the Secondary response as the "Result" for context purposes.
+            const finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
+            
+            // Update responseText variable for the final send block below
+            processedCount++;
+            
+            console.log('\n' + '═'.repeat(60));
+            console.log(`👤 User: ${senderName} (...${shortId})`);
+            console.log(`📊 CHAINED ANALYSIS COMPLETE`);
+            console.log(`⏰ ${new Date().toLocaleString()}`);
+            console.log('═'.repeat(60));
+            console.log(finalSecondaryText);
+            console.log('═'.repeat(60) + '\n');
+            
+            await sock.sendPresenceUpdate('composing', chatId);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            await sock.sendPresenceUpdate('paused', chatId);
+            
+            const sentMessage = await sock.sendMessage(chatId, { 
+                text: finalSecondaryText,
+                mentions: [senderId]
+            });
+            
+            if (sentMessage?.key?.id) {
+                const messageId = sentMessage.key.id;
+                trackBotMessage(chatId, messageId);
+                // Store the SECONDARY response as the context context for follow-ups
+                storeContext(chatId, messageId, mediaFiles, secondaryResponseText, senderId);
+                log('💾', `Secondary Context stored for ...${shortId}`);
             }
+            log('📤', `Sent Secondary (Step 2) to ...${shortId}!`);
+            return; // Exit here as we handled sending manually for secondary mode
         }
+
+        // --- NORMAL PRIMARY MODE or FOLLOW-UP HANDLING ---
+        // If we aren't in Secondary Mode (or it's a follow up), just handle normally
         
-        if (!success) {
-            throw new Error(`All ${keys.length} API keys failed. Last error: ${lastErrorMsg}`);
-        }
-        
-        // --- API KEY ROTATION LOGIC END ---
-        
-        if (!responseText || responseText.trim() === '') {
+        if (!primaryResponseText || primaryResponseText.trim() === '') {
             log('⚠️', `Empty response from AI for ...${shortId}`);
             await sock.sendMessage(chatId, { 
                 text: `⚠️ @${senderId.split('@')[0]}, I received an empty response. Please try again.`,
@@ -1691,7 +1760,7 @@ ${allOriginalText.join('\n\n')}
         console.log(`📊 ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
         console.log(`⏰ ${new Date().toLocaleString()}`);
         console.log('═'.repeat(60));
-        console.log(responseText);
+        console.log(primaryResponseText);
         console.log('═'.repeat(60) + '\n');
         
         await sock.sendPresenceUpdate('composing', chatId);
@@ -1700,9 +1769,9 @@ ${allOriginalText.join('\n\n')}
         await sock.sendPresenceUpdate('paused', chatId);
         
         let sentMessage;
-        const finalResponseText = responseText.length <= 3800 
-            ? responseText 
-            : responseText.substring(0, 3800) + '\n\n_(truncated)_';
+        const finalResponseText = primaryResponseText.length <= 3800 
+            ? primaryResponseText 
+            : primaryResponseText.substring(0, 3800) + '\n\n_(truncated)_';
         
         sentMessage = await sock.sendMessage(chatId, { 
             text: finalResponseText,
@@ -1712,7 +1781,7 @@ ${allOriginalText.join('\n\n')}
         if (sentMessage?.key?.id) {
             const messageId = sentMessage.key.id;
             trackBotMessage(chatId, messageId);
-            storeContext(chatId, messageId, mediaFiles, responseText, senderId);
+            storeContext(chatId, messageId, mediaFiles, primaryResponseText, senderId);
             log('💾', `Context stored for ...${shortId}`);
         }
         
@@ -1733,13 +1802,14 @@ ${allOriginalText.join('\n\n')}
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.5                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v2.6                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
 console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)  ║');
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║');
 console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
+console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain     ║');
 console.log('║                                                            ║');
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
