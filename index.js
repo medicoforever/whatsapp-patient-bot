@@ -35,7 +35,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 const CONFIG = {
     // We now store an array of keys
     API_KEYS: getApiKeys(),
-    GEMINI_MODEL: 'gemini-3-flash', 
+    GEMINI_MODEL: 'gemini-3-flash-preview', 
     MONGODB_URI: process.env.MONGODB_URI,
     // REMOVED ALLOWED_GROUP_ID constraint. Bot is now public.
     MEDIA_TIMEOUT_MS: 300000,
