@@ -800,6 +800,12 @@ async function startBot() {
         log('🚀', 'Starting WhatsApp Bot...');
         
         if (!makeWASocket) await loadBaileys();
+
+        // 🟢 FIX: Force MongoDB reconnection attempt if configured but disconnected
+        if (!mongoConnected && CONFIG.MONGODB_URI) {
+            log('⚠️', 'MongoDB appears disconnected. Attempting to reconnect...');
+            await connectMongoDB();
+        }
         
         let state, saveCreds, clearAll;
         
@@ -815,6 +821,7 @@ async function startBot() {
                 throw e;
             }
         } else {
+            // Only fall back to file if MongoDB really failed to connect
             const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
             const authPath = join(__dirname, 'auth_session');
             const fileAuth = await useMultiFileAuthState(authPath);
