@@ -1525,9 +1525,12 @@ async function generateGeminiContent(requestContent, systemInstruction) {
             const result = await model.generateContent(requestContent);
             responseText = result.response.text();
             
+            // 🟢 MODIFICATION START: Force error on empty response to trigger key rotation
             if (!responseText) {
-                 log('⚠️', `Response was empty. Safety Ratings: ${JSON.stringify(result.response.promptFeedback)}`);
+                 const feedback = JSON.stringify(result.response.promptFeedback || {});
+                 throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
             }
+            // 🟢 MODIFICATION END
 
             return responseText; // Success
 
@@ -1541,7 +1544,8 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 
 
 // 🔄 UPDATED processMedia to support Target Chat routing and Caption Headers
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null) {
+// 🟢 MODIFICATION: Added retryAttempt parameter (default 0)
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
     const shortId = getShortSenderId(senderId);
     // If targetChatId is provided, we send the result there. Otherwise, back to original chatId.
     const destinationChatId = targetChatId || chatId;
@@ -1811,12 +1815,8 @@ ${primaryResponseText}
         // --- NORMAL PRIMARY MODE or FOLLOW-UP HANDLING ---
         
         if (!primaryResponseText || primaryResponseText.trim() === '') {
-            log('⚠️', `Empty response from AI for ...${shortId}`);
-            await sock.sendMessage(destinationChatId, { 
-                text: `⚠️ @${senderId.split('@')[0]}, I received an empty response. Please try again.`,
-                mentions: [senderId]
-            });
-            return;
+            // This should be caught by generateGeminiContent now, but safe fallback
+            throw new Error('Received empty response from AI');
         }
         
         log('✅', `Done for ...${shortId}!`);
@@ -1866,6 +1866,28 @@ ${primaryResponseText}
         log('❌', `Error for ...${shortId}: ${error.message}`);
         console.error(error);
         
+        // 🟢 MODIFICATION START: 5-Minute Auto-Retry Logic
+        if (retryAttempt === 0) {
+            log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
+            
+            await sock.sendPresenceUpdate('composing', destinationChatId);
+            await new Promise(r => setTimeout(r, 1000));
+            
+            await sock.sendMessage(destinationChatId, { 
+                text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
+                mentions: [senderId]
+            });
+            
+            // Schedule the retry with exact same parameters, but increment retryAttempt
+            setTimeout(() => {
+                log('🔄', `Executing 5-minute retry for ...${shortId}`);
+                processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
+            }, 300000); // 300,000 ms = 5 minutes
+            
+            return;
+        }
+        // 🟢 MODIFICATION END
+
         await sock.sendPresenceUpdate('composing', destinationChatId);
         await new Promise(r => setTimeout(r, 1500));
         
@@ -1877,7 +1899,7 @@ ${primaryResponseText}
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.8                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v2.9                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
@@ -1890,7 +1912,7 @@ console.log('║                                                            ║'
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
 console.log('║  🗄️ MongoDB Persistent Sessions                           ║');
-console.log('║  🔑 Multi-Key Failover System Active                      ║');
+console.log('║  🔑 Multi-Key Failover + Auto-Retry (5m) Active           ║');
 console.log('╚════════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Starting...');
