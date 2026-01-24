@@ -23,37 +23,23 @@ const getApiKeys = () => {
 };
 
 // ==============================================================================
-// 🟢 NEW CONFIGURATION AREA (Integrated from Telegram Bot)
+// 🟢 CONFIGURATION AREA
 // ==============================================================================
 
 const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist. When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
 
 const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from the patient's reports. Please analyze this profile according to your system instructions and provide the final output.`;
 
-// ==============================================================================
-
 const CONFIG = {
-    // We now store an array of keys
     API_KEYS: getApiKeys(),
-    GEMINI_MODEL: 'gemini-3-flash-preview', // Updated to faster model if available, else stick to your preferred
+    // 🔴 CHANGED TO STABLE MODEL TO PREVENT 503 OVERLOAD ERRORS
+    GEMINI_MODEL: 'gemini-3-flash-preview', 
     MONGODB_URI: process.env.MONGODB_URI,
-    
-    // Group Routing Configuration
-    GROUPS: {
-        CT_SOURCE: process.env.GROUP_CT_SOURCE,
-        CT_TARGET: process.env.GROUP_CT_TARGET,
-        MRI_SOURCE: process.env.GROUP_MRI_SOURCE,
-        MRI_TARGET: process.env.GROUP_MRI_TARGET
-    },
-
-    MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
-    AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
-    
+    MEDIA_TIMEOUT_MS: 300000,
     CONTEXT_RETENTION_MS: 1800000,
     MAX_STORED_CONTEXTS: 20,
-    COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
-    TYPING_DELAY_MIN: 3000,
-    TYPING_DELAY_MAX: 6000,
+    TYPING_DELAY_MIN: 2000,
+    TYPING_DELAY_MAX: 4000, // Reduced slightly for faster response
     SUPPORTED_AUDIO_MIMES: [
         'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/wave', 'audio/x-wav',
         'audio/ogg', 'audio/opus', 'audio/aac', 'audio/m4a', 'audio/x-m4a',
@@ -166,36 +152,18 @@ function getFileType(mimeType, fileName) {
 function isQuestion(text) {
     if (!text) return false;
     const lowerText = text.toLowerCase().trim();
-    
-    // Check if ends with question mark
     if (lowerText.endsWith('?')) return true;
     
-    // Check for question words at the start
     const questionStarters = [
         'what', 'why', 'how', 'when', 'where', 'who', 'which', 'whose', 'whom',
         'is ', 'are ', 'was ', 'were ', 'do ', 'does ', 'did ', 'will ', 'would ',
         'can ', 'could ', 'should ', 'shall ', 'may ', 'might ', 'have ', 'has ',
-        'explain', 'tell me', 'describe', 'clarify', 'elaborate', 'meaning of',
-        'what\'s', 'what is', 'what are', 'what does', 'what do',
-        'is this', 'is it', 'is there', 'are there', 'does this', 'does it'
+        'explain', 'tell me', 'describe', 'clarify', 'elaborate', 'meaning of'
     ];
     
     for (const starter of questionStarters) {
         if (lowerText.startsWith(starter)) return true;
     }
-    
-    // Check for question phrases anywhere
-    const questionPhrases = [
-        'what does', 'what is', 'what are', 'can you explain', 'could you explain',
-        'please explain', 'i don\'t understand', 'what about', 'how about',
-        'is it', 'are they', 'does it mean', 'does this mean', 'mean by',
-        'significance of', 'implications of', 'serious', 'normal', 'abnormal'
-    ];
-    
-    for (const phrase of questionPhrases) {
-        if (lowerText.includes(phrase)) return true;
-    }
-    
     return false;
 }
 
@@ -413,9 +381,6 @@ function getTotalBufferStats(chatId) {
     return stats;
 }
 
-// ==============================================================================
-// 🔄 UPDATED TIMEOUT LOGIC FOR AUTO-PROCESSING GROUPS
-// ==============================================================================
 function resetUserTimeout(chatId, senderId, senderName) {
     if (!chatTimeouts.has(chatId)) {
         chatTimeouts.set(chatId, new Map());
@@ -426,46 +391,14 @@ function resetUserTimeout(chatId, senderId, senderName) {
         clearTimeout(chatTimeoutMap.get(senderId));
     }
     
-    // Check if this chat is one of the Auto-Process Source Groups
-    const isCTSource = chatId === CONFIG.GROUPS.CT_SOURCE;
-    const isMRISource = chatId === CONFIG.GROUPS.MRI_SOURCE;
-    const isAutoGroup = isCTSource || isMRISource;
-
-    // Use 60 seconds for auto groups, 5 minutes for others
-    const delay = isAutoGroup ? CONFIG.AUTO_PROCESS_DELAY_MS : CONFIG.MEDIA_TIMEOUT_MS;
-    
     const shortId = getShortSenderId(senderId);
-
-    const timeoutCallback = async () => {
-        if (isAutoGroup) {
-            // --- AUTO PROCESSING LOGIC ---
-            // If it's a source group, we process automatically and send to target
-            const mediaFiles = clearUserBuffer(chatId, senderId);
-            if (mediaFiles.length > 0) {
-                log('⏱️', `Auto-processing ${mediaFiles.length} item(s) from Source Group (${isCTSource ? 'CT' : 'MRI'})`);
-                
-                // Determine Target Chat ID
-                const targetChatId = isCTSource ? CONFIG.GROUPS.CT_TARGET : CONFIG.GROUPS.MRI_TARGET;
-                
-                if (targetChatId) {
-                    // Process and send to Target
-                    await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null, 3, false, targetChatId);
-                } else {
-                    log('⚠️', 'Target group not configured for this source!');
-                }
-            }
-        } else {
-            // --- STANDARD BEHAVIOR ---
-            // Just clear buffer after long inactivity
-            const clearedItems = clearUserBuffer(chatId, senderId);
-            if (clearedItems.length > 0) {
-                log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
-            }
+    chatTimeoutMap.set(senderId, setTimeout(() => {
+        const clearedItems = clearUserBuffer(chatId, senderId);
+        if (clearedItems.length > 0) {
+            log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
         }
         chatTimeoutMap.delete(senderId);
-    };
-
-    chatTimeoutMap.set(senderId, setTimeout(timeoutCallback, delay));
+    }, CONFIG.MEDIA_TIMEOUT_MS));
 }
 
 function clearUserTimeout(chatId, senderId) {
@@ -555,7 +488,6 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 
         fs.writeFileSync(inputPath, videoBuffer);
 
-        // INTELLIGENT FILTER LOGIC:
         const batchSize = 3;
         const inputFps = targetFps * batchSize;
 
@@ -602,7 +534,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    // Just grab stats from first available chat buffer for demo, or sum all
     let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
     for (const [chatId, _] of chatMediaBuffers) {
          const s = getTotalBufferStats(chatId);
@@ -697,14 +628,6 @@ app.get('/', (req, res) => {
             }
             .db-connected { background: rgba(76, 175, 80, 0.3); }
             .db-disconnected { background: rgba(244, 67, 54, 0.3); }
-            .feature-badge {
-                display: inline-block;
-                background: rgba(255,255,255,0.2);
-                padding: 3px 8px;
-                border-radius: 12px;
-                font-size: 10px;
-                margin: 2px;
-            }
         </style>
     </head>
     <body>
@@ -715,6 +638,7 @@ app.get('/', (req, res) => {
                 ${mongoConnected ? '🗄️ MongoDB Connected' : '⚠️ MongoDB Not Connected'}
             </div>
             <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
+            <div>ℹ️ Model: ${CONFIG.GEMINI_MODEL}</div>
     `;
     
     if (isConnected) {
@@ -730,7 +654,6 @@ app.get('/', (req, res) => {
                 <h3>✨ Features:</h3>
                 <p>
                 <strong>🌍 Public Access:</strong> Works in any chat/group.<br>
-                <strong>🔄 Auto-Groups:</strong> Monitored CT/MRI groups active.<br>
                 <strong>🎥 Smart Video:</strong><br>
                 - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
                 - Send <strong>.2</strong> for Smart 2 FPS<br>
@@ -839,12 +762,6 @@ async function startBot() {
         log('🚀', 'Starting WhatsApp Bot...');
         
         if (!makeWASocket) await loadBaileys();
-
-        // 🟢 FIX: Force MongoDB reconnection attempt if configured but disconnected
-        if (!mongoConnected && CONFIG.MONGODB_URI) {
-            log('⚠️', 'MongoDB appears disconnected. Attempting to reconnect...');
-            await connectMongoDB();
-        }
         
         let state, saveCreds, clearAll;
         
@@ -860,7 +777,6 @@ async function startBot() {
                 throw e;
             }
         } else {
-            // Only fall back to file if MongoDB really failed to connect
             const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
             const authPath = join(__dirname, 'auth_session');
             const fileAuth = await useMultiFileAuthState(authPath);
@@ -959,8 +875,6 @@ async function startBot() {
                 }
                 
                 log('🌍', 'Universal Mode: Bot is active for ALL chats.');
-                if (CONFIG.GROUPS.CT_SOURCE) log('🏥', 'Monitoring CT Source Group');
-                if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
             }
         });
 
@@ -1283,7 +1197,7 @@ async function handleMessage(sock, msg) {
             const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
             
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available` 
+                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🧠 Model: ${CONFIG.GEMINI_MODEL}` 
             });
         }
         else {
@@ -1488,7 +1402,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
 
-// Helper Function for Gemini API Calls with Rotation
+// Helper Function for Gemini API Calls with Rotation and Delay
 async function generateGeminiContent(requestContent, systemInstruction) {
     const keys = CONFIG.API_KEYS;
     if (keys.length === 0) {
@@ -1500,32 +1414,65 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 
     for (let i = 0; i < keys.length; i++) {
         try {
-            if (i > 0) log('⚠️', `Retrying with Backup Key #${i + 1}...`);
+            if (i > 0) {
+                log('⚠️', `Retrying with Backup Key #${i + 1} (in 2s)...`);
+                // 🔴 ADDED DELAY: Wait 2 seconds before retrying next key
+                await new Promise(r => setTimeout(r, 2000));
+            }
 
             const genAI = new GoogleGenerativeAI(keys[i]);
             const model = genAI.getGenerativeModel({ 
                 model: CONFIG.GEMINI_MODEL,
-                systemInstruction: systemInstruction
+                systemInstruction: systemInstruction,
+                // 🔴 ADDED SAFETY SETTINGS: Make it less likely to block medical content
+                safetySettings: [
+                    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
+                ]
             });
             
             const result = await model.generateContent(requestContent);
+            
+            // 🔴 CHECK FOR SAFETY BLOCK
+            if (result.response.promptFeedback?.blockReason) {
+                throw new Error(`Blocked by safety filter: ${result.response.promptFeedback.blockReason}`);
+            }
+            
+            // 🔴 CHECK FOR CANDIDATE FINISH REASON
+            const candidate = result.response.candidates[0];
+            if (candidate && candidate.finishReason !== 'STOP') {
+                if (candidate.finishReason === 'SAFETY') {
+                     throw new Error('Blocked by Safety Filter (Medical/Gore detected).');
+                }
+                if (candidate.finishReason === 'RECITATION') {
+                     throw new Error('Blocked by Copyright check.');
+                }
+            }
+            
             responseText = result.response.text();
+            
+            // 🔴 DOUBLE CHECK EMPTY STRING
+            if (!responseText || responseText.trim() === '') {
+                throw new Error('Model returned empty text (internal glitch).');
+            }
+
             return responseText; // Success
 
         } catch (error) {
             lastErrorMsg = error.message;
             log('❌', `Key #${i + 1} failed: ${error.message}`);
+            // Loop continues to next key after catch
         }
     }
     throw new Error(`All ${keys.length} API keys failed. Last error: ${lastErrorMsg}`);
 }
 
 
-// 🔄 UPDATED processMedia to support Target Chat routing and Caption Headers
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null) {
+// Updated processMedia with isSecondaryMode argument
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false) {
     const shortId = getShortSenderId(senderId);
-    // If targetChatId is provided, we send the result there. Otherwise, back to original chatId.
-    const destinationChatId = targetChatId || chatId;
     
     try {
         const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, followUps: 0 };
@@ -1735,7 +1682,7 @@ ${allOriginalText.join('\n\n')}
         
         // If Secondary Mode is active, we need to send the primary response first, then continue
         if (isSecondaryMode && !isFollowUp) {
-            await sock.sendMessage(destinationChatId, { 
+            await sock.sendMessage(chatId, { 
                 text: `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`,
                 mentions: [senderId]
             });
@@ -1768,24 +1715,23 @@ ${primaryResponseText}
             console.log(finalSecondaryText);
             console.log('═'.repeat(60) + '\n');
             
-            await sock.sendPresenceUpdate('composing', destinationChatId);
+            await sock.sendPresenceUpdate('composing', chatId);
             await new Promise(resolve => setTimeout(resolve, 2000));
-            await sock.sendPresenceUpdate('paused', destinationChatId);
+            await sock.sendPresenceUpdate('paused', chatId);
             
-            const sentMessage = await sock.sendMessage(destinationChatId, { 
+            const sentMessage = await sock.sendMessage(chatId, { 
                 text: finalSecondaryText,
                 mentions: [senderId]
             });
             
             if (sentMessage?.key?.id) {
                 const messageId = sentMessage.key.id;
-                trackBotMessage(destinationChatId, messageId);
+                trackBotMessage(chatId, messageId);
                 // Store the SECONDARY response as the context context for follow-ups
-                // Note: We store context in destination chat so reply works there
-                storeContext(destinationChatId, messageId, mediaFiles, secondaryResponseText, senderId);
+                storeContext(chatId, messageId, mediaFiles, secondaryResponseText, senderId);
                 log('💾', `Secondary Context stored for ...${shortId}`);
             }
-            log('📤', `Sent Secondary (Step 2) to target!`);
+            log('📤', `Sent Secondary (Step 2) to ...${shortId}!`);
             return; // Exit here as we handled sending manually for secondary mode
         }
 
@@ -1793,7 +1739,7 @@ ${primaryResponseText}
         
         if (!primaryResponseText || primaryResponseText.trim() === '') {
             log('⚠️', `Empty response from AI for ...${shortId}`);
-            await sock.sendMessage(destinationChatId, { 
+            await sock.sendMessage(chatId, { 
                 text: `⚠️ @${senderId.split('@')[0]}, I received an empty response. Please try again.`,
                 mentions: [senderId]
             });
@@ -1812,45 +1758,38 @@ ${primaryResponseText}
         console.log(primaryResponseText);
         console.log('═'.repeat(60) + '\n');
         
-        await sock.sendPresenceUpdate('composing', destinationChatId);
+        await sock.sendPresenceUpdate('composing', chatId);
         const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
         await new Promise(resolve => setTimeout(resolve, delay));
-        await sock.sendPresenceUpdate('paused', destinationChatId);
+        await sock.sendPresenceUpdate('paused', chatId);
         
-        let finalResponseText = primaryResponseText.length <= 3800 
+        let sentMessage;
+        const finalResponseText = primaryResponseText.length <= 3800 
             ? primaryResponseText 
             : primaryResponseText.substring(0, 3800) + '\n\n_(truncated)_';
         
-        // 🟢 FEATURE ADDITION: Put captions at the top if auto-forwarding to a target group
-        if (targetChatId && allOriginalText.length > 0) {
-            const captionHeader = allOriginalText.map(t => t.replace(/^\[.*?\]:\s*/, '')).join('\n');
-            if (captionHeader.trim().length > 0) {
-                finalResponseText = `${captionHeader}\n\n${finalResponseText}`;
-            }
-        }
-
-        const sentMessage = await sock.sendMessage(destinationChatId, { 
+        sentMessage = await sock.sendMessage(chatId, { 
             text: finalResponseText,
             mentions: [senderId]
         });
         
         if (sentMessage?.key?.id) {
             const messageId = sentMessage.key.id;
-            trackBotMessage(destinationChatId, messageId);
-            storeContext(destinationChatId, messageId, mediaFiles, primaryResponseText, senderId);
+            trackBotMessage(chatId, messageId);
+            storeContext(chatId, messageId, mediaFiles, primaryResponseText, senderId);
             log('💾', `Context stored for ...${shortId}`);
         }
         
-        log('📤', `Sent to target/chat!`);
+        log('📤', `Sent to ...${shortId}!`);
         
     } catch (error) {
         log('❌', `Error for ...${shortId}: ${error.message}`);
         console.error(error);
         
-        await sock.sendPresenceUpdate('composing', destinationChatId);
+        await sock.sendPresenceUpdate('composing', chatId);
         await new Promise(r => setTimeout(r, 1500));
         
-        await sock.sendMessage(destinationChatId, { 
+        await sock.sendMessage(chatId, { 
             text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
             mentions: [senderId]
         });
@@ -1858,12 +1797,11 @@ ${primaryResponseText}
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.7                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v2.7 (Stable)        ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
 console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)  ║');
-console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s) ║');
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║');
 console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain     ║');
