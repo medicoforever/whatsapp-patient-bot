@@ -35,7 +35,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 const CONFIG = {
     // We now store an array of keys
     API_KEYS: getApiKeys(),
-    GEMINI_MODEL: 'gemini-2.0-flash-exp', // Updated to faster model if available, else stick to your preferred
+    GEMINI_MODEL: 'gemini-3-flash-preview', // Updated to faster model if available, else stick to your preferred
     MONGODB_URI: process.env.MONGODB_URI,
     
     // Group Routing Configuration
