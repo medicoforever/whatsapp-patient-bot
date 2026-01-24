@@ -127,6 +127,23 @@ When a user replies to a previously generated Clinical Profile, you should:
 IMPORTANT: Always identify whether the user is asking a question or providing additional information, and respond appropriately.`
 };
 
+// ==============================================================================
+// 🔄 API KEY ROTATION LOGIC (Every 2 Hours)
+// ==============================================================================
+function rotateApiKeys() {
+    if (CONFIG.API_KEYS.length > 1) {
+        // Remove first element and add to end (Shift Left / Rotate)
+        // 1,2,3,4 -> 2,3,4,1
+        const key = CONFIG.API_KEYS.shift();
+        CONFIG.API_KEYS.push(key);
+        log('🔄', `API Keys Rotated. New primary key starts with: ...${CONFIG.API_KEYS[0].slice(-4)}`);
+    }
+}
+
+// Start rotation interval (2 hours = 7200000 ms)
+setInterval(rotateApiKeys, 2 * 60 * 60 * 1000);
+// ==============================================================================
+
 function isAudioMime(mimeType) {
     if (!mimeType) return false;
     return CONFIG.SUPPORTED_AUDIO_MIMES.some(m => mimeType.toLowerCase().includes(m.split('/')[1])) ||
@@ -415,7 +432,61 @@ function getTotalBufferStats(chatId) {
 }
 
 // ==============================================================================
-// 🔄 UPDATED TIMEOUT LOGIC FOR AUTO-PROCESSING GROUPS
+// 🧠 HELPER: Smart Grouping by Caption
+// ==============================================================================
+function groupMediaSmartly(mediaFiles) {
+    const distinctCaptions = new Set();
+    mediaFiles.forEach(f => {
+        if (f.caption && f.caption.trim()) {
+            distinctCaptions.add(f.caption.trim());
+        }
+    });
+
+    // Case 1: Only 1 unique caption (or 0) across all files
+    // The user requirement: "if just one caption only found with many images, then that one caption is for all those images as separate one process"
+    if (distinctCaptions.size <= 1) {
+        return [mediaFiles]; // Return as single batch
+    }
+
+    // Case 2: Multiple distinct captions
+    // User requirement: "till the beginning of the different caption, those all images belong to that caption which is before that"
+    const batches = [];
+    let currentBatch = [];
+    let activeCaption = null;
+
+    for (const file of mediaFiles) {
+        const fileCaption = (file.caption || '').trim();
+
+        // If this file has a caption AND it is different from the current active one
+        // It signals the start of a new patient/context
+        if (fileCaption && fileCaption !== activeCaption) {
+            // Close previous batch if it exists
+            if (currentBatch.length > 0) {
+                batches.push(currentBatch);
+            }
+            // Start new batch
+            currentBatch = [file];
+            activeCaption = fileCaption;
+        } else {
+            // Append to current batch (same caption OR no caption inheriting previous)
+            currentBatch.push(file);
+            
+            // If this is the very first file and has a caption, set activeCaption
+            if (!activeCaption && fileCaption) {
+                activeCaption = fileCaption;
+            }
+        }
+    }
+
+    if (currentBatch.length > 0) {
+        batches.push(currentBatch);
+    }
+
+    return batches;
+}
+
+// ==============================================================================
+// 🔄 UPDATED TIMEOUT LOGIC (Includes Smart Batching)
 // ==============================================================================
 function resetUserTimeout(chatId, senderId, senderName) {
     if (!chatTimeouts.has(chatId)) {
@@ -449,8 +520,29 @@ function resetUserTimeout(chatId, senderId, senderName) {
                 const targetChatId = isCTSource ? CONFIG.GROUPS.CT_TARGET : CONFIG.GROUPS.MRI_TARGET;
                 
                 if (targetChatId) {
-                    // Process and send to Target
-                    await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null, 3, false, targetChatId);
+                    // 🧠 NEW: Smart Grouping Logic
+                    const batches = groupMediaSmartly(mediaFiles);
+                    
+                    if (batches.length > 1) {
+                         log('🔀', `Detected ${batches.length} distinct patient contexts. Processing separately.`);
+                    }
+
+                    // Process each batch sequentially
+                    for (let i = 0; i < batches.length; i++) {
+                        const batch = batches[i];
+                        if (batch.length === 0) continue;
+
+                        log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
+                        
+                        // Process and send to Target
+                        await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
+                        
+                        // Small delay between batches to ensure order and prevent rate limits
+                        if (i < batches.length - 1) {
+                            await new Promise(r => setTimeout(r, 2000));
+                        }
+                    }
+
                 } else {
                     log('⚠️', 'Target group not configured for this source!');
                 }
@@ -1237,10 +1329,29 @@ async function handleMessage(sock, msg) {
                     targetFps = parseInt(lastChar);
                 }
                 
-                log('🤖', `Processing ${mediaFiles.length} item(s) with FPS=${targetFps}. Mode: ${isSecondaryTrigger ? 'SECONDARY/CHAINED' : 'PRIMARY'}`);
+                // 🧠 NEW: Smart Grouping Logic for Manual Triggers too
+                const batches = groupMediaSmartly(mediaFiles);
                 
-                // Pass the isSecondaryMode flag (true if .. is used)
-                await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger);
+                if (batches.length > 1) {
+                    log('🔀', `Manual Trigger: Detected ${batches.length} distinct patient contexts.`);
+                }
+                
+                // Process each batch sequentially
+                for (let i = 0; i < batches.length; i++) {
+                    const batch = batches[i];
+                    if (batch.length === 0) continue;
+                    
+                    const modeLabel = isSecondaryTrigger ? 'SECONDARY/CHAINED' : 'PRIMARY';
+                    log('🤖', `Processing Batch ${i+1}/${batches.length} (${batch.length} items) with FPS=${targetFps}. Mode: ${modeLabel}`);
+                    
+                    // Pass the isSecondaryMode flag (true if .. is used)
+                    await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger);
+                    
+                    if (i < batches.length - 1) {
+                        await new Promise(r => setTimeout(r, 2000));
+                    }
+                }
+
             } else {
                 await sock.sendMessage(chatId, { 
                     text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
@@ -1899,12 +2010,13 @@ ${primaryResponseText}
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.9                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.0                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
 console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)  ║');
 console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s) ║');
+console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║');
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║');
 console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain     ║');
@@ -1912,7 +2024,7 @@ console.log('║                                                            ║'
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
 console.log('║  🗄️ MongoDB Persistent Sessions                           ║');
-console.log('║  🔑 Multi-Key Failover + Auto-Retry (5m) Active           ║');
+console.log('║  🔑 Multi-Key Rotation (2hrs) + Failover Active           ║');
 console.log('╚════════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Starting...');
