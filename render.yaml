@@ -11,12 +11,12 @@ services:
         sync: false
       - key: NODE_VERSION
         value: 20.10.0
-      # Add these new variables
-      - key: CT_GROUP_SOURCE
+      # Add these 4 specific Group IDs (Get them from bot logs)
+      - key: GROUP_CT_SOURCE
         sync: false
-      - key: CT_GROUP_DEST
+      - key: GROUP_CT_TARGET
         sync: false
-      - key: MRI_GROUP_SOURCE
+      - key: GROUP_MRI_SOURCE
         sync: false
-      - key: MRI_GROUP_DEST
+      - key: GROUP_MRI_TARGET
         sync: false
