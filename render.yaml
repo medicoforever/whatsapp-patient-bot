@@ -11,3 +11,12 @@ services:
         sync: false
       - key: NODE_VERSION
         value: 20.10.0
+      # Add these new variables
+      - key: CT_GROUP_SOURCE
+        sync: false
+      - key: CT_GROUP_DEST
+        sync: false
+      - key: MRI_GROUP_SOURCE
+        sync: false
+      - key: MRI_GROUP_DEST
+        sync: false
