@@ -35,13 +35,22 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 const CONFIG = {
     // We now store an array of keys
     API_KEYS: getApiKeys(),
-    GEMINI_MODEL: 'gemini-3-flash-preview', 
+    GEMINI_MODEL: 'gemini-2.0-flash-exp', // Updated to faster model if available, else stick to your preferred
     MONGODB_URI: process.env.MONGODB_URI,
-    // REMOVED ALLOWED_GROUP_ID constraint. Bot is now public.
-    MEDIA_TIMEOUT_MS: 300000,
+    
+    // Group Routing Configuration
+    GROUPS: {
+        CT_SOURCE: process.env.GROUP_CT_SOURCE,
+        CT_TARGET: process.env.GROUP_CT_TARGET,
+        MRI_SOURCE: process.env.GROUP_MRI_SOURCE,
+        MRI_TARGET: process.env.GROUP_MRI_TARGET
+    },
+
+    MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
+    AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
+    
     CONTEXT_RETENTION_MS: 1800000,
     MAX_STORED_CONTEXTS: 20,
-    // Trigger text is now dynamic (handled in code), but base commands remain
     COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
     TYPING_DELAY_MIN: 3000,
     TYPING_DELAY_MAX: 6000,
@@ -404,6 +413,9 @@ function getTotalBufferStats(chatId) {
     return stats;
 }
 
+// ==============================================================================
+// 🔄 UPDATED TIMEOUT LOGIC FOR AUTO-PROCESSING GROUPS
+// ==============================================================================
 function resetUserTimeout(chatId, senderId, senderName) {
     if (!chatTimeouts.has(chatId)) {
         chatTimeouts.set(chatId, new Map());
@@ -414,14 +426,46 @@ function resetUserTimeout(chatId, senderId, senderName) {
         clearTimeout(chatTimeoutMap.get(senderId));
     }
     
+    // Check if this chat is one of the Auto-Process Source Groups
+    const isCTSource = chatId === CONFIG.GROUPS.CT_SOURCE;
+    const isMRISource = chatId === CONFIG.GROUPS.MRI_SOURCE;
+    const isAutoGroup = isCTSource || isMRISource;
+
+    // Use 60 seconds for auto groups, 5 minutes for others
+    const delay = isAutoGroup ? CONFIG.AUTO_PROCESS_DELAY_MS : CONFIG.MEDIA_TIMEOUT_MS;
+    
     const shortId = getShortSenderId(senderId);
-    chatTimeoutMap.set(senderId, setTimeout(() => {
-        const clearedItems = clearUserBuffer(chatId, senderId);
-        if (clearedItems.length > 0) {
-            log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
+
+    const timeoutCallback = async () => {
+        if (isAutoGroup) {
+            // --- AUTO PROCESSING LOGIC ---
+            // If it's a source group, we process automatically and send to target
+            const mediaFiles = clearUserBuffer(chatId, senderId);
+            if (mediaFiles.length > 0) {
+                log('⏱️', `Auto-processing ${mediaFiles.length} item(s) from Source Group (${isCTSource ? 'CT' : 'MRI'})`);
+                
+                // Determine Target Chat ID
+                const targetChatId = isCTSource ? CONFIG.GROUPS.CT_TARGET : CONFIG.GROUPS.MRI_TARGET;
+                
+                if (targetChatId) {
+                    // Process and send to Target
+                    await processMedia(sock, chatId, mediaFiles, false, null, senderId, senderName, null, 3, false, targetChatId);
+                } else {
+                    log('⚠️', 'Target group not configured for this source!');
+                }
+            }
+        } else {
+            // --- STANDARD BEHAVIOR ---
+            // Just clear buffer after long inactivity
+            const clearedItems = clearUserBuffer(chatId, senderId);
+            if (clearedItems.length > 0) {
+                log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
+            }
         }
         chatTimeoutMap.delete(senderId);
-    }, CONFIG.MEDIA_TIMEOUT_MS));
+    };
+
+    chatTimeoutMap.set(senderId, setTimeout(timeoutCallback, delay));
 }
 
 function clearUserTimeout(chatId, senderId) {
@@ -512,12 +556,6 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
         fs.writeFileSync(inputPath, videoBuffer);
 
         // INTELLIGENT FILTER LOGIC:
-        // We use the 'thumbnail' filter. It picks the most representative frame (highest variance/sharpness)
-        // from a batch of frames.
-        // batchSize = 3 (we compare 3 frames and pick 1).
-        // inputFps = targetFps * 3. 
-        // Example for Default (.): Target 3fps. We grab 9fps, group by 3, pick best of 3 => Result 3fps sharpest.
-        
         const batchSize = 3;
         const inputFps = targetFps * batchSize;
 
@@ -692,6 +730,7 @@ app.get('/', (req, res) => {
                 <h3>✨ Features:</h3>
                 <p>
                 <strong>🌍 Public Access:</strong> Works in any chat/group.<br>
+                <strong>🔄 Auto-Groups:</strong> Monitored CT/MRI groups active.<br>
                 <strong>🎥 Smart Video:</strong><br>
                 - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
                 - Send <strong>.2</strong> for Smart 2 FPS<br>
@@ -920,6 +959,8 @@ async function startBot() {
                 }
                 
                 log('🌍', 'Universal Mode: Bot is active for ALL chats.');
+                if (CONFIG.GROUPS.CT_SOURCE) log('🏥', 'Monitoring CT Source Group');
+                if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
             }
         });
 
@@ -1480,9 +1521,11 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 }
 
 
-// Updated processMedia with isSecondaryMode argument
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false) {
+// 🔄 UPDATED processMedia to support Target Chat routing and Caption Headers
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null) {
     const shortId = getShortSenderId(senderId);
+    // If targetChatId is provided, we send the result there. Otherwise, back to original chatId.
+    const destinationChatId = targetChatId || chatId;
     
     try {
         const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, followUps: 0 };
@@ -1492,7 +1535,6 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
         const followUpTexts = [];
         
         // === VIDEO PRE-PROCESSING START ===
-        // We iterate through media files and if we find a video, we extract frames.
         const processedMedia = [];
         
         for (const m of mediaFiles) {
@@ -1693,7 +1735,7 @@ ${allOriginalText.join('\n\n')}
         
         // If Secondary Mode is active, we need to send the primary response first, then continue
         if (isSecondaryMode && !isFollowUp) {
-            await sock.sendMessage(chatId, { 
+            await sock.sendMessage(destinationChatId, { 
                 text: `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`,
                 mentions: [senderId]
             });
@@ -1726,32 +1768,32 @@ ${primaryResponseText}
             console.log(finalSecondaryText);
             console.log('═'.repeat(60) + '\n');
             
-            await sock.sendPresenceUpdate('composing', chatId);
+            await sock.sendPresenceUpdate('composing', destinationChatId);
             await new Promise(resolve => setTimeout(resolve, 2000));
-            await sock.sendPresenceUpdate('paused', chatId);
+            await sock.sendPresenceUpdate('paused', destinationChatId);
             
-            const sentMessage = await sock.sendMessage(chatId, { 
+            const sentMessage = await sock.sendMessage(destinationChatId, { 
                 text: finalSecondaryText,
                 mentions: [senderId]
             });
             
             if (sentMessage?.key?.id) {
                 const messageId = sentMessage.key.id;
-                trackBotMessage(chatId, messageId);
+                trackBotMessage(destinationChatId, messageId);
                 // Store the SECONDARY response as the context context for follow-ups
-                storeContext(chatId, messageId, mediaFiles, secondaryResponseText, senderId);
+                // Note: We store context in destination chat so reply works there
+                storeContext(destinationChatId, messageId, mediaFiles, secondaryResponseText, senderId);
                 log('💾', `Secondary Context stored for ...${shortId}`);
             }
-            log('📤', `Sent Secondary (Step 2) to ...${shortId}!`);
+            log('📤', `Sent Secondary (Step 2) to target!`);
             return; // Exit here as we handled sending manually for secondary mode
         }
 
         // --- NORMAL PRIMARY MODE or FOLLOW-UP HANDLING ---
-        // If we aren't in Secondary Mode (or it's a follow up), just handle normally
         
         if (!primaryResponseText || primaryResponseText.trim() === '') {
             log('⚠️', `Empty response from AI for ...${shortId}`);
-            await sock.sendMessage(chatId, { 
+            await sock.sendMessage(destinationChatId, { 
                 text: `⚠️ @${senderId.split('@')[0]}, I received an empty response. Please try again.`,
                 mentions: [senderId]
             });
@@ -1770,38 +1812,45 @@ ${primaryResponseText}
         console.log(primaryResponseText);
         console.log('═'.repeat(60) + '\n');
         
-        await sock.sendPresenceUpdate('composing', chatId);
+        await sock.sendPresenceUpdate('composing', destinationChatId);
         const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
         await new Promise(resolve => setTimeout(resolve, delay));
-        await sock.sendPresenceUpdate('paused', chatId);
+        await sock.sendPresenceUpdate('paused', destinationChatId);
         
-        let sentMessage;
-        const finalResponseText = primaryResponseText.length <= 3800 
+        let finalResponseText = primaryResponseText.length <= 3800 
             ? primaryResponseText 
             : primaryResponseText.substring(0, 3800) + '\n\n_(truncated)_';
         
-        sentMessage = await sock.sendMessage(chatId, { 
+        // 🟢 FEATURE ADDITION: Put captions at the top if auto-forwarding to a target group
+        if (targetChatId && allOriginalText.length > 0) {
+            const captionHeader = allOriginalText.map(t => t.replace(/^\[.*?\]:\s*/, '')).join('\n');
+            if (captionHeader.trim().length > 0) {
+                finalResponseText = `${captionHeader}\n\n${finalResponseText}`;
+            }
+        }
+
+        const sentMessage = await sock.sendMessage(destinationChatId, { 
             text: finalResponseText,
             mentions: [senderId]
         });
         
         if (sentMessage?.key?.id) {
             const messageId = sentMessage.key.id;
-            trackBotMessage(chatId, messageId);
-            storeContext(chatId, messageId, mediaFiles, primaryResponseText, senderId);
+            trackBotMessage(destinationChatId, messageId);
+            storeContext(destinationChatId, messageId, mediaFiles, primaryResponseText, senderId);
             log('💾', `Context stored for ...${shortId}`);
         }
         
-        log('📤', `Sent to ...${shortId}!`);
+        log('📤', `Sent to target/chat!`);
         
     } catch (error) {
         log('❌', `Error for ...${shortId}: ${error.message}`);
         console.error(error);
         
-        await sock.sendPresenceUpdate('composing', chatId);
+        await sock.sendPresenceUpdate('composing', destinationChatId);
         await new Promise(r => setTimeout(r, 1500));
         
-        await sock.sendMessage(chatId, { 
+        await sock.sendMessage(destinationChatId, { 
             text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
             mentions: [senderId]
         });
@@ -1809,11 +1858,12 @@ ${primaryResponseText}
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v2.6                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v2.7                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
 console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)  ║');
+console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s) ║');
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║');
 console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain     ║');
