@@ -1086,6 +1086,16 @@ async function startBot() {
     }
 }
 
+// 🟢 FIX: Helper to unwrap nested messages (ViewOnce, Ephemeral, etc.)
+const unwrapMessage = (m) => {
+    if (!m) return null;
+    if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
+    if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
+    if (m.ephemeralMessage?.message) return unwrapMessage(m.ephemeralMessage.message);
+    if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
+    return m;
+};
+
 async function handleMessage(sock, msg) {
     const chatId = msg.key.remoteJid;
     
@@ -1101,23 +1111,30 @@ async function handleMessage(sock, msg) {
          log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
     }
 
-    // No isAllowedGroup check here -> Public Bot
-    
-    const messageType = Object.keys(msg.message)[0];
+    // 🟢 FIX: Unwrap the message content to handle ViewOnce/Ephemeral messages
+    const content = unwrapMessage(msg.message);
+
+    if (!content) {
+        // If content is null after unwrapping, we can't process it.
+        return; 
+    }
+
+    const messageType = Object.keys(content)[0];
     
     let quotedMessageId = null;
     let contextInfo = null;
     
+    // Use 'content' instead of 'msg.message' for type detection
     if (messageType === 'extendedTextMessage') {
-        contextInfo = msg.message.extendedTextMessage?.contextInfo;
+        contextInfo = content.extendedTextMessage?.contextInfo;
     } else if (messageType === 'imageMessage') {
-        contextInfo = msg.message.imageMessage?.contextInfo;
+        contextInfo = content.imageMessage?.contextInfo;
     } else if (messageType === 'documentMessage') {
-        contextInfo = msg.message.documentMessage?.contextInfo;
+        contextInfo = content.documentMessage?.contextInfo;
     } else if (messageType === 'audioMessage') {
-        contextInfo = msg.message.audioMessage?.contextInfo;
+        contextInfo = content.audioMessage?.contextInfo;
     } else if (messageType === 'videoMessage') {
-        contextInfo = msg.message.videoMessage?.contextInfo;
+        contextInfo = content.videoMessage?.contextInfo;
     }
     
     if (contextInfo?.stanzaId) {
@@ -1125,7 +1142,7 @@ async function handleMessage(sock, msg) {
         
         if (isBotMessage(chatId, quotedMessageId)) {
             log('↩️', `Reply to bot from ${senderName} (...${shortId})`);
-            await handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType);
+            await handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType, content);
             return;
         }
     }
@@ -1135,12 +1152,12 @@ async function handleMessage(sock, msg) {
         
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.imageMessage.caption || '';
+            const caption = content.imageMessage.caption || '';
             
             const count = addToUserBuffer(chatId, senderId, {
                 type: 'image',
                 data: buffer.toString('base64'),
-                mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
+                mimeType: content.imageMessage.mimetype || 'image/jpeg',
                 caption: caption,
                 timestamp: Date.now()
             });
@@ -1161,15 +1178,15 @@ async function handleMessage(sock, msg) {
         
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.videoMessage.caption || '';
-            const mimeType = msg.message.videoMessage.mimetype || 'video/mp4';
+            const caption = content.videoMessage.caption || '';
+            const mimeType = content.videoMessage.mimetype || 'video/mp4';
             
             const count = addToUserBuffer(chatId, senderId, {
                 type: 'video',
                 data: buffer.toString('base64'),
                 mimeType: mimeType,
                 caption: caption,
-                duration: msg.message.videoMessage.seconds || 0,
+                duration: content.videoMessage.seconds || 0,
                 timestamp: Date.now()
             });
             
@@ -1185,7 +1202,7 @@ async function handleMessage(sock, msg) {
         }
     }
     else if (messageType === 'audioMessage') {
-        const isVoice = msg.message.audioMessage.ptt === true;
+        const isVoice = content.audioMessage.ptt === true;
         const emoji = isVoice ? '🎤' : '🎵';
         
         log(emoji, `${isVoice ? 'Voice' : 'Audio'} from ${senderName} (...${shortId})`);
@@ -1196,8 +1213,8 @@ async function handleMessage(sock, msg) {
             const count = addToUserBuffer(chatId, senderId, {
                 type: isVoice ? 'voice' : 'audio',
                 data: buffer.toString('base64'),
-                mimeType: msg.message.audioMessage.mimetype || 'audio/ogg',
-                duration: msg.message.audioMessage.seconds || 0,
+                mimeType: content.audioMessage.mimetype || 'audio/ogg',
+                duration: content.audioMessage.seconds || 0,
                 timestamp: Date.now()
             });
             
@@ -1209,9 +1226,9 @@ async function handleMessage(sock, msg) {
         }
     }
     else if (messageType === 'documentMessage') {
-        const docMime = msg.message.documentMessage.mimetype || '';
-        const fileName = msg.message.documentMessage.fileName || 'document';
-        const caption = msg.message.documentMessage.caption || '';
+        const docMime = content.documentMessage.mimetype || '';
+        const fileName = content.documentMessage.fileName || 'document';
+        const caption = content.documentMessage.caption || '';
         
         const fileType = getFileType(docMime, fileName);
         
@@ -1298,7 +1315,7 @@ async function handleMessage(sock, msg) {
         }
     }
     else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
-        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
+        const text = (content.conversation || content.extendedTextMessage?.text || '').trim();
         
         if (!text) return;
 
@@ -1414,7 +1431,7 @@ async function handleMessage(sock, msg) {
     }
 }
 
-async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType) {
+async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType, content) {
     const storedContext = getStoredContext(chatId, quotedMessageId);
     const shortId = getShortSenderId(senderId);
     
@@ -1432,7 +1449,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     
     // Handle both conversation and extendedTextMessage for text replies
     if (messageType === 'conversation') {
-        const text = msg.message.conversation || '';
+        const text = content.conversation || '';
         if (text.trim()) {
             userTextInput = text.trim();
             newContent.push({
@@ -1446,7 +1463,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
         }
     }
     else if (messageType === 'extendedTextMessage') {
-        const text = msg.message.extendedTextMessage?.text || '';
+        const text = content.extendedTextMessage?.text || '';
         if (text.trim()) {
             userTextInput = text.trim();
             newContent.push({
@@ -1462,12 +1479,12 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     else if (messageType === 'imageMessage') {
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.imageMessage.caption || '';
+            const caption = content.imageMessage.caption || '';
             
             newContent.push({
                 type: 'image',
                 data: buffer.toString('base64'),
-                mimeType: msg.message.imageMessage.mimetype || 'image/jpeg',
+                mimeType: content.imageMessage.mimetype || 'image/jpeg',
                 caption: caption,
                 timestamp: Date.now(),
                 isFollowUp: true
@@ -1481,14 +1498,14 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     else if (messageType === 'videoMessage') {
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const caption = msg.message.videoMessage.caption || '';
+            const caption = content.videoMessage.caption || '';
             
             newContent.push({
                 type: 'video',
                 data: buffer.toString('base64'),
-                mimeType: msg.message.videoMessage.mimetype || 'video/mp4',
+                mimeType: content.videoMessage.mimetype || 'video/mp4',
                 caption: caption,
-                duration: msg.message.videoMessage.seconds || 0,
+                duration: content.videoMessage.seconds || 0,
                 timestamp: Date.now(),
                 isFollowUp: true
             });
@@ -1501,13 +1518,13 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     else if (messageType === 'audioMessage') {
         try {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            const isVoice = msg.message.audioMessage.ptt === true;
+            const isVoice = content.audioMessage.ptt === true;
             
             newContent.push({
                 type: isVoice ? 'voice' : 'audio',
                 data: buffer.toString('base64'),
-                mimeType: msg.message.audioMessage.mimetype || 'audio/ogg',
-                duration: msg.message.audioMessage.seconds || 0,
+                mimeType: content.audioMessage.mimetype || 'audio/ogg',
+                duration: content.audioMessage.seconds || 0,
                 timestamp: Date.now(),
                 isFollowUp: true
             });
@@ -1517,9 +1534,9 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
         }
     }
     else if (messageType === 'documentMessage') {
-        const docMime = msg.message.documentMessage.mimetype || '';
-        const fileName = msg.message.documentMessage.fileName || 'document';
-        const caption = msg.message.documentMessage.caption || '';
+        const docMime = content.documentMessage.mimetype || '';
+        const fileName = content.documentMessage.fileName || 'document';
+        const caption = content.documentMessage.caption || '';
         
         const fileType = getFileType(docMime, fileName);
         
