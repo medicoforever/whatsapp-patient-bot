@@ -9,6 +9,7 @@ import mongoose from 'mongoose';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import os from 'os';
+import crypto from 'crypto';
 
 // Setup FFmpeg path automatically for Render
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -66,6 +67,8 @@ const CONFIG = {
         'video/quicktime', 'video/x-matroska', 'video/mkv', 'video/3gpp', 'video/3gp'
     ],
     SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
+    // 🔗 Media Viewer URL expiry: 12 hours
+    MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
     SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -126,6 +129,66 @@ When a user replies to a previously generated Clinical Profile, you should:
 
 IMPORTANT: Always identify whether the user is asking a question or providing additional information, and respond appropriately.`
 };
+
+// ==============================================================================
+// 🔗 MEDIA VIEWER STORE (In-Memory with 12hr Expiry)
+// ==============================================================================
+const mediaViewerStore = new Map();
+
+function storeMediaForViewer(mediaFiles) {
+    const viewerId = crypto.randomBytes(16).toString('hex');
+    const expiresAt = Date.now() + CONFIG.MEDIA_VIEWER_EXPIRY_MS;
+    
+    // Store only viewable media (images, pdfs, audio, video) with their base64 data
+    const viewableMedia = [];
+    for (const m of mediaFiles) {
+        if (m.type === 'image' || m.type === 'pdf' || m.type === 'audio' || m.type === 'voice' || m.type === 'video') {
+            viewableMedia.push({
+                type: m.type,
+                data: m.data,
+                mimeType: m.mimeType,
+                caption: m.caption || '',
+                fileName: m.fileName || ''
+            });
+        }
+    }
+    
+    if (viewableMedia.length === 0) return null;
+    
+    mediaViewerStore.set(viewerId, {
+        media: viewableMedia,
+        expiresAt: expiresAt,
+        createdAt: Date.now()
+    });
+    
+    log('🔗', `Media viewer created: ${viewerId} (${viewableMedia.length} files, expires in 12h)`);
+    
+    // Schedule cleanup
+    setTimeout(() => {
+        if (mediaViewerStore.has(viewerId)) {
+            mediaViewerStore.delete(viewerId);
+            log('🧹', `Media viewer expired and cleaned: ${viewerId}`);
+        }
+    }, CONFIG.MEDIA_VIEWER_EXPIRY_MS);
+    
+    return viewerId;
+}
+
+// Periodic cleanup of expired entries (every 1 hour)
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [id, entry] of mediaViewerStore) {
+        if (now >= entry.expiresAt) {
+            mediaViewerStore.delete(id);
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        log('🧹', `Periodic cleanup: removed ${cleaned} expired media viewer(s)`);
+    }
+}, 60 * 60 * 1000);
+// ==============================================================================
 
 // ==============================================================================
 // 🔄 API KEY ROTATION LOGIC (Every 2 Hours)
@@ -694,6 +757,268 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ==============================================================================
+// 🔗 MEDIA VIEWER ROUTE - Serves source media for a given viewer ID
+// ==============================================================================
+app.get('/view/:viewerId', (req, res) => {
+    const { viewerId } = req.params;
+    const entry = mediaViewerStore.get(viewerId);
+    
+    if (!entry) {
+        return res.status(404).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Link Expired</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+                .container { text-align: center; padding: 40px; }
+                .icon { font-size: 64px; margin-bottom: 20px; }
+                h1 { color: #e94560; }
+                p { color: #aaa; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="icon">⏰</div>
+                <h1>Link Expired or Invalid</h1>
+                <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
+            </div>
+        </body>
+        </html>`);
+    }
+    
+    if (Date.now() >= entry.expiresAt) {
+        mediaViewerStore.delete(viewerId);
+        return res.status(410).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Link Expired</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+                .container { text-align: center; padding: 40px; }
+                .icon { font-size: 64px; margin-bottom: 20px; }
+                h1 { color: #e94560; }
+                p { color: #aaa; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="icon">⏰</div>
+                <h1>Link Expired</h1>
+                <p>This media viewer link has expired (12 hour limit).</p>
+            </div>
+        </body>
+        </html>`);
+    }
+    
+    const media = entry.media;
+    const remainingMs = entry.expiresAt - Date.now();
+    const remainingHours = Math.floor(remainingMs / 3600000);
+    const remainingMins = Math.floor((remainingMs % 3600000) / 60000);
+    
+    let mediaHtml = '';
+    media.forEach((m, index) => {
+        const caption = m.caption ? `<div class="caption">${m.caption.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+        const fileName = m.fileName ? `<div class="filename">${m.fileName.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+        
+        if (m.type === 'image') {
+            mediaHtml += `
+            <div class="media-item">
+                <div class="media-index">#${index + 1} — Image</div>
+                ${caption}${fileName}
+                <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+            </div>`;
+        } else if (m.type === 'pdf') {
+            mediaHtml += `
+            <div class="media-item">
+                <div class="media-index">#${index + 1} — PDF</div>
+                ${caption}${fileName}
+                <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
+                <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+            </div>`;
+        } else if (m.type === 'audio' || m.type === 'voice') {
+            mediaHtml += `
+            <div class="media-item">
+                <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
+                ${caption}${fileName}
+                <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+            </div>`;
+        } else if (m.type === 'video') {
+            mediaHtml += `
+            <div class="media-item">
+                <div class="media-index">#${index + 1} — Video</div>
+                ${caption}${fileName}
+                <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+            </div>`;
+        }
+    });
+    
+    res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Source Media Viewer</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #0f0f1a;
+                color: #e0e0e0;
+                padding: 10px;
+            }
+            .header {
+                text-align: center;
+                padding: 20px 10px;
+                background: linear-gradient(135deg, #1a1a2e, #16213e);
+                border-radius: 12px;
+                margin-bottom: 15px;
+                border: 1px solid #333;
+            }
+            .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
+            .header .meta { font-size: 12px; color: #888; }
+            .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
+            .media-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 12px;
+            }
+            .media-item {
+                background: #1a1a2e;
+                border-radius: 10px;
+                overflow: hidden;
+                border: 1px solid #2a2a4a;
+                transition: transform 0.2s;
+            }
+            .media-item:hover { transform: scale(1.01); border-color: #25D366; }
+            .media-item img {
+                width: 100%;
+                display: block;
+                cursor: pointer;
+                transition: opacity 0.2s;
+            }
+            .media-item img:hover { opacity: 0.9; }
+            .media-index {
+                padding: 8px 12px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #25D366;
+                background: #0f0f1a;
+                border-bottom: 1px solid #2a2a4a;
+            }
+            .caption {
+                padding: 6px 12px;
+                font-size: 12px;
+                color: #ccc;
+                background: #16213e;
+                font-style: italic;
+            }
+            .filename {
+                padding: 4px 12px;
+                font-size: 11px;
+                color: #888;
+            }
+            .pdf-frame {
+                width: 100%;
+                height: 500px;
+                border: none;
+            }
+            .download-btn {
+                display: block;
+                text-align: center;
+                padding: 10px;
+                background: #25D366;
+                color: #000;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            .download-btn:hover { background: #1da851; }
+            
+            /* Fullscreen overlay */
+            .fullscreen-overlay {
+                display: none;
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                background: rgba(0,0,0,0.95);
+                z-index: 9999;
+                justify-content: center;
+                align-items: center;
+                cursor: zoom-out;
+            }
+            .fullscreen-overlay.active { display: flex; }
+            .fullscreen-overlay img {
+                max-width: 95vw;
+                max-height: 95vh;
+                object-fit: contain;
+            }
+            
+            @media (max-width: 600px) {
+                .media-grid { grid-template-columns: 1fr; }
+                body { padding: 5px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🔍 Source Media Viewer</h1>
+            <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
+            <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
+        </div>
+        
+        <div class="media-grid">
+            ${mediaHtml}
+        </div>
+        
+        <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
+            <img id="fsImage" src="" alt="Fullscreen">
+        </div>
+        
+        <script>
+            function openFullscreen(img) {
+                const overlay = document.getElementById('fsOverlay');
+                const fsImg = document.getElementById('fsImage');
+                fsImg.src = img.src;
+                overlay.classList.add('active');
+            }
+            function closeFullscreen() {
+                document.getElementById('fsOverlay').classList.remove('active');
+            }
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeFullscreen();
+            });
+        </script>
+    </body>
+    </html>`);
+});
+
+// Individual media file endpoint for memory efficiency (optional direct access)
+app.get('/media/:viewerId/:index', (req, res) => {
+    const { viewerId, index } = req.params;
+    const idx = parseInt(index);
+    const entry = mediaViewerStore.get(viewerId);
+    
+    if (!entry || Date.now() >= entry.expiresAt) {
+        return res.status(404).send('Not found or expired');
+    }
+    
+    if (isNaN(idx) || idx < 0 || idx >= entry.media.length) {
+        return res.status(404).send('Invalid index');
+    }
+    
+    const m = entry.media[idx];
+    const buffer = Buffer.from(m.data, 'base64');
+    res.setHeader('Content-Type', m.mimeType);
+    res.setHeader('Content-Length', buffer.length);
+    res.send(buffer);
+});
+// ==============================================================================
+
 app.get('/', (req, res) => {
     // Just grab stats from first available chat buffer for demo, or sum all
     let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
@@ -818,6 +1143,7 @@ app.get('/', (req, res) => {
                 <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
                 <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
                 <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
+                <div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div>
             </div>
             <div class="info-box">
                 <h3>✨ Features:</h3>
@@ -830,6 +1156,7 @@ app.get('/', (req, res) => {
                 - Send <strong>.1</strong> for Smart 1 FPS<br>
                 <strong>🧠 Secondary Analysis:</strong><br>
                 - Send <strong>..</strong> (double dot) for Chained Analysis<br>
+                <strong>🔗 Source Viewer:</strong> Each response includes a link to view source media (12h expiry)<br>
                 <strong>↩️ Reply:</strong> Reply to bot to ask questions.
                 </p>
             </div>
@@ -862,6 +1189,7 @@ app.get('/health', (req, res) => {
         mode: 'universal',
         processedCount,
         activeKeys: CONFIG.API_KEYS.length,
+        activeViewers: mediaViewerStore.size,
         timestamp: new Date().toISOString()
     });
 });
@@ -869,6 +1197,19 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
     log('🌐', `Web server running on port ${PORT}`);
 });
+
+// ==============================================================================
+// 🔗 HELPER: Get the base URL for viewer links
+// ==============================================================================
+function getBaseUrl() {
+    // Use RENDER_EXTERNAL_URL if on Render, otherwise fallback
+    if (process.env.RENDER_EXTERNAL_URL) {
+        return process.env.RENDER_EXTERNAL_URL;
+    }
+    // Fallback for local dev
+    return `http://localhost:${PORT}`;
+}
+// ==============================================================================
 
 async function loadBaileys() {
     botStatus = 'Loading WhatsApp library...';
@@ -1378,7 +1719,7 @@ async function handleMessage(sock, msg) {
         }
         else if (text.toLowerCase() === 'help' || text === '?') {
             await sock.sendMessage(chatId, { 
-                text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.*  - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!` 
+                text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.*  - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)` 
             });
         }
         else if (text.toLowerCase() === 'clear') {
@@ -1412,7 +1753,7 @@ async function handleMessage(sock, msg) {
             const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
             
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available` 
+                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}` 
             });
         }
         else {
@@ -1880,14 +2221,27 @@ ${allOriginalText.join('\n\n')}
             requestContent = [promptText];
         }
         
+        // ==============================================================================
+        // 🔗 STORE SOURCE MEDIA FOR VIEWER (before processing, using ORIGINAL mediaFiles)
+        // ==============================================================================
+        const viewerId = storeMediaForViewer(mediaFiles);
+        const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
+        // ==============================================================================
+        
         // --- STEP 1: Generate Primary Clinical Profile ---
         log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
         const primaryResponseText = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
         
         // If Secondary Mode is active, we need to send the primary response first, then continue
         if (isSecondaryMode && !isFollowUp) {
+            // 🔗 Append viewer URL to Step 1
+            let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
+            if (viewerUrl) {
+                step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+            }
+            
             await sock.sendMessage(destinationChatId, { 
-                text: `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`,
+                text: step1Text,
                 mentions: [senderId]
             });
             log('📤', `Sent Primary (Step 1) to ...${shortId}`);
@@ -1906,7 +2260,10 @@ ${primaryResponseText}
             
             // The final response we want to store and send is the Secondary one (or a combo)
             // We'll treat the Secondary response as the "Result" for context purposes.
-            const finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
+            let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
+            if (viewerUrl) {
+                finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+            }
             
             // Update responseText variable for the final send block below
             processedCount++;
@@ -1976,6 +2333,11 @@ ${primaryResponseText}
             }
         }
 
+        // 🔗 Append viewer URL to response
+        if (viewerUrl) {
+            finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+        }
+
         const sentMessage = await sock.sendMessage(destinationChatId, { 
             text: finalResponseText,
             mentions: [senderId]
@@ -2037,6 +2399,7 @@ console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║');
 console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain     ║');
+console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link     ║');
 console.log('║                                                            ║');
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
