@@ -194,6 +194,7 @@ setInterval(() => {
 // ==============================================================================
 let decryptFailTimestamps = [];
 let isHealingInProgress = false;
+let startupHealDone = false;
 
 function trackDecryptionFailure() {
     const now = Date.now();
@@ -209,7 +210,26 @@ function trackDecryptionFailure() {
     }
 }
 
-async function triggerSessionHeal() {
+// CHANGE 1: New nukeSessionKeysFromMongo function
+async function nukeSessionKeysFromMongo() {
+    if (!mongoConnected || !SessionModel) {
+        log('⚠️', '  MongoDB not available for key cleanup');
+        return 0;
+    }
+    try {
+        const result = await SessionModel.deleteMany({
+            key: { $regex: /^key_/ }
+        });
+        log('🗑️', `  Nuked ${result.deletedCount} signal session keys from MongoDB`);
+        return result.deletedCount;
+    } catch (error) {
+        log('❌', `  Failed to nuke keys: ${error.message}`);
+        return 0;
+    }
+}
+
+// CHANGE 1 (continued): Updated triggerSessionHeal to use nukeSessionKeysFromMongo
+async function triggerSessionHeal(reason = 'threshold') {
     if (isHealingInProgress) return;
     isHealingInProgress = true;
     
@@ -218,74 +238,29 @@ async function triggerSessionHeal() {
     log('🔧', '══════════════════════════════════════');
     
     try {
-        // Step 1: Clear ONLY signal session keys from MongoDB (NOT auth_creds)
-        // Signal session keys are stored with prefix "key_" 
-        // We specifically target sender-key, session, pre-key, app-state etc.
-        if (mongoConnected && SessionModel) {
-            const keysToClean = [
-                'key_pre-key_',
-                'key_session_',
-                'key_sender-key_',
-                'key_sender-key-memory_',
-                'key_app-state-sync-key_',
-                'key_app-state-sync-version_',
-            ];
-            
-            let totalDeleted = 0;
-            for (const prefix of keysToClean) {
-                const result = await SessionModel.deleteMany({
-                    key: { $regex: `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` }
-                });
-                if (result.deletedCount > 0) {
-                    log('🗑️', `  Cleared ${result.deletedCount} entries matching "${prefix}*"`);
-                    totalDeleted += result.deletedCount;
-                }
-            }
-            
-            log('🔧', `  Total signal keys cleared: ${totalDeleted}`);
-            log('🔧', '  Auth credentials (login) preserved ✅');
-        } else {
-            log('⚠️', '  MongoDB not available - cannot clear session keys');
-            // If using file auth, clear the session directory keys
-            const authPath = join(__dirname, 'auth_session');
-            if (fs.existsSync(authPath)) {
-                const files = fs.readdirSync(authPath);
-                let cleared = 0;
-                for (const file of files) {
-                    // Keep creds.json, delete everything else (session keys)
-                    if (file !== 'creds.json') {
-                        fs.unlinkSync(join(authPath, file));
-                        cleared++;
-                    }
-                }
-                log('🗑️', `  Cleared ${cleared} session key files (kept creds.json)`);
-            }
-        }
-        
-        // Step 2: Reset failure counter
+        const deleted = await nukeSessionKeysFromMongo();
         decryptFailTimestamps = [];
         
-        // Step 3: Force reconnection to re-negotiate sessions
-        log('🔄', '  Forcing reconnection to re-negotiate encryption...');
+        if (deleted > 0) {
+            log('🔧', `  Cleared ${deleted} corrupted keys. Auth creds preserved ✅`);
+        }
         
         if (sock) {
+            log('🔄', '  Forcing reconnection...');
             try {
-                sock.end(new Error('Auto-heal: forcing reconnection'));
+                sock.end(new Error(`Session heal: ${reason}`));
             } catch (e) {
-                log('⚠️', `  Socket close error (harmless): ${e.message}`);
+                log('⚠️', `  Socket close (harmless): ${e.message}`);
             }
         }
         
-        // The connection.update handler will auto-reconnect
-        // Give a small delay before allowing another heal
         setTimeout(() => {
             isHealingInProgress = false;
-            log('🔧', '  Auto-heal cooldown complete. Monitoring resumed.');
-        }, 30000); // 30 second cooldown
+            log('🔧', '  Heal cooldown complete.');
+        }, 30000);
         
     } catch (error) {
-        log('❌', `  Auto-heal error: ${error.message}`);
-        console.error(error);
+        log('❌', `  Heal error: ${error.message}`);
         isHealingInProgress = false;
     }
 }
@@ -1363,6 +1338,19 @@ async function startBot() {
             await connectMongoDB();
         }
         
+        // CHANGE 2: ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
+        if (!startupHealDone && mongoConnected) {
+            if (!SessionModel) {
+                SessionModel = mongoose.model('Session', sessionSchema);
+            }
+            log('🔧', '╔══════════════════════════════════════════╗');
+            log('🔧', '║  STARTUP HEAL: Cleaning session keys...  ║');
+            log('🔧', '╚══════════════════════════════════════════╝');
+            const deleted = await nukeSessionKeysFromMongo();
+            log('🔧', `  Startup heal complete. Removed ${deleted} stale keys.`);
+            startupHealDone = true;
+        }
+
         let state, saveCreds, clearAll, clearSessionKeys;
         
         if (mongoConnected) {
@@ -1478,8 +1466,12 @@ async function startBot() {
                     log('🔄', 'Restarting with fresh session in 5 seconds...');
                     setTimeout(startBot, 5000);
                 } else {
-                    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                    log('🔄', `Reconnecting in 5 seconds... (shouldReconnect: ${shouldReconnect})`);
+                    // CHANGE 3: Handle 428 errors in connection close
+                    if (statusCode === 428) {
+                        log('🔧', '428 detected — nuking session keys before reconnect...');
+                        await nukeSessionKeysFromMongo();
+                    }
+                    log('🔄', `Reconnecting in 5 seconds...`);
                     setTimeout(startBot, 5000);
                 }
                 
@@ -2476,7 +2468,7 @@ console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║
 console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain     ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link     ║');
-console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair             ║');
+console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix   ║');
 console.log('║                                                            ║');
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
