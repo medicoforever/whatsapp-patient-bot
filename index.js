@@ -69,6 +69,9 @@ const CONFIG = {
     SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
     // 🔗 Media Viewer URL expiry: 12 hours
     MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
+    // 🔧 Decryption failure auto-heal settings
+    DECRYPT_FAIL_THRESHOLD: 8,
+    DECRYPT_FAIL_WINDOW_MS: 60000,
     SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -139,7 +142,6 @@ function storeMediaForViewer(mediaFiles) {
     const viewerId = crypto.randomBytes(16).toString('hex');
     const expiresAt = Date.now() + CONFIG.MEDIA_VIEWER_EXPIRY_MS;
     
-    // Store only viewable media (images, pdfs, audio, video) with their base64 data
     const viewableMedia = [];
     for (const m of mediaFiles) {
         if (m.type === 'image' || m.type === 'pdf' || m.type === 'audio' || m.type === 'voice' || m.type === 'video') {
@@ -163,7 +165,6 @@ function storeMediaForViewer(mediaFiles) {
     
     log('🔗', `Media viewer created: ${viewerId} (${viewableMedia.length} files, expires in 12h)`);
     
-    // Schedule cleanup
     setTimeout(() => {
         if (mediaViewerStore.has(viewerId)) {
             mediaViewerStore.delete(viewerId);
@@ -174,7 +175,6 @@ function storeMediaForViewer(mediaFiles) {
     return viewerId;
 }
 
-// Periodic cleanup of expired entries (every 1 hour)
 setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
@@ -188,6 +188,107 @@ setInterval(() => {
         log('🧹', `Periodic cleanup: removed ${cleaned} expired media viewer(s)`);
     }
 }, 60 * 60 * 1000);
+
+// ==============================================================================
+// 🔧 DECRYPTION FAILURE TRACKER (Auto-Heal)
+// ==============================================================================
+let decryptFailTimestamps = [];
+let isHealingInProgress = false;
+
+function trackDecryptionFailure() {
+    const now = Date.now();
+    decryptFailTimestamps.push(now);
+    // Keep only timestamps within the window
+    decryptFailTimestamps = decryptFailTimestamps.filter(
+        ts => (now - ts) < CONFIG.DECRYPT_FAIL_WINDOW_MS
+    );
+    
+    if (decryptFailTimestamps.length >= CONFIG.DECRYPT_FAIL_THRESHOLD && !isHealingInProgress) {
+        log('🚨', `Decryption failure threshold reached (${decryptFailTimestamps.length} failures in ${CONFIG.DECRYPT_FAIL_WINDOW_MS / 1000}s). Triggering auto-heal...`);
+        triggerSessionHeal();
+    }
+}
+
+async function triggerSessionHeal() {
+    if (isHealingInProgress) return;
+    isHealingInProgress = true;
+    
+    log('🔧', '══════════════════════════════════════');
+    log('🔧', '  AUTO-HEAL: Signal session key reset ');
+    log('🔧', '══════════════════════════════════════');
+    
+    try {
+        // Step 1: Clear ONLY signal session keys from MongoDB (NOT auth_creds)
+        // Signal session keys are stored with prefix "key_" 
+        // We specifically target sender-key, session, pre-key, app-state etc.
+        if (mongoConnected && SessionModel) {
+            const keysToClean = [
+                'key_pre-key_',
+                'key_session_',
+                'key_sender-key_',
+                'key_sender-key-memory_',
+                'key_app-state-sync-key_',
+                'key_app-state-sync-version_',
+            ];
+            
+            let totalDeleted = 0;
+            for (const prefix of keysToClean) {
+                const result = await SessionModel.deleteMany({
+                    key: { $regex: `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` }
+                });
+                if (result.deletedCount > 0) {
+                    log('🗑️', `  Cleared ${result.deletedCount} entries matching "${prefix}*"`);
+                    totalDeleted += result.deletedCount;
+                }
+            }
+            
+            log('🔧', `  Total signal keys cleared: ${totalDeleted}`);
+            log('🔧', '  Auth credentials (login) preserved ✅');
+        } else {
+            log('⚠️', '  MongoDB not available - cannot clear session keys');
+            // If using file auth, clear the session directory keys
+            const authPath = join(__dirname, 'auth_session');
+            if (fs.existsSync(authPath)) {
+                const files = fs.readdirSync(authPath);
+                let cleared = 0;
+                for (const file of files) {
+                    // Keep creds.json, delete everything else (session keys)
+                    if (file !== 'creds.json') {
+                        fs.unlinkSync(join(authPath, file));
+                        cleared++;
+                    }
+                }
+                log('🗑️', `  Cleared ${cleared} session key files (kept creds.json)`);
+            }
+        }
+        
+        // Step 2: Reset failure counter
+        decryptFailTimestamps = [];
+        
+        // Step 3: Force reconnection to re-negotiate sessions
+        log('🔄', '  Forcing reconnection to re-negotiate encryption...');
+        
+        if (sock) {
+            try {
+                sock.end(new Error('Auto-heal: forcing reconnection'));
+            } catch (e) {
+                log('⚠️', `  Socket close error (harmless): ${e.message}`);
+            }
+        }
+        
+        // The connection.update handler will auto-reconnect
+        // Give a small delay before allowing another heal
+        setTimeout(() => {
+            isHealingInProgress = false;
+            log('🔧', '  Auto-heal cooldown complete. Monitoring resumed.');
+        }, 30000); // 30 second cooldown
+        
+    } catch (error) {
+        log('❌', `  Auto-heal error: ${error.message}`);
+        console.error(error);
+        isHealingInProgress = false;
+    }
+}
 // ==============================================================================
 
 // ==============================================================================
@@ -195,15 +296,12 @@ setInterval(() => {
 // ==============================================================================
 function rotateApiKeys() {
     if (CONFIG.API_KEYS.length > 1) {
-        // Remove first element and add to end (Shift Left / Rotate)
-        // 1,2,3,4 -> 2,3,4,1
         const key = CONFIG.API_KEYS.shift();
         CONFIG.API_KEYS.push(key);
         log('🔄', `API Keys Rotated. New primary key starts with: ...${CONFIG.API_KEYS[0].slice(-4)}`);
     }
 }
 
-// Start rotation interval (2 hours = 7200000 ms)
 setInterval(rotateApiKeys, 2 * 60 * 60 * 1000);
 // ==============================================================================
 
@@ -248,10 +346,8 @@ function isQuestion(text) {
     if (!text) return false;
     const lowerText = text.toLowerCase().trim();
     
-    // Check if ends with question mark
     if (lowerText.endsWith('?')) return true;
     
-    // Check for question words at the start
     const questionStarters = [
         'what', 'why', 'how', 'when', 'where', 'who', 'which', 'whose', 'whom',
         'is ', 'are ', 'was ', 'were ', 'do ', 'does ', 'did ', 'will ', 'would ',
@@ -265,7 +361,6 @@ function isQuestion(text) {
         if (lowerText.startsWith(starter)) return true;
     }
     
-    // Check for question phrases anywhere
     const questionPhrases = [
         'what does', 'what is', 'what are', 'can you explain', 'could you explain',
         'please explain', 'i don\'t understand', 'what about', 'how about',
@@ -350,6 +445,18 @@ async function useMongoDBAuthState() {
         }
     };
 
+    // 🔧 NEW: Clear only signal session keys, keep auth creds
+    const clearSessionKeys = async () => {
+        try {
+            const result = await SessionModel.deleteMany({
+                key: { $regex: /^key_/ }
+            });
+            log('🗑️', `Cleared ${result.deletedCount} signal session keys from MongoDB`);
+        } catch (error) {
+            log('❌', `MongoDB session key clear error: ${error.message}`);
+        }
+    };
+
     let creds = await readData('auth_creds');
     
     if (!creds) {
@@ -395,7 +502,8 @@ async function useMongoDBAuthState() {
             await writeData('auth_creds', creds);
             log('💾', 'Credentials saved to MongoDB');
         },
-        clearAll
+        clearAll,
+        clearSessionKeys
     };
 }
 
@@ -505,14 +613,10 @@ function groupMediaSmartly(mediaFiles) {
         }
     });
 
-    // Case 1: Only 1 unique caption (or 0) across all files
-    // The user requirement: "if just one caption only found with many images, then that one caption is for all those images as separate one process"
     if (distinctCaptions.size <= 1) {
-        return [mediaFiles]; // Return as single batch
+        return [mediaFiles];
     }
 
-    // Case 2: Multiple distinct captions
-    // User requirement: "till the beginning of the different caption, those all images belong to that caption which is before that"
     const batches = [];
     let currentBatch = [];
     let activeCaption = null;
@@ -520,21 +624,15 @@ function groupMediaSmartly(mediaFiles) {
     for (const file of mediaFiles) {
         const fileCaption = (file.caption || '').trim();
 
-        // If this file has a caption AND it is different from the current active one
-        // It signals the start of a new patient/context
         if (fileCaption && fileCaption !== activeCaption) {
-            // Close previous batch if it exists
             if (currentBatch.length > 0) {
                 batches.push(currentBatch);
             }
-            // Start new batch
             currentBatch = [file];
             activeCaption = fileCaption;
         } else {
-            // Append to current batch (same caption OR no caption inheriting previous)
             currentBatch.push(file);
             
-            // If this is the very first file and has a caption, set activeCaption
             if (!activeCaption && fileCaption) {
                 activeCaption = fileCaption;
             }
@@ -561,46 +659,37 @@ function resetUserTimeout(chatId, senderId, senderName) {
         clearTimeout(chatTimeoutMap.get(senderId));
     }
     
-    // Check if this chat is one of the Auto-Process Source Groups
     const isCTSource = chatId === CONFIG.GROUPS.CT_SOURCE;
     const isMRISource = chatId === CONFIG.GROUPS.MRI_SOURCE;
     const isAutoGroup = isCTSource || isMRISource;
 
-    // Use 60 seconds for auto groups, 5 minutes for others
     const delay = isAutoGroup ? CONFIG.AUTO_PROCESS_DELAY_MS : CONFIG.MEDIA_TIMEOUT_MS;
     
     const shortId = getShortSenderId(senderId);
 
     const timeoutCallback = async () => {
         if (isAutoGroup) {
-            // --- AUTO PROCESSING LOGIC ---
-            // If it's a source group, we process automatically and send to target
             const mediaFiles = clearUserBuffer(chatId, senderId);
             if (mediaFiles.length > 0) {
                 log('⏱️', `Auto-processing ${mediaFiles.length} item(s) from Source Group (${isCTSource ? 'CT' : 'MRI'})`);
                 
-                // Determine Target Chat ID
                 const targetChatId = isCTSource ? CONFIG.GROUPS.CT_TARGET : CONFIG.GROUPS.MRI_TARGET;
                 
                 if (targetChatId) {
-                    // 🧠 NEW: Smart Grouping Logic
                     const batches = groupMediaSmartly(mediaFiles);
                     
                     if (batches.length > 1) {
                          log('🔀', `Detected ${batches.length} distinct patient contexts. Processing separately.`);
                     }
 
-                    // Process each batch sequentially
                     for (let i = 0; i < batches.length; i++) {
                         const batch = batches[i];
                         if (batch.length === 0) continue;
 
                         log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
                         
-                        // Process and send to Target
                         await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
                         
-                        // Small delay between batches to ensure order and prevent rate limits
                         if (i < batches.length - 1) {
                             await new Promise(r => setTimeout(r, 2000));
                         }
@@ -611,8 +700,6 @@ function resetUserTimeout(chatId, senderId, senderName) {
                 }
             }
         } else {
-            // --- STANDARD BEHAVIOR ---
-            // Just clear buffer after long inactivity
             const clearedItems = clearUserBuffer(chatId, senderId);
             if (clearedItems.length > 0) {
                 log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
@@ -711,7 +798,6 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 
         fs.writeFileSync(inputPath, videoBuffer);
 
-        // INTELLIGENT FILTER LOGIC:
         const batchSize = 3;
         const inputFps = targetFps * batchSize;
 
@@ -721,9 +807,9 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 
         ffmpeg(inputPath)
             .outputOptions([
-                `-vf ${videoFilter}`, // The magic intelligent filter
-                '-vsync 0',           // Prevent dropping frames arbitrarily
-                '-q:v 2'              // High quality JPEG
+                `-vf ${videoFilter}`,
+                '-vsync 0',
+                '-q:v 2'
             ])
             .output(outputPattern)
             .on('end', () => {
@@ -735,11 +821,11 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
                     const frames = files.map(file => {
                         const path = join(tempDir, file);
                         const buffer = fs.readFileSync(path);
-                        fs.unlinkSync(path); // Clean up frame
+                        fs.unlinkSync(path);
                         return buffer.toString('base64');
                     });
 
-                    fs.unlinkSync(inputPath); // Clean up video
+                    fs.unlinkSync(inputPath);
                     resolve(frames);
                 } catch (err) {
                     reject(err);
@@ -758,7 +844,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ==============================================================================
-// 🔗 MEDIA VIEWER ROUTE - Serves source media for a given viewer ID
+// 🔗 MEDIA VIEWER ROUTE
 // ==============================================================================
 app.get('/view/:viewerId', (req, res) => {
     const { viewerId } = req.params;
@@ -939,7 +1025,6 @@ app.get('/view/:viewerId', (req, res) => {
             }
             .download-btn:hover { background: #1da851; }
             
-            /* Fullscreen overlay */
             .fullscreen-overlay {
                 display: none;
                 position: fixed;
@@ -997,7 +1082,6 @@ app.get('/view/:viewerId', (req, res) => {
     </html>`);
 });
 
-// Individual media file endpoint for memory efficiency (optional direct access)
 app.get('/media/:viewerId/:index', (req, res) => {
     const { viewerId, index } = req.params;
     const idx = parseInt(index);
@@ -1020,7 +1104,6 @@ app.get('/media/:viewerId/:index', (req, res) => {
 // ==============================================================================
 
 app.get('/', (req, res) => {
-    // Just grab stats from first available chat buffer for demo, or sum all
     let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
     for (const [chatId, _] of chatMediaBuffers) {
          const s = getTotalBufferStats(chatId);
@@ -1157,6 +1240,7 @@ app.get('/', (req, res) => {
                 <strong>🧠 Secondary Analysis:</strong><br>
                 - Send <strong>..</strong> (double dot) for Chained Analysis<br>
                 <strong>🔗 Source Viewer:</strong> Each response includes a link to view source media (12h expiry)<br>
+                <strong>🔧 Auto-Heal:</strong> Signal session key auto-repair active<br>
                 <strong>↩️ Reply:</strong> Reply to bot to ask questions.
                 </p>
             </div>
@@ -1190,6 +1274,8 @@ app.get('/health', (req, res) => {
         processedCount,
         activeKeys: CONFIG.API_KEYS.length,
         activeViewers: mediaViewerStore.size,
+        decryptFailures: decryptFailTimestamps.length,
+        healingInProgress: isHealingInProgress,
         timestamp: new Date().toISOString()
     });
 });
@@ -1202,11 +1288,9 @@ app.listen(PORT, () => {
 // 🔗 HELPER: Get the base URL for viewer links
 // ==============================================================================
 function getBaseUrl() {
-    // Use RENDER_EXTERNAL_URL if on Render, otherwise fallback
     if (process.env.RENDER_EXTERNAL_URL) {
         return process.env.RENDER_EXTERNAL_URL;
     }
-    // Fallback for local dev
     return `http://localhost:${PORT}`;
 }
 // ==============================================================================
@@ -1274,13 +1358,12 @@ async function startBot() {
         
         if (!makeWASocket) await loadBaileys();
 
-        // 🟢 FIX: Force MongoDB reconnection attempt if configured but disconnected
         if (!mongoConnected && CONFIG.MONGODB_URI) {
             log('⚠️', 'MongoDB appears disconnected. Attempting to reconnect...');
             await connectMongoDB();
         }
         
-        let state, saveCreds, clearAll;
+        let state, saveCreds, clearAll, clearSessionKeys;
         
         if (mongoConnected) {
             try {
@@ -1288,13 +1371,13 @@ async function startBot() {
                 state = mongoAuth.state;
                 saveCreds = mongoAuth.saveCreds;
                 clearAll = mongoAuth.clearAll;
+                clearSessionKeys = mongoAuth.clearSessionKeys;
                 log('✅', 'Using MongoDB for session storage');
             } catch (e) {
                 log('❌', `MongoDB auth failed: ${e.message}`);
                 throw e;
             }
         } else {
-            // Only fall back to file if MongoDB really failed to connect
             const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
             const authPath = join(__dirname, 'auth_session');
             const fileAuth = await useMultiFileAuthState(authPath);
@@ -1303,10 +1386,27 @@ async function startBot() {
             clearAll = async () => {
                 try { fs.rmSync(authPath, { recursive: true, force: true }); } catch(e) {}
             };
+            clearSessionKeys = async () => {
+                try {
+                    if (fs.existsSync(authPath)) {
+                        const files = fs.readdirSync(authPath);
+                        let cleared = 0;
+                        for (const file of files) {
+                            if (file !== 'creds.json') {
+                                fs.unlinkSync(join(authPath, file));
+                                cleared++;
+                            }
+                        }
+                        log('🗑️', `Cleared ${cleared} session key files (kept creds.json)`);
+                    }
+                } catch(e) {
+                    log('❌', `File session key clear error: ${e.message}`);
+                }
+            };
             log('📁', 'Using file-based auth (session will be lost on restart)');
         }
         
-        authState = { state, saveCreds, clearAll };
+        authState = { state, saveCreds, clearAll, clearSessionKeys };
         
         let version;
         try {
@@ -1320,10 +1420,13 @@ async function startBot() {
         
         botStatus = 'Connecting...';
         
+        // 🔧 Create a pino logger that detects session closure warnings
+        const baileysLogger = pino({ level: 'warn' });
+        
         sock = makeWASocket({
             version,
             auth: state,
-            logger: pino({ level: 'silent' }),
+            logger: baileysLogger,
             browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
             markOnlineOnConnect: false,
             syncFullHistory: false,
@@ -1385,6 +1488,9 @@ async function startBot() {
                 qrCodeDataURL = null;
                 botStatus = 'Connected';
                 
+                // 🔧 Reset decryption failure counter on successful connection
+                decryptFailTimestamps = [];
+                
                 log('✅', '🎉 CONNECTED TO WHATSAPP!');
                 
                 if (authState?.saveCreds) {
@@ -1409,7 +1515,20 @@ async function startBot() {
             
             for (const msg of messages) {
                 if (msg.key.fromMe) continue;
-                if (!msg.message) continue;
+                
+                // 🔧 DECRYPTION FAILURE DETECTION
+                // If we receive a message notification but the message body is empty/null,
+                // it means decryption failed (Signal Protocol out of sync)
+                if (!msg.message) {
+                    // Check if this looks like a real message that failed to decrypt
+                    // (not just a protocol message or receipt)
+                    const chatId = msg.key.remoteJid;
+                    if (chatId && chatId !== 'status@broadcast') {
+                        log('⚠️', `Empty message body from ${chatId} (possible decryption failure)`);
+                        trackDecryptionFailure();
+                    }
+                    continue;
+                }
                 
                 try {
                     await handleMessage(sock, msg);
@@ -1446,17 +1565,14 @@ async function handleMessage(sock, msg) {
     const senderName = getSenderName(msg);
     const shortId = getShortSenderId(senderId);
     
-    // Group discovery logging (optional, no longer restricts access)
     const isGroup = chatId.endsWith('@g.us');
     if (isGroup) {
          log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
     }
 
-    // 🟢 FIX: Unwrap the message content to handle ViewOnce/Ephemeral messages
     const content = unwrapMessage(msg.message);
 
     if (!content) {
-        // If content is null after unwrapping, we can't process it.
         return; 
     }
 
@@ -1465,7 +1581,6 @@ async function handleMessage(sock, msg) {
     let quotedMessageId = null;
     let contextInfo = null;
     
-    // Use 'content' instead of 'msg.message' for type detection
     if (messageType === 'extendedTextMessage') {
         contextInfo = content.extendedTextMessage?.contextInfo;
     } else if (messageType === 'imageMessage') {
@@ -1661,9 +1776,7 @@ async function handleMessage(sock, msg) {
         if (!text) return;
 
         // CHECK FOR TRIGGERS
-        // Primary: . .1 .2 .3
         const isPrimaryTrigger = /^(\.|(\.[1-3]))$/.test(text);
-        // Secondary: .. ..1 ..2 ..3
         const isSecondaryTrigger = /^(\.\.|(\.\.[1-3]))$/.test(text);
         
         if (isPrimaryTrigger || isSecondaryTrigger) {
@@ -1677,24 +1790,18 @@ async function handleMessage(sock, msg) {
                 clearUserTimeout(chatId, senderId);
                 const mediaFiles = clearUserBuffer(chatId, senderId);
                 
-                // DETERMINE VIDEO FPS based on command suffix
-                // . or .. = 3fps
-                // .1 or ..1 = 1fps
-                // .2 or ..2 = 2fps
                 const lastChar = text.slice(-1);
                 let targetFps = 3; 
                 if (!isNaN(parseInt(lastChar))) {
                     targetFps = parseInt(lastChar);
                 }
                 
-                // 🧠 NEW: Smart Grouping Logic for Manual Triggers too
                 const batches = groupMediaSmartly(mediaFiles);
                 
                 if (batches.length > 1) {
                     log('🔀', `Manual Trigger: Detected ${batches.length} distinct patient contexts.`);
                 }
                 
-                // Process each batch sequentially
                 for (let i = 0; i < batches.length; i++) {
                     const batch = batches[i];
                     if (batch.length === 0) continue;
@@ -1702,7 +1809,6 @@ async function handleMessage(sock, msg) {
                     const modeLabel = isSecondaryTrigger ? 'SECONDARY/CHAINED' : 'PRIMARY';
                     log('🤖', `Processing Batch ${i+1}/${batches.length} (${batch.length} items) with FPS=${targetFps}. Mode: ${modeLabel}`);
                     
-                    // Pass the isSecondaryMode flag (true if .. is used)
                     await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger);
                     
                     if (i < batches.length - 1) {
@@ -1753,7 +1859,7 @@ async function handleMessage(sock, msg) {
             const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
             
             await sock.sendMessage(chatId, { 
-                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}` 
+                text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄️ MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}` 
             });
         }
         else {
@@ -1788,7 +1894,6 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     const newContent = [];
     let userTextInput = '';
     
-    // Handle both conversation and extendedTextMessage for text replies
     if (messageType === 'conversation') {
         const text = content.conversation || '';
         if (text.trim()) {
@@ -1948,7 +2053,6 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
         return;
     }
     
-    // Determine if this is a question or additional context
     const isUserQuestion = isQuestion(userTextInput);
     
     const combinedMedia = [...storedContext.mediaFiles, ...newContent];
@@ -1968,7 +2072,6 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     let responseText = null;
     let lastErrorMsg = '';
 
-    // 🔴 NEW: Explicit Safety Settings to allow medical content
     const safetySettings = [
         { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
         { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -1978,7 +2081,6 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 
     for (let i = 0; i < keys.length; i++) {
         try {
-            // 🔴 NEW: Add a 2-second delay before retrying with next key
             if (i > 0) {
                 log('⚠️', `Waiting 2s before retrying with Backup Key #${i + 1}...`);
                 await new Promise(resolve => setTimeout(resolve, 2000));
@@ -1988,20 +2090,18 @@ async function generateGeminiContent(requestContent, systemInstruction) {
             const model = genAI.getGenerativeModel({ 
                 model: CONFIG.GEMINI_MODEL,
                 systemInstruction: systemInstruction,
-                safetySettings: safetySettings // 🔴 Apply Safety Settings
+                safetySettings: safetySettings
             });
             
             const result = await model.generateContent(requestContent);
             responseText = result.response.text();
             
-            // 🟢 MODIFICATION START: Force error on empty response to trigger key rotation
             if (!responseText) {
                  const feedback = JSON.stringify(result.response.promptFeedback || {});
                  throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
             }
-            // 🟢 MODIFICATION END
 
-            return responseText; // Success
+            return responseText;
 
         } catch (error) {
             lastErrorMsg = error.message;
@@ -2012,11 +2112,8 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 }
 
 
-// 🔄 UPDATED processMedia to support Target Chat routing and Caption Headers
-// 🟢 MODIFICATION: Added retryAttempt parameter (default 0)
 async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
     const shortId = getShortSenderId(senderId);
-    // If targetChatId is provided, we send the result there. Otherwise, back to original chatId.
     const destinationChatId = targetChatId || chatId;
     
     try {
@@ -2034,11 +2131,9 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
                 log('🎬', `Processing video for ...${shortId} (Target FPS: ${targetFps})`);
                 try {
                     const videoBuffer = Buffer.from(m.data, 'base64');
-                    // Extract frames using ffmpeg with smart filter
                     const frames = await extractFramesFromVideo(videoBuffer, targetFps);
                     log('📸', `Extracted ${frames.length} smart frames from video`);
                     
-                    // Add extracted frames as individual images
                     frames.forEach(frameData => {
                         processedMedia.push({
                             type: 'image',
@@ -2051,7 +2146,6 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
                     });
                 } catch (err) {
                     log('❌', `Video extraction failed: ${err.message}. processing as standard video.`);
-                    // Fallback to original if ffmpeg fails
                     processedMedia.push(m);
                 }
             } else {
@@ -2143,11 +2237,9 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
         let promptText = '';
         
         if (isFollowUp && previousResponse) {
-            // Determine if this is a question or additional context
             const isUserQuestion = userTextInput ? isQuestion(userTextInput) : false;
             
             if (isUserQuestion) {
-                // User is asking a question - answer it based on context
                 promptText = `The user is replying to a previously generated Clinical Profile with a QUESTION or request for clarification.
 
 === PREVIOUS CLINICAL PROFILE ===
@@ -2171,7 +2263,6 @@ Please answer the user's question directly and helpfully based on the Clinical P
 
 DO NOT regenerate the Clinical Profile unless specifically asked. Just answer their question.`;
             } else {
-                // User is providing additional context or corrections - regenerate profile
                 promptText = `The user is replying to a previously generated Clinical Profile with ADDITIONAL CONTEXT, CORRECTIONS, or NEW INFORMATION.
 
 === PREVIOUS CLINICAL PROFILE ===
@@ -2221,20 +2312,15 @@ ${allOriginalText.join('\n\n')}
             requestContent = [promptText];
         }
         
-        // ==============================================================================
-        // 🔗 STORE SOURCE MEDIA FOR VIEWER (before processing, using ORIGINAL mediaFiles)
-        // ==============================================================================
+        // 🔗 STORE SOURCE MEDIA FOR VIEWER
         const viewerId = storeMediaForViewer(mediaFiles);
         const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
-        // ==============================================================================
         
         // --- STEP 1: Generate Primary Clinical Profile ---
         log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
         const primaryResponseText = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
         
-        // If Secondary Mode is active, we need to send the primary response first, then continue
         if (isSecondaryMode && !isFollowUp) {
-            // 🔗 Append viewer URL to Step 1
             let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
             if (viewerUrl) {
                 step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`;
@@ -2255,17 +2341,14 @@ ${allOriginalText.join('\n\n')}
 ${primaryResponseText}
 === END PROFILE ===`;
 
-            const secondaryRequestContent = [secondaryPrompt]; // Text only request based on profile
+            const secondaryRequestContent = [secondaryPrompt];
             const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
             
-            // The final response we want to store and send is the Secondary one (or a combo)
-            // We'll treat the Secondary response as the "Result" for context purposes.
             let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
             if (viewerUrl) {
                 finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
             }
             
-            // Update responseText variable for the final send block below
             processedCount++;
             
             console.log('\n' + '═'.repeat(60));
@@ -2288,19 +2371,16 @@ ${primaryResponseText}
             if (sentMessage?.key?.id) {
                 const messageId = sentMessage.key.id;
                 trackBotMessage(destinationChatId, messageId);
-                // Store the SECONDARY response as the context context for follow-ups
-                // Note: We store context in destination chat so reply works there
                 storeContext(destinationChatId, messageId, mediaFiles, secondaryResponseText, senderId);
                 log('💾', `Secondary Context stored for ...${shortId}`);
             }
             log('📤', `Sent Secondary (Step 2) to target!`);
-            return; // Exit here as we handled sending manually for secondary mode
+            return;
         }
 
         // --- NORMAL PRIMARY MODE or FOLLOW-UP HANDLING ---
         
         if (!primaryResponseText || primaryResponseText.trim() === '') {
-            // This should be caught by generateGeminiContent now, but safe fallback
             throw new Error('Received empty response from AI');
         }
         
@@ -2325,7 +2405,6 @@ ${primaryResponseText}
             ? primaryResponseText 
             : primaryResponseText.substring(0, 3800) + '\n\n_(truncated)_';
         
-        // 🟢 FEATURE ADDITION: Put captions at the top if auto-forwarding to a target group
         if (targetChatId && allOriginalText.length > 0) {
             const captionHeader = allOriginalText.map(t => t.replace(/^\[.*?\]:\s*/, '')).join('\n');
             if (captionHeader.trim().length > 0) {
@@ -2356,7 +2435,6 @@ ${primaryResponseText}
         log('❌', `Error for ...${shortId}: ${error.message}`);
         console.error(error);
         
-        // 🟢 MODIFICATION START: 5-Minute Auto-Retry Logic
         if (retryAttempt === 0) {
             log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
             
@@ -2368,15 +2446,13 @@ ${primaryResponseText}
                 mentions: [senderId]
             });
             
-            // Schedule the retry with exact same parameters, but increment retryAttempt
             setTimeout(() => {
                 log('🔄', `Executing 5-minute retry for ...${shortId}`);
                 processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
-            }, 300000); // 300,000 ms = 5 minutes
+            }, 300000);
             
             return;
         }
-        // 🟢 MODIFICATION END
 
         await sock.sendPresenceUpdate('composing', destinationChatId);
         await new Promise(r => setTimeout(r, 1500));
@@ -2389,7 +2465,7 @@ ${primaryResponseText}
 }
 
 console.log('\n╔════════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.0                 ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.1                 ║');
 console.log('║                                                            ║');
 console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                            ║');
@@ -2400,6 +2476,7 @@ console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames      ║
 console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                   ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain     ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link     ║');
+console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair             ║');
 console.log('║                                                            ║');
 console.log('║  ✨ Per-User Buffers - Each user processed separately     ║');
 console.log('║  ↩️ Reply to ask questions OR add context                  ║');
