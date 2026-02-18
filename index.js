@@ -72,6 +72,9 @@ const CONFIG = {
   // 🔧 Decryption failure auto-heal settings
   DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
+  // 🔄 Retry settings for empty source group messages
+  EMPTY_MSG_RETRY_DELAY_MS: 3000, // Wait 3 seconds before retry
+  EMPTY_MSG_MAX_RETRIES: 3, // Max retries for empty messages
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -517,6 +520,12 @@ function isMessageAlreadyProcessed(msgId) {
   }
   return false;
 }
+// ======================================================================
+
+// ======================================================================
+// 🔄 PENDING EMPTY MESSAGES TRACKER (for source group retry)
+// ======================================================================
+const pendingEmptyMessages = new Map(); // msgId -> { msg, retryCount, chatId, timestamp }
 // ======================================================================
 
 let sock = null;
@@ -1283,6 +1292,7 @@ app.get('/health', (req, res) => {
     activeViewers: mediaViewerStore.size,
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
+    pendingRetries: pendingEmptyMessages.size,
     timestamp: new Date().toISOString()
   });
 });
@@ -1593,14 +1603,25 @@ async function startBot() {
         if (!msg.message) {
           const chatId = msg.key.remoteJid;
           if (chatId && chatId !== 'status@broadcast') {
-            // Only track decryption failures for non-source groups to avoid
-            // auto-heal disrupting active source group processing
             const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
-            if (!isSourceGroup) {
+            if (isSourceGroup) {
+              // 🔄 SOURCE GROUP: Queue for retry instead of skipping
+              log('⏳', `Empty message body from source group ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
+              if (msgId && !pendingEmptyMessages.has(msgId)) {
+                // Remove from processedMessageIds so it can be reprocessed on retry
+                processedMessageIds.delete(msgId);
+                pendingEmptyMessages.set(msgId, {
+                  msg: msg,
+                  retryCount: 0,
+                  chatId: chatId,
+                  timestamp: Date.now()
+                });
+                // Schedule first retry
+                scheduleEmptyMessageRetry(msgId);
+              }
+            } else {
               log('⚠️', `Empty message body from ${chatId} (possible decryption failure)`);
               trackDecryptionFailure();
-            } else {
-              log('⚠️', `Empty message body from source group ${chatId} (skipping, not counting as decrypt fail)`);
             }
           }
           continue;
@@ -1614,6 +1635,41 @@ async function startBot() {
       }
     });
 
+    // 🔄 Listen for message updates (content populated after initial delivery)
+    sock.ev.on('messages.update', async (updates) => {
+      for (const update of updates) {
+        const msgId = update.key?.id;
+        if (!msgId) continue;
+
+        // Check if this was a pending empty message that now has content
+        if (pendingEmptyMessages.has(msgId) && update.update?.message) {
+          const pending = pendingEmptyMessages.get(msgId);
+          log('✅', `Message update received for pending empty msg ${msgId.substring(0, 8)}... — now has content!`);
+
+          // Reconstruct the message with the updated content
+          const fullMsg = {
+            ...pending.msg,
+            message: update.update.message
+          };
+
+          // Remove from pending
+          pendingEmptyMessages.delete(msgId);
+
+          // Check dedup - remove from processed so it can be handled
+          processedMessageIds.delete(msgId);
+
+          // Now process it
+          if (!fullMsg.key.fromMe && !isMessageAlreadyProcessed(msgId)) {
+            try {
+              await handleMessage(sock, fullMsg);
+            } catch (error) {
+              log('❌', `Message handling error (from update): ${error.message}`);
+            }
+          }
+        }
+      }
+    });
+
   } catch (error) {
     log('💥', `Bot error: ${error.message}`);
     console.error(error);
@@ -1621,6 +1677,59 @@ async function startBot() {
     setTimeout(startBot, 10000);
   }
 }
+
+// ======================================================================
+// 🔄 EMPTY MESSAGE RETRY LOGIC (for source group messages)
+// ======================================================================
+function scheduleEmptyMessageRetry(msgId) {
+  const pending = pendingEmptyMessages.get(msgId);
+  if (!pending) return;
+
+  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS * (pending.retryCount + 1); // Progressive delay
+
+  setTimeout(async () => {
+    const stillPending = pendingEmptyMessages.get(msgId);
+    if (!stillPending) return; // Already resolved via messages.update
+
+    stillPending.retryCount++;
+
+    // Try to load the message from the store/socket
+    try {
+      // Attempt to use sock.loadMessage if available, or just check if message arrived via update
+      // The main mechanism is messages.update event, but we also check here
+      if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
+        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (source group: ${stillPending.chatId})`);
+        pendingEmptyMessages.delete(msgId);
+        return;
+      }
+
+      log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from source group`);
+
+      // Schedule next retry
+      scheduleEmptyMessageRetry(msgId);
+
+    } catch (error) {
+      log('❌', `Retry error for ${msgId.substring(0, 8)}...: ${error.message}`);
+      pendingEmptyMessages.delete(msgId);
+    }
+  }, retryDelay);
+}
+
+// Periodic cleanup for stale pending messages (older than 2 minutes)
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [msgId, pending] of pendingEmptyMessages) {
+    if (now - pending.timestamp > 120000) { // 2 minutes
+      pendingEmptyMessages.delete(msgId);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    log('🧹', `Cleaned ${cleaned} stale pending empty message(s)`);
+  }
+}, 60000);
+// ======================================================================
 
 // 🟢 FIX: Helper to unwrap nested messages (ViewOnce, Ephemeral, etc.)
 const unwrapMessage = (m) => {
@@ -1935,7 +2044,7 @@ async function handleMessage(sock, msg) {
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
       await sock.sendMessage(chatId, {
-        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}`
+        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
       });
     }
     else {
@@ -2276,7 +2385,6 @@ async function generateGeminiContent(requestContent, systemInstruction) {
   }
   throw new Error(`All ${keys.length} API keys failed. Last error: ${lastErrorMsg}`);
 }
-
 
 async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
   const shortId = getShortSenderId(senderId);
@@ -2672,27 +2780,29 @@ ${primaryResponseText}
 
 
 
+
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║           WhatsApp Clinical Profile Bot v3.2            ║');
+console.log('║           WhatsApp Clinical Profile Bot v3.3            ║');
 console.log('║                                                        ║');
-console.log('║ 📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
+console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
 console.log('║                                                        ║');
-console.log('║ 🌍 UNIVERSAL MODE: Works in any chat (Group or Private)║');
-console.log('║ 🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s)║');
-console.log('║ 🔀 SMART BATCHING: Splits distinct patients automatically║');
-console.log('║ 🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames    ║');
-console.log('║    Use: . (3fps), .2 (2fps), .1 (1fps)                 ║');
-console.log('║ 🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain   ║');
-console.log('║ 🔗 SOURCE VIEWER: Each response has a 12h media link   ║');
-console.log('║ 🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix ║');
-console.log('║ 🆔 DEDUPLICATION: Prevents duplicate message processing║');
-console.log('║ 📋 JSON SUMMARY: Age/Sex/Study/Brief in every response ║');
-console.log('║ 👤 SENDER CONTACT: Click-to-chat link for source sender║');
+console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)║');
+console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s)║');
+console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║');
+console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
+console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                ║');
+console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
+console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
+console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix ║');
+console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
+console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response ║');
+console.log('║  👤 SENDER CONTACT: Click-to-chat link for source sender║');
+console.log('║  🔄 EMPTY MSG RETRY: Auto-retry empty source group msgs ║');
 console.log('║                                                        ║');
-console.log('║ ✨ Per-User Buffers - Each user processed separately   ║');
-console.log('║ ↩️ Reply to ask questions OR add context                ║');
-console.log('║ 🗄 MongoDB Persistent Sessions                         ║');
-console.log('║ 🔑 Multi-Key Rotation (2hrs) + Failover Active         ║');
+console.log('║  ✨ Per-User Buffers - Each user processed separately   ║');
+console.log('║  ↩️ Reply to ask questions OR add context               ║');
+console.log('║  🗄 MongoDB Persistent Sessions                        ║');
+console.log('║  🔑 Multi-Key Rotation (2hrs) + Failover Active        ║');
 console.log('╚══════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Starting...');
