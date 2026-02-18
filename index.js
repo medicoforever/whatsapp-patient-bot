@@ -210,7 +210,7 @@ function trackDecryptionFailure() {
     }
 }
 
-// CHANGE 1: New nukeSessionKeysFromMongo function
+// CHANGE 3: Ensuring nukeSessionKeysFromMongo function exists (Already existed, kept as is)
 async function nukeSessionKeysFromMongo() {
     if (!mongoConnected || !SessionModel) {
         log('⚠️', '  MongoDB not available for key cleanup');
@@ -228,7 +228,7 @@ async function nukeSessionKeysFromMongo() {
     }
 }
 
-// CHANGE 1 (continued): Updated triggerSessionHeal to use nukeSessionKeysFromMongo
+// Updated triggerSessionHeal to use nukeSessionKeysFromMongo
 async function triggerSessionHeal(reason = 'threshold') {
     if (isHealingInProgress) return;
     isHealingInProgress = true;
@@ -1338,7 +1338,7 @@ async function startBot() {
             await connectMongoDB();
         }
         
-        // CHANGE 2: ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
+        // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
         if (!startupHealDone && mongoConnected) {
             if (!SessionModel) {
                 SessionModel = mongoose.model('Session', sessionSchema);
@@ -1408,8 +1408,8 @@ async function startBot() {
         
         botStatus = 'Connecting...';
         
-        // 🔧 Create a pino logger that detects session closure warnings
-        const baileysLogger = pino({ level: 'warn' });
+        // CHANGE 4: Create a pino logger set to 'silent' to stop log spam
+        const baileysLogger = pino({ level: 'silent' });
         
         sock = makeWASocket({
             version,
@@ -1418,6 +1418,8 @@ async function startBot() {
             browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
             markOnlineOnConnect: false,
             syncFullHistory: false,
+            // CHANGE 1: Add retryRequestDelayMs to prevent key race conditions
+            retryRequestDelayMs: 2000,
             getMessage: async (key) => {
                 return { conversation: '' };
             }
@@ -1466,9 +1468,9 @@ async function startBot() {
                     log('🔄', 'Restarting with fresh session in 5 seconds...');
                     setTimeout(startBot, 5000);
                 } else {
-                    // CHANGE 3: Handle 428 errors in connection close
-                    if (statusCode === 428) {
-                        log('🔧', '428 detected — nuking session keys before reconnect...');
+                    // CHANGE 2: Handle 428, 408, 515 errors in connection close
+                    if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
+                        log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
                         await nukeSessionKeysFromMongo();
                     }
                     log('🔄', `Reconnecting in 5 seconds...`);
