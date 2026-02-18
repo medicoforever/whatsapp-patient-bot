@@ -37,7 +37,7 @@ const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
   // 🔴 CHANGED TO STABLE MODEL to prevent 503 Overloaded errors
-  GEMINI_MODEL: 'gemini-3-flash-preview',
+  GEMINI_MODEL: 'gemini-2.5-flash',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -1344,8 +1344,8 @@ function formatJsonBlock(jsonData) {
 function formatSenderContact(senderId) {
   if (!senderId) return '';
   const phone = senderId.split('@')[0];
-  // WhatsApp click-to-chat link
-  return `\n\n👤 *Sent by:* wa.me/${phone}`;
+  // WhatsApp @mention format — returns text + the senderId for mentions array
+  return { text: `\n\n👤 *Sent by:* @${phone}`, mentionId: senderId };
 }
 
 // ======================================================================
@@ -1429,7 +1429,7 @@ async function startBot() {
         SessionModel = mongoose.model('Session', sessionSchema);
       }
       log('🔧', '╔══════════════════════════════════════════╗');
-      log('🔧', '║  STARTUP HEAL: Cleaning session keys...  ║');
+      log('🔧', '║ STARTUP HEAL: Cleaning session keys...  ║');
       log('🔧', '╚══════════════════════════════════════════╝');
       const deleted = await nukeSessionKeysFromMongo();
       log('🔧', ` Startup heal complete. Removed ${deleted} stale keys.`);
@@ -2078,7 +2078,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   }
 
   // ======================================================================
-  // 🆕 GROUP CHAT REPLY: Source documents + user question → model
+  // 🆕 GROUP CHAT REPLY: Exclusively use source media + user text, NO system instruction
   // ======================================================================
   if (isGroup) {
     // Extract user's question text
@@ -2115,7 +2115,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       }
     }
 
-    // The request is: all source documents + user's question as prompt
+    // EXCLUSIVELY: source documents as inline data + user's question as text — NO system instruction
     const requestContent = contentParts.length > 0
       ? [userQuestion, ...contentParts]
       : [userQuestion];
@@ -2123,9 +2123,10 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     try {
       await sock.sendPresenceUpdate('composing', chatId);
 
-      log('🔄', `Group reply: Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
+      log('🔄', `Group reply (NO system instruction): Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
 
-      const responseText = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
+      // Call Gemini with NO system instruction (null)
+      const responseText = await generateGeminiContent(requestContent, null);
 
       await sock.sendPresenceUpdate('paused', chatId);
 
@@ -2362,11 +2363,17 @@ async function generateGeminiContent(requestContent, systemInstruction) {
       }
 
       const genAI = new GoogleGenerativeAI(keys[i]);
-      const model = genAI.getGenerativeModel({
+      
+      // Build model config — only include systemInstruction if it's not null/undefined
+      const modelConfig = {
         model: CONFIG.GEMINI_MODEL,
-        systemInstruction: systemInstruction,
         safetySettings: safetySettings
-      });
+      };
+      if (systemInstruction) {
+        modelConfig.systemInstruction = systemInstruction;
+      }
+      
+      const model = genAI.getGenerativeModel(modelConfig);
 
       const result = await model.generateContent(requestContent);
       responseText = result.response.text();
@@ -2601,6 +2608,8 @@ ${allOriginalText.join('\n\n')}
     const primaryResponseText = stripJsonFromResponse(rawPrimaryResponse);
 
     if (isSecondaryMode && !isFollowUp) {
+      // Build mentions array for this message
+      const step1Mentions = [senderId];
       let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
       if (jsonData) {
         step1Text += formatJsonBlock(jsonData);
@@ -2608,9 +2617,13 @@ ${allOriginalText.join('\n\n')}
       if (viewerUrl) {
         step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`;
       }
-      // Add sender contact for auto-group routing
+      // Add sender contact for auto-group routing using @mention
       if (targetChatId) {
-        step1Text += formatSenderContact(senderId);
+        const senderContact = formatSenderContact(senderId);
+        step1Text += senderContact.text;
+        if (!step1Mentions.includes(senderContact.mentionId)) {
+          step1Mentions.push(senderContact.mentionId);
+        }
       }
       // Add group reply footer if destination is a group
       if (isDestinationGroup) {
@@ -2619,7 +2632,7 @@ ${allOriginalText.join('\n\n')}
 
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
-        mentions: [senderId]
+        mentions: step1Mentions
       });
       log('📤', `Sent Primary (Step 1) to ...${shortId}`);
 
@@ -2635,12 +2648,18 @@ ${primaryResponseText}
       const secondaryRequestContent = [secondaryPrompt];
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
 
+      // Build mentions array for secondary message
+      const step2Mentions = [senderId];
       let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
       if (viewerUrl) {
         finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
       }
       if (targetChatId) {
-        finalSecondaryText += formatSenderContact(senderId);
+        const senderContact = formatSenderContact(senderId);
+        finalSecondaryText += senderContact.text;
+        if (!step2Mentions.includes(senderContact.mentionId)) {
+          step2Mentions.push(senderContact.mentionId);
+        }
       }
       // Add group reply footer if destination is a group
       if (isDestinationGroup) {
@@ -2663,7 +2682,7 @@ ${primaryResponseText}
 
       const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
-        mentions: [senderId]
+        mentions: step2Mentions
       });
 
       if (sentMessage?.key?.id) {
@@ -2721,9 +2740,16 @@ ${primaryResponseText}
       finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
     }
 
-    // 👤 Append sender contact for auto-group routing
+    // Build mentions array
+    const finalMentions = [senderId];
+
+    // 👤 Append sender contact for auto-group routing using @mention
     if (targetChatId) {
-      finalResponseText += formatSenderContact(senderId);
+      const senderContact = formatSenderContact(senderId);
+      finalResponseText += senderContact.text;
+      if (!finalMentions.includes(senderContact.mentionId)) {
+        finalMentions.push(senderContact.mentionId);
+      }
     }
 
     // 💬 Append group reply footer if destination is a group
@@ -2733,7 +2759,7 @@ ${primaryResponseText}
 
     const sentMessage = await sock.sendMessage(destinationChatId, {
       text: finalResponseText,
-      mentions: [senderId]
+      mentions: finalMentions
     });
 
     if (sentMessage?.key?.id) {
@@ -2781,25 +2807,26 @@ ${primaryResponseText}
 
 
 
+
 console.log('\n╔══════════════════════════════════════════════════════════╗');
 console.log('║           WhatsApp Clinical Profile Bot v3.3            ║');
 console.log('║                                                        ║');
-console.log('║  📷 Images  📄 PDFs  🎤 Voice  🎵 Audio  🎬 Video  💬 Text ║');
+console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
 console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)║');
 console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s)║');
 console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║');
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
-console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                ║');
+console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
-console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix ║');
+console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
 console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
-console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response ║');
-console.log('║  👤 SENDER CONTACT: Click-to-chat link for source sender║');
-console.log('║  🔄 EMPTY MSG RETRY: Auto-retry empty source group msgs ║');
+console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
+console.log('║  👤 SENDER CONTACT: @mention tag for source sender     ║');
+console.log('║  🔄 EMPTY MSG RETRY: Auto-retry empty source group msgs║');
 console.log('║                                                        ║');
-console.log('║  ✨ Per-User Buffers - Each user processed separately   ║');
+console.log('║  ✨ Per-User Buffers - Each user processed separately  ║');
 console.log('║  ↩️ Reply to ask questions OR add context               ║');
 console.log('║  🗄 MongoDB Persistent Sessions                        ║');
 console.log('║  🔑 Multi-Key Rotation (2hrs) + Failover Active        ║');
