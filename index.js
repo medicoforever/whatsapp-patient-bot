@@ -51,7 +51,8 @@ const CONFIG = {
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
   AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
 
-  CONTEXT_RETENTION_MS: 1800000,
+  // 🔧 FIX ISSUE 1: Changed from 30 minutes (1800000) to 12 hours (43200000)
+  CONTEXT_RETENTION_MS: 43200000,
   MAX_STORED_CONTEXTS: 20,
   COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
   TYPING_DELAY_MIN: 3000,
@@ -73,8 +74,8 @@ const CONFIG = {
   DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
-  EMPTY_MSG_RETRY_DELAY_MS: 3000, // Wait 3 seconds before retry
-  EMPTY_MSG_MAX_RETRIES: 3, // Max retries for empty messages
+  EMPTY_MSG_RETRY_DELAY_MS: 5000, // Wait 5 seconds before retry (increased from 3s)
+  EMPTY_MSG_MAX_RETRIES: 5, // Max retries for empty messages (increased from 3)
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -665,6 +666,9 @@ function groupMediaSmartly(mediaFiles) {
 // ======================================================================
 // 🔄 UPDATED TIMEOUT LOGIC (Includes Smart Batching)
 // ======================================================================
+// 🔧 FIX ISSUE 2: Store sender metadata for source group messages
+const sourceGroupSenderInfo = new Map(); // chatId+senderId -> { participantId, pushName }
+
 function resetUserTimeout(chatId, senderId, senderName) {
   if (!chatTimeouts.has(chatId)) {
     chatTimeouts.set(chatId, new Map());
@@ -698,18 +702,27 @@ function resetUserTimeout(chatId, senderId, senderName) {
             log('🔀', `Detected ${batches.length} distinct patient contexts. Processing separately.`);
           }
 
+          // 🔧 FIX ISSUE 2: Retrieve stored sender info for this source group sender
+          const senderInfoKey = `${chatId}_${senderId}`;
+          const storedInfo = sourceGroupSenderInfo.get(senderInfoKey);
+          const actualSenderId = (storedInfo && storedInfo.participantId) ? storedInfo.participantId : senderId;
+          const actualSenderName = (storedInfo && storedInfo.pushName) ? storedInfo.pushName : senderName;
+
           for (let i = 0; i < batches.length; i++) {
             const batch = batches[i];
             if (batch.length === 0) continue;
 
             log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
 
-            await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
+            await processMedia(sock, chatId, batch, false, null, actualSenderId, actualSenderName, null, 3, false, targetChatId);
 
             if (i < batches.length - 1) {
               await new Promise(r => setTimeout(r, 2000));
             }
           }
+
+          // Clean up stored sender info
+          sourceGroupSenderInfo.delete(senderInfoKey);
 
         } else {
           log('⚠️', 'Target group not configured for this source!');
@@ -1341,11 +1354,22 @@ function formatJsonBlock(jsonData) {
   return `\n\n📋 *Quick Reference:*\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
 }
 
-function formatSenderContact(senderId) {
-  if (!senderId) return '';
-  const phone = senderId.split('@')[0];
-  // WhatsApp @mention format — returns text + the senderId for mentions array
-  return { text: `\n\n👤 *Sent by:* @${phone}`, mentionId: senderId };
+// 🔧 FIX ISSUE 2: Improved formatSenderContact to use pushName and handle LID senders
+function formatSenderContact(senderId, senderName) {
+  if (!senderId) return { text: '', mentionId: null };
+  const idPart = senderId.split('@')[0];
+  const domain = senderId.split('@')[1] || '';
+
+  // If sender is a LID (Linked Identity) or doesn't look like a phone number, use pushName display
+  const isLid = domain === 'lid' || idPart.length > 15;
+
+  if (isLid && senderName && senderName !== idPart) {
+    // For LID-based senders, show the pushName as display text since @mention won't work
+    return { text: `\n\n👤 *Sent by:* ${senderName}`, mentionId: senderId };
+  }
+
+  // Normal phone-based sender - use @mention which creates a clickable link
+  return { text: `\n\n👤 *Sent by:* @${idPart}`, mentionId: senderId };
 }
 
 // ======================================================================
@@ -1429,7 +1453,7 @@ async function startBot() {
         SessionModel = mongoose.model('Session', sessionSchema);
       }
       log('🔧', '╔══════════════════════════════════════════╗');
-      log('🔧', '║ STARTUP HEAL: Cleaning session keys...  ║');
+      log('🔧', '║  STARTUP HEAL: Cleaning session keys...  ║');
       log('🔧', '╚══════════════════════════════════════════╝');
       const deleted = await nukeSessionKeysFromMongo();
       log('🔧', ` Startup heal complete. Removed ${deleted} stale keys.`);
@@ -1695,8 +1719,6 @@ function scheduleEmptyMessageRetry(msgId) {
 
     // Try to load the message from the store/socket
     try {
-      // Attempt to use sock.loadMessage if available, or just check if message arrived via update
-      // The main mechanism is messages.update event, but we also check here
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
         log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (source group: ${stillPending.chatId})`);
         pendingEmptyMessages.delete(msgId);
@@ -1704,6 +1726,17 @@ function scheduleEmptyMessageRetry(msgId) {
       }
 
       log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from source group`);
+
+      // 🔧 FIX ISSUE 3: Try to request message retry from WhatsApp
+      try {
+        if (sock && stillPending.msg && stillPending.msg.key) {
+          // Send a read receipt which can trigger re-delivery
+          await sock.readMessages([stillPending.msg.key]);
+        }
+      } catch (retryErr) {
+        // Non-critical, just log
+        log('⚠️', `Read receipt for retry failed (non-critical): ${retryErr.message}`);
+      }
 
       // Schedule next retry
       scheduleEmptyMessageRetry(msgId);
@@ -1715,12 +1748,12 @@ function scheduleEmptyMessageRetry(msgId) {
   }, retryDelay);
 }
 
-// Periodic cleanup for stale pending messages (older than 2 minutes)
+// Periodic cleanup for stale pending messages (older than 5 minutes)
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [msgId, pending] of pendingEmptyMessages) {
-    if (now - pending.timestamp > 120000) { // 2 minutes
+    if (now - pending.timestamp > 300000) { // 5 minutes (increased from 2)
       pendingEmptyMessages.delete(msgId);
       cleaned++;
     }
@@ -1753,6 +1786,16 @@ async function handleMessage(sock, msg) {
   const isGroup = chatId.endsWith('@g.us');
   if (isGroup) {
     log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
+  }
+
+  // 🔧 FIX ISSUE 2: For source groups, store the actual participant info
+  const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
+  if (isSourceGroup && msg.key.participant) {
+    const senderInfoKey = `${chatId}_${senderId}`;
+    sourceGroupSenderInfo.set(senderInfoKey, {
+      participantId: msg.key.participant,
+      pushName: msg.pushName || null
+    });
   }
 
   const content = unwrapMessage(msg.message);
@@ -2070,8 +2113,9 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
   if (!storedContext) {
     log('⚠️', `Context expired for ...${shortId}`);
+    // 🔧 FIX ISSUE 1: Updated expiry message from "30 min" to "12 hour"
     await sock.sendMessage(chatId, {
-      text: `⏰ @${senderId.split('@')[0]}, that context has expired (30 min limit).\n\nPlease send new files and use "." to process.`,
+      text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
       mentions: [senderId]
     });
     return;
@@ -2363,7 +2407,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
       }
 
       const genAI = new GoogleGenerativeAI(keys[i]);
-      
+
       // Build model config — only include systemInstruction if it's not null/undefined
       const modelConfig = {
         model: CONFIG.GEMINI_MODEL,
@@ -2372,7 +2416,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
       if (systemInstruction) {
         modelConfig.systemInstruction = systemInstruction;
       }
-      
+
       const model = genAI.getGenerativeModel(modelConfig);
 
       const result = await model.generateContent(requestContent);
@@ -2619,9 +2663,9 @@ ${allOriginalText.join('\n\n')}
       }
       // Add sender contact for auto-group routing using @mention
       if (targetChatId) {
-        const senderContact = formatSenderContact(senderId);
+        const senderContact = formatSenderContact(senderId, senderName);
         step1Text += senderContact.text;
-        if (!step1Mentions.includes(senderContact.mentionId)) {
+        if (senderContact.mentionId && !step1Mentions.includes(senderContact.mentionId)) {
           step1Mentions.push(senderContact.mentionId);
         }
       }
@@ -2655,9 +2699,9 @@ ${primaryResponseText}
         finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
       }
       if (targetChatId) {
-        const senderContact = formatSenderContact(senderId);
+        const senderContact = formatSenderContact(senderId, senderName);
         finalSecondaryText += senderContact.text;
-        if (!step2Mentions.includes(senderContact.mentionId)) {
+        if (senderContact.mentionId && !step2Mentions.includes(senderContact.mentionId)) {
           step2Mentions.push(senderContact.mentionId);
         }
       }
@@ -2745,9 +2789,9 @@ ${primaryResponseText}
 
     // 👤 Append sender contact for auto-group routing using @mention
     if (targetChatId) {
-      const senderContact = formatSenderContact(senderId);
+      const senderContact = formatSenderContact(senderId, senderName);
       finalResponseText += senderContact.text;
-      if (!finalMentions.includes(senderContact.mentionId)) {
+      if (senderContact.mentionId && !finalMentions.includes(senderContact.mentionId)) {
         finalMentions.push(senderContact.mentionId);
       }
     }
@@ -2809,7 +2853,7 @@ ${primaryResponseText}
 
 
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║           WhatsApp Clinical Profile Bot v3.3            ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.4              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
@@ -2817,7 +2861,7 @@ console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)║')
 console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s)║');
 console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║');
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
-console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
+console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
 console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
