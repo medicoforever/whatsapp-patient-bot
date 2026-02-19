@@ -37,7 +37,7 @@ const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
   // 🔴 CHANGED TO STABLE MODEL to prevent 503 Overloaded errors
-  GEMINI_MODEL: 'gemini-2.5-flash',
+  GEMINI_MODEL: 'gemini-3-flash-preview',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -51,8 +51,8 @@ const CONFIG = {
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
   AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
 
-  // 🔧 FIX ISSUE 1: Changed from 30 minutes (1800000) to 12 hours (43200000)
-  CONTEXT_RETENTION_MS: 43200000,
+  // 🔧 FIX #1: Changed from 30 minutes to 12 hours to match media viewer expiry
+  CONTEXT_RETENTION_MS: 12 * 60 * 60 * 1000, // 12 hours
   MAX_STORED_CONTEXTS: 20,
   COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
   TYPING_DELAY_MIN: 3000,
@@ -74,8 +74,8 @@ const CONFIG = {
   DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
-  EMPTY_MSG_RETRY_DELAY_MS: 5000, // Wait 5 seconds before retry (increased from 3s)
-  EMPTY_MSG_MAX_RETRIES: 5, // Max retries for empty messages (increased from 3)
+  EMPTY_MSG_RETRY_DELAY_MS: 3000, // Wait 3 seconds before retry
+  EMPTY_MSG_MAX_RETRIES: 3, // Max retries for empty messages
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -666,9 +666,6 @@ function groupMediaSmartly(mediaFiles) {
 // ======================================================================
 // 🔄 UPDATED TIMEOUT LOGIC (Includes Smart Batching)
 // ======================================================================
-// 🔧 FIX ISSUE 2: Store sender metadata for source group messages
-const sourceGroupSenderInfo = new Map(); // chatId+senderId -> { participantId, pushName }
-
 function resetUserTimeout(chatId, senderId, senderName) {
   if (!chatTimeouts.has(chatId)) {
     chatTimeouts.set(chatId, new Map());
@@ -702,27 +699,18 @@ function resetUserTimeout(chatId, senderId, senderName) {
             log('🔀', `Detected ${batches.length} distinct patient contexts. Processing separately.`);
           }
 
-          // 🔧 FIX ISSUE 2: Retrieve stored sender info for this source group sender
-          const senderInfoKey = `${chatId}_${senderId}`;
-          const storedInfo = sourceGroupSenderInfo.get(senderInfoKey);
-          const actualSenderId = (storedInfo && storedInfo.participantId) ? storedInfo.participantId : senderId;
-          const actualSenderName = (storedInfo && storedInfo.pushName) ? storedInfo.pushName : senderName;
-
           for (let i = 0; i < batches.length; i++) {
             const batch = batches[i];
             if (batch.length === 0) continue;
 
             log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
 
-            await processMedia(sock, chatId, batch, false, null, actualSenderId, actualSenderName, null, 3, false, targetChatId);
+            await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
 
             if (i < batches.length - 1) {
               await new Promise(r => setTimeout(r, 2000));
             }
           }
-
-          // Clean up stored sender info
-          sourceGroupSenderInfo.delete(senderInfoKey);
 
         } else {
           log('⚠️', 'Target group not configured for this source!');
@@ -884,22 +872,22 @@ app.get('/view/:viewerId', (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Link Expired</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
-        .container { text-align: center; padding: 40px; }
-        .icon { font-size: 64px; margin-bottom: 20px; }
-        h1 { color: #e94560; }
-        p { color: #aaa; }
-      </style>
+        <title>Link Expired</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+            .container { text-align: center; padding: 40px; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            h1 { color: #e94560; }
+            p { color: #aaa; }
+        </style>
     </head>
     <body>
-      <div class="container">
-        <div class="icon">⏰</div>
-        <h1>Link Expired or Invalid</h1>
-        <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
-      </div>
+        <div class="container">
+            <div class="icon">⏰</div>
+            <h1>Link Expired or Invalid</h1>
+            <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
+        </div>
     </body>
     </html>`);
   }
@@ -910,22 +898,22 @@ app.get('/view/:viewerId', (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Link Expired</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
-        .container { text-align: center; padding: 40px; }
-        .icon { font-size: 64px; margin-bottom: 20px; }
-        h1 { color: #e94560; }
-        p { color: #aaa; }
-      </style>
+        <title>Link Expired</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+            .container { text-align: center; padding: 40px; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            h1 { color: #e94560; }
+            p { color: #aaa; }
+        </style>
     </head>
     <body>
-      <div class="container">
-        <div class="icon">⏰</div>
-        <h1>Link Expired</h1>
-        <p>This media viewer link has expired (12 hour limit).</p>
-      </div>
+        <div class="container">
+            <div class="icon">⏰</div>
+            <h1>Link Expired</h1>
+            <p>This media viewer link has expired (12 hour limit).</p>
+        </div>
     </body>
     </html>`);
   }
@@ -942,173 +930,173 @@ app.get('/view/:viewerId', (req, res) => {
 
     if (m.type === 'image') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — Image</div>
-        ${caption}${fileName}
-        <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Image</div>
+            ${caption}${fileName}
+            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+        </div>`;
     } else if (m.type === 'pdf') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — PDF</div>
-        ${caption}${fileName}
-        <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
-        <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — PDF</div>
+            ${caption}${fileName}
+            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
+            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+        </div>`;
     } else if (m.type === 'audio' || m.type === 'voice') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
-        ${caption}${fileName}
-        <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
+            ${caption}${fileName}
+            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+        </div>`;
     } else if (m.type === 'video') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — Video</div>
-        ${caption}${fileName}
-        <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Video</div>
+            ${caption}${fileName}
+            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+        </div>`;
     }
   });
 
   res.send(`
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <title>Source Media Viewer</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      * { box-sizing: border-box; margin: 0; padding: 0; }
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        background: #0f0f1a;
-        color: #e0e0e0;
-        padding: 10px;
-      }
-      .header {
-        text-align: center;
-        padding: 20px 10px;
-        background: linear-gradient(135deg, #1a1a2e, #16213e);
-        border-radius: 12px;
-        margin-bottom: 15px;
-        border: 1px solid #333;
-      }
-      .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
-      .header .meta { font-size: 12px; color: #888; }
-      .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
-      .media-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-        gap: 12px;
-      }
-      .media-item {
-        background: #1a1a2e;
-        border-radius: 10px;
-        overflow: hidden;
-        border: 1px solid #2a2a4a;
-        transition: transform 0.2s;
-      }
-      .media-item:hover { transform: scale(1.01); border-color: #25D366; }
-      .media-item img {
-        width: 100%;
-        display: block;
-        cursor: pointer;
-        transition: opacity 0.2s;
-      }
-      .media-item img:hover { opacity: 0.9; }
-      .media-index {
-        padding: 8px 12px;
-        font-size: 11px;
-        font-weight: 600;
-        color: #25D366;
-        background: #0f0f1a;
-        border-bottom: 1px solid #2a2a4a;
-      }
-      .caption {
-        padding: 6px 12px;
-        font-size: 12px;
-        color: #ccc;
-        background: #16213e;
-        font-style: italic;
-      }
-      .filename {
-        padding: 4px 12px;
-        font-size: 11px;
-        color: #888;
-      }
-      .pdf-frame {
-        width: 100%;
-        height: 500px;
-        border: none;
-      }
-      .download-btn {
-        display: block;
-        text-align: center;
-        padding: 10px;
-        background: #25D366;
-        color: #000;
-        text-decoration: none;
-        font-weight: 600;
-        font-size: 13px;
-      }
-      .download-btn:hover { background: #1da851; }
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Source Media Viewer</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #0f0f1a;
+                color: #e0e0e0;
+                padding: 10px;
+            }
+            .header {
+                text-align: center;
+                padding: 20px 10px;
+                background: linear-gradient(135deg, #1a1a2e, #16213e);
+                border-radius: 12px;
+                margin-bottom: 15px;
+                border: 1px solid #333;
+            }
+            .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
+            .header .meta { font-size: 12px; color: #888; }
+            .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
+            .media-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 12px;
+            }
+            .media-item {
+                background: #1a1a2e;
+                border-radius: 10px;
+                overflow: hidden;
+                border: 1px solid #2a2a4a;
+                transition: transform 0.2s;
+            }
+            .media-item:hover { transform: scale(1.01); border-color: #25D366; }
+            .media-item img {
+                width: 100%;
+                display: block;
+                cursor: pointer;
+                transition: opacity 0.2s;
+            }
+            .media-item img:hover { opacity: 0.9; }
+            .media-index {
+                padding: 8px 12px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #25D366;
+                background: #0f0f1a;
+                border-bottom: 1px solid #2a2a4a;
+            }
+            .caption {
+                padding: 6px 12px;
+                font-size: 12px;
+                color: #ccc;
+                background: #16213e;
+                font-style: italic;
+            }
+            .filename {
+                padding: 4px 12px;
+                font-size: 11px;
+                color: #888;
+            }
+            .pdf-frame {
+                width: 100%;
+                height: 500px;
+                border: none;
+            }
+            .download-btn {
+                display: block;
+                text-align: center;
+                padding: 10px;
+                background: #25D366;
+                color: #000;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            .download-btn:hover { background: #1da851; }
 
-      .fullscreen-overlay {
-        display: none;
-        position: fixed;
-        top: 0; left: 0;
-        width: 100vw; height: 100vh;
-        background: rgba(0,0,0,0.95);
-        z-index: 9999;
-        justify-content: center;
-        align-items: center;
-        cursor: zoom-out;
-      }
-      .fullscreen-overlay.active { display: flex; }
-      .fullscreen-overlay img {
-        max-width: 95vw;
-        max-height: 95vh;
-        object-fit: contain;
-      }
+            .fullscreen-overlay {
+                display: none;
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                background: rgba(0,0,0,0.95);
+                z-index: 9999;
+                justify-content: center;
+                align-items: center;
+                cursor: zoom-out;
+            }
+            .fullscreen-overlay.active { display: flex; }
+            .fullscreen-overlay img {
+                max-width: 95vw;
+                max-height: 95vh;
+                object-fit: contain;
+            }
 
-      @media (max-width: 600px) {
-        .media-grid { grid-template-columns: 1fr; }
-        body { padding: 5px; }
-      }
-    </style>
-  </head>
-  <body>
-    <div class="header">
-      <h1>🔍 Source Media Viewer</h1>
-      <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
-      <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
-    </div>
+            @media (max-width: 600px) {
+                .media-grid { grid-template-columns: 1fr; }
+                body { padding: 5px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🔍 Source Media Viewer</h1>
+            <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
+            <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
+        </div>
 
-    <div class="media-grid">
-      ${mediaHtml}
-    </div>
+        <div class="media-grid">
+            ${mediaHtml}
+        </div>
 
-    <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
-      <img id="fsImage" src="" alt="Fullscreen">
-    </div>
+        <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
+            <img id="fsImage" src="" alt="Fullscreen">
+        </div>
 
-    <script>
-      function openFullscreen(img) {
-        const overlay = document.getElementById('fsOverlay');
-        const fsImg = document.getElementById('fsImage');
-        fsImg.src = img.src;
-        overlay.classList.add('active');
-      }
-      function closeFullscreen() {
-        document.getElementById('fsOverlay').classList.remove('active');
-      }
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') closeFullscreen();
-      });
-    </script>
-  </body>
-  </html>`);
+        <script>
+            function openFullscreen(img) {
+                const overlay = document.getElementById('fsOverlay');
+                const fsImg = document.getElementById('fsImage');
+                fsImg.src = img.src;
+                overlay.classList.add('active');
+            }
+            function closeFullscreen() {
+                document.getElementById('fsOverlay').classList.remove('active');
+            }
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeFullscreen();
+            });
+        </script>
+    </body>
+    </html>`);
 });
 
 app.get('/media/:viewerId/:index', (req, res) => {
@@ -1146,147 +1134,147 @@ app.get('/', (req, res) => {
   }
 
   let html = `
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <title>WhatsApp Patient Bot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="5">
-    <style>
-      * { box-sizing: border-box; }
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        min-height: 100vh;
-        margin: 0;
-        background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
-        color: white;
-        padding: 20px;
-      }
-      .container {
-        text-align: center;
-        background: rgba(255,255,255,0.15);
-        padding: 30px;
-        border-radius: 20px;
-        backdrop-filter: blur(10px);
-        max-width: 600px;
-        width: 100%;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-      }
-      h1 { margin: 0 0 10px 0; font-size: 24px; }
-      .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; }
-      .status {
-        padding: 15px 20px;
-        border-radius: 12px;
-        margin: 20px 0;
-        font-size: 16px;
-        font-weight: 600;
-      }
-      .connected { background: #4CAF50; }
-      .waiting { background: rgba(255,255,255,0.2); }
-      .qr-container {
-        background: white;
-        padding: 15px;
-        border-radius: 15px;
-        display: inline-block;
-        margin: 20px 0;
-      }
-      .qr-container img { display: block; max-width: 250px; width: 100%; }
-      .info-box {
-        text-align: left;
-        background: rgba(0,0,0,0.2);
-        padding: 15px;
-        border-radius: 12px;
-        margin-top: 15px;
-        font-size: 13px;
-      }
-      .info-box h3 { margin: 0 0 10px 0; font-size: 15px; }
-      .stats {
-        display: flex;
-        justify-content: center;
-        gap: 6px;
-        margin-top: 20px;
-        flex-wrap: wrap;
-      }
-      .stat {
-        background: rgba(255,255,255,0.1);
-        padding: 8px 10px;
-        border-radius: 10px;
-        min-width: 50px;
-      }
-      .stat-value { font-size: 16px; font-weight: bold; }
-      .stat-label { font-size: 8px; opacity: 0.8; }
-      .db-status {
-        font-size: 11px;
-        padding: 5px 10px;
-        border-radius: 20px;
-        display: inline-block;
-        margin-bottom: 15px;
-      }
-      .db-connected { background: rgba(76, 175, 80, 0.3); }
-      .db-disconnected { background: rgba(244, 67, 54, 0.3); }
-      .feature-badge {
-        display: inline-block;
-        background: rgba(255,255,255,0.2);
-        padding: 3px 8px;
-        border-radius: 12px;
-        font-size: 10px;
-        margin: 2px;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <h1>📱 WhatsApp Patient Bot</h1>
-      <p class="subtitle">Medical Clinical Profile Generator</p>
-      <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
-        ${mongoConnected ? '🗄 MongoDB Connected' : '⚠️ MongoDB Not Connected'}
-      </div>
-      <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
-  `;
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WhatsApp Patient Bot</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="5">
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
+                color: white;
+                padding: 20px;
+            }
+            .container {
+                text-align: center;
+                background: rgba(255,255,255,0.15);
+                padding: 30px;
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                max-width: 600px;
+                width: 100%;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            }
+            h1 { margin: 0 0 10px 0; font-size: 24px; }
+            .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; }
+            .status {
+                padding: 15px 20px;
+                border-radius: 12px;
+                margin: 20px 0;
+                font-size: 16px;
+                font-weight: 600;
+            }
+            .connected { background: #4CAF50; }
+            .waiting { background: rgba(255,255,255,0.2); }
+            .qr-container {
+                background: white;
+                padding: 15px;
+                border-radius: 15px;
+                display: inline-block;
+                margin: 20px 0;
+            }
+            .qr-container img { display: block; max-width: 250px; width: 100%; }
+            .info-box {
+                text-align: left;
+                background: rgba(0,0,0,0.2);
+                padding: 15px;
+                border-radius: 12px;
+                margin-top: 15px;
+                font-size: 13px;
+            }
+            .info-box h3 { margin: 0 0 10px 0; font-size: 15px; }
+            .stats {
+                display: flex;
+                justify-content: center;
+                gap: 6px;
+                margin-top: 20px;
+                flex-wrap: wrap;
+            }
+            .stat {
+                background: rgba(255,255,255,0.1);
+                padding: 8px 10px;
+                border-radius: 10px;
+                min-width: 50px;
+            }
+            .stat-value { font-size: 16px; font-weight: bold; }
+            .stat-label { font-size: 8px; opacity: 0.8; }
+            .db-status {
+                font-size: 11px;
+                padding: 5px 10px;
+                border-radius: 20px;
+                display: inline-block;
+                margin-bottom: 15px;
+            }
+            .db-connected { background: rgba(76, 175, 80, 0.3); }
+            .db-disconnected { background: rgba(244, 67, 54, 0.3); }
+            .feature-badge {
+                display: inline-block;
+                background: rgba(255,255,255,0.2);
+                padding: 3px 8px;
+                border-radius: 12px;
+                font-size: 10px;
+                margin: 2px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📱 WhatsApp Patient Bot</h1>
+            <p class="subtitle">Medical Clinical Profile Generator</p>
+            <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
+                ${mongoConnected ? '🗄 MongoDB Connected' : '⚠️ MongoDB Not Connected'}
+            </div>
+            <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
+    `;
 
   if (isConnected) {
     html += `
-      <div class="status connected">✅ UNIVERSAL MODE ACTIVE</div>
-      <p>Bot is active for all incoming messages (Private & Group)</p>
-      <div class="stats">
-        <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
-        <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
-        <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
-        <div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div>
-      </div>
-      <div class="info-box">
-        <h3>✨ Features:</h3>
-        <p>
-          <strong>🌍 Public Access:</strong> Works in any chat/group.<br>
-          <strong>🔄 Auto-Groups:</strong> Monitored CT/MRI groups active.<br>
-          <strong>🎥 Smart Video:</strong><br>
-          - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
-          - Send <strong>.2</strong> for Smart 2 FPS<br>
-          - Send <strong>.1</strong> for Smart 1 FPS<br>
-          <strong>🧠 Secondary Analysis:</strong><br>
-          - Send <strong>..</strong> (double dot) for Chained Analysis<br>
-          <strong>🔗 Source Viewer:</strong> Each response includes a link to view source media (12h expiry)<br>
-          <strong>🔧 Auto-Heal:</strong> Signal session key auto-repair active<br>
-          <strong>↩️ Reply:</strong> Reply to bot to ask questions.
-        </p>
-      </div>
+            <div class="status connected">✅ UNIVERSAL MODE ACTIVE</div>
+            <p>Bot is active for all incoming messages (Private & Group)</p>
+            <div class="stats">
+                <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
+                <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
+                <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
+                <div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div>
+            </div>
+            <div class="info-box">
+                <h3>✨ Features:</h3>
+                <p>
+                    <strong>🌍 Public Access:</strong> Works in any chat/group.<br>
+                    <strong>🔄 Auto-Groups:</strong> Monitored CT/MRI groups active.<br>
+                    <strong>🎥 Smart Video:</strong><br>
+                    - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
+                    - Send <strong>.2</strong> for Smart 2 FPS<br>
+                    - Send <strong>.1</strong> for Smart 1 FPS<br>
+                    <strong>🧠 Secondary Analysis:</strong><br>
+                    - Send <strong>..</strong> (double dot) for Chained Analysis<br>
+                    <strong>🔗 Source Viewer:</strong> Each response includes a link to view source media (12h expiry)<br>
+                    <strong>🔧 Auto-Heal:</strong> Signal session key auto-repair active<br>
+                    <strong>↩️ Reply:</strong> Reply to bot to ask questions.
+                </p>
+            </div>
     `;
   } else if (qrCodeDataURL) {
     html += `
-      <div class="status waiting">📲 SCAN QR CODE</div>
-      <div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>
-      <div class="info-box">
-        <h3>📋 To connect:</h3>
-        <p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device</p>
-      </div>
+            <div class="status waiting">📲 SCAN QR CODE</div>
+            <div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>
+            <div class="info-box">
+                <h3>📋 To connect:</h3>
+                <p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device</p>
+            </div>
     `;
   } else {
     html += `
-      <div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>
-      <p>Please wait...</p>
+            <div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>
+            <p>Please wait...</p>
     `;
   }
 
@@ -1354,22 +1342,26 @@ function formatJsonBlock(jsonData) {
   return `\n\n📋 *Quick Reference:*\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
 }
 
-// 🔧 FIX ISSUE 2: Improved formatSenderContact to use pushName and handle LID senders
+// 🔧 FIX #2: Updated formatSenderContact to handle users without usernames properly
 function formatSenderContact(senderId, senderName) {
   if (!senderId) return { text: '', mentionId: null };
-  const idPart = senderId.split('@')[0];
-  const domain = senderId.split('@')[1] || '';
-
-  // If sender is a LID (Linked Identity) or doesn't look like a phone number, use pushName display
-  const isLid = domain === 'lid' || idPart.length > 15;
-
-  if (isLid && senderName && senderName !== idPart) {
-    // For LID-based senders, show the pushName as display text since @mention won't work
-    return { text: `\n\n👤 *Sent by:* ${senderName}`, mentionId: senderId };
+  const phone = senderId.split('@')[0];
+  const domain = senderId.split('@')[1] || 's.whatsapp.net';
+  
+  // Check if this is a proper phone number (digits, possibly with + prefix)
+  // Phone-based JIDs look like: 919876543210@s.whatsapp.net
+  // LID-based JIDs look like: 120363047547742844@lid or long numbers @g.us participants
+  const isPhoneNumber = /^\d{7,15}$/.test(phone) && (domain === 's.whatsapp.net' || domain === 'c.us');
+  
+  if (isPhoneNumber) {
+    // This is a proper phone number - use @mention which creates a clickable link
+    return { text: `\n\n👤 *Sent by:* @${phone}`, mentionId: senderId };
+  } else {
+    // This is a LID or non-phone identifier - show the display name instead
+    // Don't create a broken @mention, just show the name
+    const displayName = senderName || phone;
+    return { text: `\n\n👤 *Sent by:* ${displayName}`, mentionId: null };
   }
-
-  // Normal phone-based sender - use @mention which creates a clickable link
-  return { text: `\n\n👤 *Sent by:* @${idPart}`, mentionId: senderId };
 }
 
 // ======================================================================
@@ -1453,7 +1445,7 @@ async function startBot() {
         SessionModel = mongoose.model('Session', sessionSchema);
       }
       log('🔧', '╔══════════════════════════════════════════╗');
-      log('🔧', '║  STARTUP HEAL: Cleaning session keys...  ║');
+      log('🔧', '║ STARTUP HEAL: Cleaning session keys...  ║');
       log('🔧', '╚══════════════════════════════════════════╝');
       const deleted = await nukeSessionKeysFromMongo();
       log('🔧', ` Startup heal complete. Removed ${deleted} stale keys.`);
@@ -1719,6 +1711,8 @@ function scheduleEmptyMessageRetry(msgId) {
 
     // Try to load the message from the store/socket
     try {
+      // Attempt to use sock.loadMessage if available, or just check if message arrived via update
+      // The main mechanism is messages.update event, but we also check here
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
         log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (source group: ${stillPending.chatId})`);
         pendingEmptyMessages.delete(msgId);
@@ -1726,17 +1720,6 @@ function scheduleEmptyMessageRetry(msgId) {
       }
 
       log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from source group`);
-
-      // 🔧 FIX ISSUE 3: Try to request message retry from WhatsApp
-      try {
-        if (sock && stillPending.msg && stillPending.msg.key) {
-          // Send a read receipt which can trigger re-delivery
-          await sock.readMessages([stillPending.msg.key]);
-        }
-      } catch (retryErr) {
-        // Non-critical, just log
-        log('⚠️', `Read receipt for retry failed (non-critical): ${retryErr.message}`);
-      }
 
       // Schedule next retry
       scheduleEmptyMessageRetry(msgId);
@@ -1748,12 +1731,12 @@ function scheduleEmptyMessageRetry(msgId) {
   }, retryDelay);
 }
 
-// Periodic cleanup for stale pending messages (older than 5 minutes)
+// Periodic cleanup for stale pending messages (older than 2 minutes)
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [msgId, pending] of pendingEmptyMessages) {
-    if (now - pending.timestamp > 300000) { // 5 minutes (increased from 2)
+    if (now - pending.timestamp > 120000) { // 2 minutes
       pendingEmptyMessages.delete(msgId);
       cleaned++;
     }
@@ -1786,16 +1769,6 @@ async function handleMessage(sock, msg) {
   const isGroup = chatId.endsWith('@g.us');
   if (isGroup) {
     log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
-  }
-
-  // 🔧 FIX ISSUE 2: For source groups, store the actual participant info
-  const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
-  if (isSourceGroup && msg.key.participant) {
-    const senderInfoKey = `${chatId}_${senderId}`;
-    sourceGroupSenderInfo.set(senderInfoKey, {
-      participantId: msg.key.participant,
-      pushName: msg.pushName || null
-    });
   }
 
   const content = unwrapMessage(msg.message);
@@ -2112,8 +2085,8 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   const isGroup = chatId.endsWith('@g.us');
 
   if (!storedContext) {
+    // 🔧 FIX #1: Updated expiry message from "30 min limit" to "12 hour limit"
     log('⚠️', `Context expired for ...${shortId}`);
-    // 🔧 FIX ISSUE 1: Updated expiry message from "30 min" to "12 hour"
     await sock.sendMessage(chatId, {
       text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
       mentions: [senderId]
@@ -2853,7 +2826,7 @@ ${primaryResponseText}
 
 
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.4              ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.3              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
@@ -2861,7 +2834,7 @@ console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)║')
 console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s)║');
 console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║');
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
-console.log('║     Use: . (3fps), .2 (2fps), .1 (1fps)                ║');
+console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
 console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
