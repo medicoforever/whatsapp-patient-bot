@@ -37,7 +37,7 @@ const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
   // 🔴 CHANGED TO STABLE MODEL to prevent 503 Overloaded errors
-  GEMINI_MODEL: 'gemini-3.1-flash-lite-preview',
+  GEMINI_MODEL: 'gemini-3-flash-preview',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -1342,26 +1342,13 @@ function formatJsonBlock(jsonData) {
   return `\n\n📋 *Quick Reference:*\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
 }
 
-// 🔧 FIX #2: Updated formatSenderContact to handle users without usernames properly
+// 🔧 FIX: Made all usernames correctly clickable, including @lid strings
 function formatSenderContact(senderId, senderName) {
   if (!senderId) return { text: '', mentionId: null };
-  const phone = senderId.split('@')[0];
-  const domain = senderId.split('@')[1] || 's.whatsapp.net';
-  
-  // Check if this is a proper phone number (digits, possibly with + prefix)
-  // Phone-based JIDs look like: 919876543210@s.whatsapp.net
-  // LID-based JIDs look like: 120363047547742844@lid or long numbers @g.us participants
-  const isPhoneNumber = /^\d{7,15}$/.test(phone) && (domain === 's.whatsapp.net' || domain === 'c.us');
-  
-  if (isPhoneNumber) {
-    // This is a proper phone number - use @mention which creates a clickable link
-    return { text: `\n\n👤 *Sent by:* @${phone}`, mentionId: senderId };
-  } else {
-    // This is a LID or non-phone identifier - show the display name instead
-    // Don't create a broken @mention, just show the name
-    const displayName = senderName || phone;
-    return { text: `\n\n👤 *Sent by:* ${displayName}`, mentionId: null };
-  }
+  const userString = senderId.split('@')[0];
+  // By always placing the @username and inserting senderId into mentions array,
+  // it generates a fully clickable whatsapp ping correctly.
+  return { text: `\n\n👤 *Sent by:* @${userString}`, mentionId: senderId };
 }
 
 // ======================================================================
@@ -1615,30 +1602,25 @@ async function startBot() {
           continue;
         }
 
-        // 🔧 DECRYPTION FAILURE DETECTION
+        // 🔧 DECRYPTION FAILURE DETECTION & UNIVERSAL RETRY LOGIC
         if (!msg.message) {
           const chatId = msg.key.remoteJid;
           if (chatId && chatId !== 'status@broadcast') {
-            const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
-            if (isSourceGroup) {
-              // 🔄 SOURCE GROUP: Queue for retry instead of skipping
-              log('⏳', `Empty message body from source group ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
-              if (msgId && !pendingEmptyMessages.has(msgId)) {
-                // Remove from processedMessageIds so it can be reprocessed on retry
-                processedMessageIds.delete(msgId);
-                pendingEmptyMessages.set(msgId, {
-                  msg: msg,
-                  retryCount: 0,
-                  chatId: chatId,
-                  timestamp: Date.now()
-                });
-                // Schedule first retry
-                scheduleEmptyMessageRetry(msgId);
-              }
-            } else {
-              log('⚠️', `Empty message body from ${chatId} (possible decryption failure)`);
-              trackDecryptionFailure();
+            // 🔄 ALL CHATS: Queue for retry to handle multi-device sync delays & transient decryption fails
+            log('⏳', `Empty message body from ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
+            if (msgId && !pendingEmptyMessages.has(msgId)) {
+              // Remove from processedMessageIds so it can be reprocessed on retry
+              processedMessageIds.delete(msgId);
+              pendingEmptyMessages.set(msgId, {
+                msg: msg,
+                retryCount: 0,
+                chatId: chatId,
+                timestamp: Date.now()
+              });
+              // Schedule first retry
+              scheduleEmptyMessageRetry(msgId);
             }
+            trackDecryptionFailure(); // Still trigger auto-heal threshold if failures persist
           }
           continue;
         }
@@ -1711,15 +1693,13 @@ function scheduleEmptyMessageRetry(msgId) {
 
     // Try to load the message from the store/socket
     try {
-      // Attempt to use sock.loadMessage if available, or just check if message arrived via update
-      // The main mechanism is messages.update event, but we also check here
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
-        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (source group: ${stillPending.chatId})`);
+        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (chat: ${stillPending.chatId})`);
         pendingEmptyMessages.delete(msgId);
         return;
       }
 
-      log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from source group`);
+      log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}...`);
 
       // Schedule next retry
       scheduleEmptyMessageRetry(msgId);
@@ -2098,13 +2078,19 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   // 🆕 GROUP CHAT REPLY: Exclusively use source media + user text, NO system instruction
   // ======================================================================
   if (isGroup) {
-    // Extract user's question text
+    // 🔧 FIX: Correctly parse question/text from media captions during group replies
     let userQuestion = '';
 
     if (messageType === 'conversation') {
       userQuestion = (content.conversation || '').trim();
     } else if (messageType === 'extendedTextMessage') {
       userQuestion = (content.extendedTextMessage?.text || '').trim();
+    } else if (messageType === 'imageMessage') {
+      userQuestion = (content.imageMessage?.caption || '').trim();
+    } else if (messageType === 'videoMessage') {
+      userQuestion = (content.videoMessage?.caption || '').trim();
+    } else if (messageType === 'documentMessage') {
+      userQuestion = (content.documentMessage?.caption || '').trim();
     }
 
     if (!userQuestion) {
@@ -2355,14 +2341,13 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
 
-// Helper Function for Gemini API Calls with Rotation
+// 🟢 NEW: Unified Helper Function for Gemini API Calls with Fallback logic
 async function generateGeminiContent(requestContent, systemInstruction) {
   const keys = CONFIG.API_KEYS;
   if (keys.length === 0) {
     throw new Error('No API keys configured!');
   }
 
-  let responseText = null;
   let lastErrorMsg = '';
 
   const safetySettings = [
@@ -2372,42 +2357,65 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
   ];
 
-  for (let i = 0; i < keys.length; i++) {
-    try {
-      if (i > 0) {
-        log('⚠️', `Waiting 2s before retrying with Backup Key #${i + 1}...`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
+  // Helper function to try sending a request across all keys with a specified model
+  const tryModel = async (modelName, useThinking) => {
+    for (let i = 0; i < keys.length; i++) {
+      try {
+        if (i > 0) {
+          log('⚠️', `Waiting 2s before retrying with Backup Key #${i + 1} (${modelName})...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+
+        const genAI = new GoogleGenerativeAI(keys[i]);
+        const modelConfig = {
+          model: modelName,
+          safetySettings: safetySettings
+        };
+        if (systemInstruction) {
+          modelConfig.systemInstruction = systemInstruction;
+        }
+        if (useThinking) {
+          modelConfig.generationConfig = {
+            thinkingConfig: { thinkingLevel: 'HIGH' }
+          };
+        }
+
+        const model = genAI.getGenerativeModel(modelConfig);
+        const result = await model.generateContent(requestContent);
+        const responseText = result.response.text();
+
+        if (!responseText) {
+          const feedback = JSON.stringify(result.response.promptFeedback || {});
+          throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
+        }
+
+        return responseText;
+
+      } catch (error) {
+        lastErrorMsg = error.message;
+        log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
       }
-
-      const genAI = new GoogleGenerativeAI(keys[i]);
-
-      // Build model config — only include systemInstruction if it's not null/undefined
-      const modelConfig = {
-        model: CONFIG.GEMINI_MODEL,
-        safetySettings: safetySettings
-      };
-      if (systemInstruction) {
-        modelConfig.systemInstruction = systemInstruction;
-      }
-
-      const model = genAI.getGenerativeModel(modelConfig);
-
-      const result = await model.generateContent(requestContent);
-      responseText = result.response.text();
-
-      if (!responseText) {
-        const feedback = JSON.stringify(result.response.promptFeedback || {});
-        throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
-      }
-
-      return responseText;
-
-    } catch (error) {
-      lastErrorMsg = error.message;
-      log('❌', `Key #${i + 1} failed: ${error.message}`);
     }
+    return null; // All keys failed for this model
+  };
+
+  // --- 1. Loop through keys using Primary Model ---
+  let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
+  if (responseText) {
+    return responseText;
   }
-  throw new Error(`All ${keys.length} API keys failed. Last error: ${lastErrorMsg}`);
+
+  log('⚠️', `All keys failed for primary model. Falling back to gemini-3.1-flash-lite-preview with HIGH thinking...`);
+
+  // --- 2. Loop through keys using Fallback Lite Model (High Thinking) ---
+  responseText = await tryModel('gemini-3.1-flash-lite-preview', true);
+  if (responseText) {
+    // Append fallback note string natively so it's always included automatically
+    return responseText + '\n\n_{fallback model gemini-3.1-flash-lite used}_';
+  }
+
+  // --- 3. Both models failed across all keys ---
+  throw new Error(`All ${keys.length} API keys failed for both primary and fallback models. Last error: ${lastErrorMsg}`);
 }
 
 async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
@@ -2826,7 +2834,7 @@ ${primaryResponseText}
 
 
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.3              ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.4              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
@@ -2841,7 +2849,8 @@ console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
 console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
 console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
 console.log('║  👤 SENDER CONTACT: @mention tag for source sender     ║');
-console.log('║  🔄 EMPTY MSG RETRY: Auto-retry empty source group msgs║');
+console.log('║  🔄 EMPTY MSG RETRY: Auto-retry empty messages globally║');
+console.log('║  ⚡ FALLBACK MODEL: Lite Model Auto-failover w/ HIGH T ║');
 console.log('║                                                        ║');
 console.log('║  ✨ Per-User Buffers - Each user processed separately  ║');
 console.log('║  ↩️ Reply to ask questions OR add context               ║');
