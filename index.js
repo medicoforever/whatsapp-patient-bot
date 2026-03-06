@@ -37,7 +37,7 @@ const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
   // 🔴 CHANGED TO STABLE MODEL to prevent 503 Overloaded errors
-  GEMINI_MODEL: 'gemini-3-flash-preview',
+  GEMINI_MODEL: 'gemini-3.1-flash-lite-preview',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
