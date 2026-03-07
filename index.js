@@ -74,8 +74,8 @@ const CONFIG = {
   DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
-  EMPTY_MSG_RETRY_DELAY_MS: 3000, // Wait 3 seconds before retry
-  EMPTY_MSG_MAX_RETRIES: 3, // Max retries for empty messages
+  EMPTY_MSG_RETRY_DELAY_MS: 5000, // Wait 5 seconds before retry
+  EMPTY_MSG_MAX_RETRIES: 10, // Max retries for empty messages (50s total buffer)
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -1601,34 +1601,41 @@ async function startBot() {
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
 
-        // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
         const msgId = msg.key.id;
+
+        // 🔧 DECRYPTION FAILURE DETECTION & UNIVERSAL RETRY LOGIC
+        if (!msg.message || Object.keys(msg.message).length === 0) {
+          const chatId = msg.key.remoteJid;
+          if (chatId && chatId !== 'status@broadcast') {
+            // 🔄 ALL CHATS: Queue for retry to handle multi-device sync delays & transient decryption fails
+            if (msgId) {
+              processedMessageIds.delete(msgId); // ALLOW IT TO BE PROCESSED ONCE CONTENT ARRIVES
+              if (!pendingEmptyMessages.has(msgId)) {
+                log('⏳', `Empty message body from ${chatId} — queuing for retry (msg: ${msgId.substring(0, 8)}...)`);
+                pendingEmptyMessages.set(msgId, {
+                  msg: msg,
+                  retryCount: 0,
+                  chatId: chatId,
+                  timestamp: Date.now()
+                });
+                scheduleEmptyMessageRetry(msgId);
+              }
+            }
+            trackDecryptionFailure(); // Trigger auto-heal threshold if failures persist
+          }
+          continue;
+        }
+
+        // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
         if (msgId && isMessageAlreadyProcessed(msgId)) {
           log('🔁', `Skipping duplicate message ${msgId.substring(0, 8)}...`);
           continue;
         }
 
-        // 🔧 DECRYPTION FAILURE DETECTION & UNIVERSAL RETRY LOGIC
-        if (!msg.message) {
-          const chatId = msg.key.remoteJid;
-          if (chatId && chatId !== 'status@broadcast') {
-            // 🔄 ALL CHATS: Queue for retry to handle multi-device sync delays & transient decryption fails
-            log('⏳', `Empty message body from ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
-            if (msgId && !pendingEmptyMessages.has(msgId)) {
-              // Remove from processedMessageIds so it can be reprocessed on retry
-              processedMessageIds.delete(msgId);
-              pendingEmptyMessages.set(msgId, {
-                msg: msg,
-                retryCount: 0,
-                chatId: chatId,
-                timestamp: Date.now()
-              });
-              // Schedule first retry
-              scheduleEmptyMessageRetry(msgId);
-            }
-            trackDecryptionFailure(); // Still trigger auto-heal threshold if failures persist
-          }
-          continue;
+        // Check if this was previously an empty message that now has body in upsert
+        if (msgId && pendingEmptyMessages.has(msgId)) {
+          pendingEmptyMessages.delete(msgId);
+          log('✅', `Pending empty message ${msgId.substring(0, 8)}... now has content!`);
         }
 
         try {
@@ -1658,9 +1665,7 @@ async function startBot() {
 
           // Remove from pending
           pendingEmptyMessages.delete(msgId);
-
-          // Check dedup - remove from processed so it can be handled
-          processedMessageIds.delete(msgId);
+          processedMessageIds.delete(msgId); // Ensure deduplicator allows processing
 
           // Now process it
           if (!fullMsg.key.fromMe && !isMessageAlreadyProcessed(msgId)) {
@@ -1689,15 +1694,14 @@ function scheduleEmptyMessageRetry(msgId) {
   const pending = pendingEmptyMessages.get(msgId);
   if (!pending) return;
 
-  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS * (pending.retryCount + 1); // Progressive delay
+  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS; // Constant 5s intervals
 
   setTimeout(async () => {
     const stillPending = pendingEmptyMessages.get(msgId);
-    if (!stillPending) return; // Already resolved via messages.update
+    if (!stillPending) return; // Already resolved via messages.update or upsert
 
     stillPending.retryCount++;
 
-    // Try to load the message from the store/socket
     try {
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
         log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (chat: ${stillPending.chatId})`);
@@ -1733,15 +1737,35 @@ setInterval(() => {
 }, 60000);
 // ======================================================================
 
-// 🟢 FIX: Helper to unwrap nested messages (ViewOnce, Ephemeral, etc.)
+// 🟢 FIX: Helper to unwrap nested messages robustly
 const unwrapMessage = (m) => {
   if (!m) return null;
+  if (m.message) return unwrapMessage(m.message); // Some messages are nested in .message
   if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
   if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
+  if (m.viewOnceMessageV2Extension?.message) return unwrapMessage(m.viewOnceMessageV2Extension.message);
   if (m.ephemeralMessage?.message) return unwrapMessage(m.ephemeralMessage.message);
   if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
   return m;
 };
+
+// 🟢 FIX: Helper to accurately determine the message type, ignoring metadata keys
+function getMessageType(content) {
+  if (!content) return null;
+  const keys = Object.keys(content);
+  const validTypes = [
+    'imageMessage',
+    'videoMessage',
+    'audioMessage',
+    'documentMessage',
+    'extendedTextMessage',
+    'conversation'
+  ];
+  for (const type of validTypes) {
+    if (keys.includes(type)) return type;
+  }
+  return keys[0];
+}
 
 async function handleMessage(sock, msg) {
   const chatId = msg.key.remoteJid;
@@ -1759,26 +1783,20 @@ async function handleMessage(sock, msg) {
 
   const content = unwrapMessage(msg.message);
 
-  if (!content) {
+  if (!content || Object.keys(content).length === 0) {
     return;
   }
 
-  const messageType = Object.keys(content)[0];
+  const messageType = getMessageType(content);
 
   let quotedMessageId = null;
-  let contextInfo = null;
-
-  if (messageType === 'extendedTextMessage') {
-    contextInfo = content.extendedTextMessage?.contextInfo;
-  } else if (messageType === 'imageMessage') {
-    contextInfo = content.imageMessage?.contextInfo;
-  } else if (messageType === 'documentMessage') {
-    contextInfo = content.documentMessage?.contextInfo;
-  } else if (messageType === 'audioMessage') {
-    contextInfo = content.audioMessage?.contextInfo;
-  } else if (messageType === 'videoMessage') {
-    contextInfo = content.videoMessage?.contextInfo;
-  }
+  // 🟢 FIX: Safe universal contextInfo extraction (fixes missing reply detection)
+  let contextInfo = content.extendedTextMessage?.contextInfo ||
+                    content.imageMessage?.contextInfo ||
+                    content.videoMessage?.contextInfo ||
+                    content.audioMessage?.contextInfo ||
+                    content.documentMessage?.contextInfo ||
+                    content[messageType]?.contextInfo;
 
   if (contextInfo?.stanzaId) {
     quotedMessageId = contextInfo.stanzaId;
@@ -2062,6 +2080,9 @@ async function handleMessage(sock, msg) {
       log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
       resetUserTimeout(chatId, senderId, senderName);
     }
+  }
+  else {
+    log('📎', `Skipping unhandled/system message type: ${messageType}`);
   }
 }
 
@@ -2835,12 +2856,8 @@ ${primaryResponseText}
   }
 }
 
-
-
-
-
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.4              ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.5              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
