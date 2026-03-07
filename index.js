@@ -51,9 +51,9 @@ const CONFIG = {
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
   AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
 
-  // 🔧 FIX #1: Changed from 30 minutes to 12 hours to match media viewer expiry
+  // 🔗 Retention & expiry timeouts: 12 hours
   CONTEXT_RETENTION_MS: 12 * 60 * 60 * 1000, // 12 hours
-  MAX_STORED_CONTEXTS: 20,
+  MAX_STORED_CONTEXTS: 1000, // 🔧 Increased from 20 to 1000 to prevent premature eviction
   COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
   TYPING_DELAY_MIN: 3000,
   TYPING_DELAY_MAX: 6000,
@@ -745,6 +745,7 @@ function storeContext(chatId, messageId, mediaFiles, response, senderId) {
 
   const contexts = chatContexts.get(chatId);
 
+  // 🔧 LIMIT PREMATURE EXPIRY: Store up to 1000 contexts to safely cover 12h
   if (contexts.size >= CONFIG.MAX_STORED_CONTEXTS) {
     const entries = Array.from(contexts.entries());
     entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
@@ -794,9 +795,10 @@ function trackBotMessage(chatId, messageId) {
   botMessageIds.get(chatId).add(messageId);
 
   const ids = botMessageIds.get(chatId);
-  if (ids.size > 100) {
+  // 🔧 BUMPED to 2000 so the bot doesn't forget its own messages prematurely
+  if (ids.size > 2000) {
     const arr = Array.from(ids);
-    arr.slice(0, 50).forEach(id => ids.delete(id));
+    arr.slice(0, 1000).forEach(id => ids.delete(id));
   }
 }
 
@@ -1342,13 +1344,17 @@ function formatJsonBlock(jsonData) {
   return `\n\n📋 *Quick Reference:*\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
 }
 
-// 🔧 FIX: Made all usernames correctly clickable, including @lid strings
+// 🔧 FIX: Made all usernames correctly clickable, explicitly maps the JID @string into text
 function formatSenderContact(senderId, senderName) {
   if (!senderId) return { text: '', mentionId: null };
   const userString = senderId.split('@')[0];
-  // By always placing the @username and inserting senderId into mentions array,
-  // it generates a fully clickable whatsapp ping correctly.
-  return { text: `\n\n👤 *Sent by:* @${userString}`, mentionId: senderId };
+  
+  // Use @userString and include senderName to be readable.
+  // Using the strict "@numericalId" text natively signals the WhatsApp client to hook it to the mentionId.
+  const namePart = senderName && senderName !== userString ? ` (${senderName})` : '';
+  const displayString = `\n\n👤 *Sent by:* @${userString}${namePart}`;
+  
+  return { text: displayString, mentionId: senderId };
 }
 
 // ======================================================================
