@@ -284,14 +284,25 @@ async function triggerSessionHeal(reason = 'threshold') {
       log('🔧', ` Cleared corrupted keys from Database. Auth creds preserved ✅`);
     }
 
-    // 🛡️ CRITICAL FIX: To fix "Bad MAC", we must flush Baileys memory cache.
-    // The only safe way to do this in Render is to restart the Node process.
-    log('🔄', ' Restarting process to flush Baileys memory cache and negotiate fresh keys...');
+    log('🔄', ' Soft Rebooting WhatsApp socket to flush memory cache...');
     
-    // Give logs time to print before exiting
+    // 🛡️ THE RENDER-SAFE FIX: We destroy the current socket and softly boot a new one
+    // WITHOUT exiting the Node.js process so Render doesn't crash the server.
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners();
+            sock.ws.close();
+        } catch (e) {}
+    }
+    
     setTimeout(() => {
-      process.exit(1); 
-    }, 2000);
+        startBot();
+    }, 3000);
+
+    setTimeout(() => {
+      isHealingInProgress = false;
+      log('🔧', ' Heal cooldown complete.');
+    }, 30000);
 
   } catch (error) {
     log('❌', ` Heal error: ${error.message}`);
@@ -1476,18 +1487,17 @@ async function startBot() {
     }
 
     // 🛑 NEW: EMERGENCY RESET OVERRIDE
-    // If you add FORCE_RESET_AUTH=true in Render, it wipes the DB and cleanly restarts
     if (process.env.FORCE_RESET_AUTH === 'true') {
         log('⚠️', 'EMERGENCY OVERRIDE TRIGGERED: FORCE_RESET_AUTH=true');
         if (!SessionModel && mongoConnected) {
             SessionModel = mongoose.model('Session', sessionSchema);
         }
         await aggressiveAuthWipe();
-        log('🛑', 'Database completely wiped. Exiting process so Render restarts clean. IMPORTANT: Go remove FORCE_RESET_AUTH from Render Dashboard!');
-        process.exit(1);
+        log('🛑', 'Database completely wiped. Please remove FORCE_RESET_AUTH from Render Dashboard!');
+        return; 
     }
 
-    // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
+    // ONE-TIME STARTUP HEAL
     if (!startupHealDone && mongoConnected) {
       if (!SessionModel) {
         SessionModel = mongoose.model('Session', sessionSchema);
@@ -1565,9 +1575,9 @@ async function startBot() {
       auth: state,
       logger: baileysLogger,
       browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
-      markOnlineOnConnect: true, // 🔥 Force presence sync to wake up keys
+      markOnlineOnConnect: true, 
       syncFullHistory: false,
-      keepAliveIntervalMs: 25000, // 🔥 Crucial for Render: Keeps socket from dropping
+      keepAliveIntervalMs: 25000, 
       retryRequestDelayMs: 2000,
       getMessage: async (key) => {
         return { conversation: '' };
@@ -1606,6 +1616,7 @@ async function startBot() {
           statusCode === 401 ||
           statusCode === 405;
 
+        // 🛡️ NO process.exit() used below! We use "Soft Reboots" for Render Compatibility.
         if (loggedOut) {
           log('🚨', 'FATAL ERROR: Session logged out or Crypto-Desync (401/405).');
           botStatus = 'Logged out - wiping session...';
@@ -1613,20 +1624,19 @@ async function startBot() {
           if (authState?.clearAll) {
             await authState.clearAll();
           }
-          await aggressiveAuthWipe(); // Ensure it's completely dead in MongoDB
+          await aggressiveAuthWipe(); 
 
-          log('🔄', 'Restarting container to generate fresh QR code cleanly...');
-          process.exit(1); // Force process restart to flush bad memory
+          log('🔄', 'Restarting to generate fresh QR code cleanly...');
+          setTimeout(startBot, 5000); 
         } else {
-          if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
+          if (statusCode === 428 || statusCode === 515) {
             log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
+            // Only clear keys if it's actually 428 (Precondition Required) or 515
             await nukeSessionKeysFromMongo();
-            log('🔄', 'Restarting node process to flush Baileys memory cache...');
-            process.exit(1); // 🛡️ CRITICAL for 428/Bad MAC memory wipe
-          } else {
-            log('🔄', `Reconnecting in 5 seconds...`);
-            setTimeout(startBot, 5000);
           }
+          
+          log('🔄', `Reconnecting in 5 seconds...`);
+          setTimeout(startBot, 5000); 
         }
 
       } else if (connection === 'open') {
@@ -1839,7 +1849,7 @@ async function handleMessage(sock, msg) {
 
   const isGroup = chatId.endsWith('@g.us');
   if (isGroup) {
-    log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
+    // Suppressed the global chat log spam to make debugging cleaner
   }
 
   const content = unwrapMessage(msg.message);
@@ -2141,7 +2151,7 @@ async function handleMessage(sock, msg) {
       } catch (e) {}
     }
     else {
-      log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+      // log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
       const count = addToUserBuffer(chatId, senderId, {
         type: 'text',
@@ -3003,6 +3013,5 @@ if (CONFIG.API_KEYS.length === 0) {
   } catch (error) {
     log('💥', `Startup error: ${error.message}`);
     console.error(error);
-    process.exit(1);
   }
 })();
