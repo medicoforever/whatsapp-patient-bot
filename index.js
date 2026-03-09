@@ -281,22 +281,17 @@ async function triggerSessionHeal(reason = 'threshold') {
     decryptFailTimestamps = [];
 
     if (deleted > 0) {
-      log('🔧', ` Cleared ${deleted} corrupted keys. Auth creds preserved ✅`);
+      log('🔧', ` Cleared corrupted keys from Database. Auth creds preserved ✅`);
     }
 
-    if (sock) {
-      log('🔄', ' Forcing socket disconnect to renegotiate encryption...');
-      try {
-        sock.end(new Error(`428`)); // 428 tells the bot to reconnect safely
-      } catch (e) {
-        log('⚠️', ` Socket close: ${e.message}`);
-      }
-    }
-
+    // 🛡️ CRITICAL FIX: To fix "Bad MAC", we must flush Baileys memory cache.
+    // The only safe way to do this in Render is to restart the Node process.
+    log('🔄', ' Restarting process to flush Baileys memory cache and negotiate fresh keys...');
+    
+    // Give logs time to print before exiting
     setTimeout(() => {
-      isHealingInProgress = false;
-      log('🔧', ' Heal cooldown complete.');
-    }, 30000);
+      process.exit(1); 
+    }, 2000);
 
   } catch (error) {
     log('❌', ` Heal error: ${error.message}`);
@@ -515,7 +510,7 @@ async function useMongoDBAuthState() {
     },
     saveCreds: async () => {
       await writeData('auth_creds', creds);
-      log('💾', 'Credentials saved to MongoDB');
+      // 🔇 Muted the constant console spam for standard saving
     },
     clearAll,
     clearSessionKeys
@@ -1626,9 +1621,12 @@ async function startBot() {
           if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
             log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
             await nukeSessionKeysFromMongo();
+            log('🔄', 'Restarting node process to flush Baileys memory cache...');
+            process.exit(1); // 🛡️ CRITICAL for 428/Bad MAC memory wipe
+          } else {
+            log('🔄', `Reconnecting in 5 seconds...`);
+            setTimeout(startBot, 5000);
           }
-          log('🔄', `Reconnecting in 5 seconds...`);
-          setTimeout(startBot, 5000);
         }
 
       } else if (connection === 'open') {
@@ -1643,7 +1641,6 @@ async function startBot() {
 
         if (authState?.saveCreds) {
           await authState.saveCreds();
-          log('💾', 'Credentials saved');
         }
 
         log('🌍', 'Universal Mode: Bot is active for ALL chats.');
@@ -2158,7 +2155,11 @@ async function handleMessage(sock, msg) {
     }
   }
   else {
-    log('📎', `Skipping unhandled/system message type: ${messageType}`);
+    // 🔇 Mute internal system protocols in console to prevent log spam
+    const ignored = ['protocolMessage', 'senderKeyDistributionMessage', 'messageContextInfo', 'reactionMessage', 'pollCreationMessage', 'pollUpdateMessage'];
+    if (!ignored.includes(messageType)) {
+        log('📎', `Skipping unhandled/system message type: ${messageType}`);
+    }
   }
 }
 
@@ -2168,7 +2169,6 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   const isGroup = chatId.endsWith('@g.us');
 
   if (!storedContext) {
-    // 🔧 FIX #1: Updated expiry message from "30 min limit" to "12 hour limit"
     log('⚠️', `Context expired for ...${shortId}`);
     if (!isConnected || !sock) return;
     try {
@@ -2184,7 +2184,6 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   // 🆕 GROUP CHAT REPLY: Exclusively use source media + user text, NO system instruction
   // ======================================================================
   if (isGroup) {
-    // 🔧 FIX: Correctly parse question/text from media captions during group replies
     let userQuestion = '';
 
     if (messageType === 'conversation') {
