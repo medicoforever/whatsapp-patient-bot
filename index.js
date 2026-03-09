@@ -23,6 +23,16 @@ const getApiKeys = () => {
   return keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
 };
 
+// 🟢 HELPER: Clean Group IDs automatically to prevent Render config errors
+const cleanGroupId = (id) => {
+  if (!id) return undefined;
+  let clean = id.toString().trim();
+  if (clean && !clean.includes('@')) {
+    clean += '@g.us'; // Automatically add suffix if missing
+  }
+  return clean;
+};
+
 // ======================================================================
 // 🟢 NEW CONFIGURATION AREA
 // ======================================================================
@@ -40,12 +50,12 @@ const CONFIG = {
   GEMINI_MODEL: 'gemini-3-flash-preview',
   MONGODB_URI: process.env.MONGODB_URI,
 
-  // Group Routing Configuration
+  // Group Routing Configuration (Automatically fixed formatting)
   GROUPS: {
-    CT_SOURCE: process.env.GROUP_CT_SOURCE,
-    CT_TARGET: process.env.GROUP_CT_TARGET,
-    MRI_SOURCE: process.env.GROUP_MRI_SOURCE,
-    MRI_TARGET: process.env.GROUP_MRI_TARGET
+    CT_SOURCE: cleanGroupId(process.env.GROUP_CT_SOURCE),
+    CT_TARGET: cleanGroupId(process.env.GROUP_CT_TARGET),
+    MRI_SOURCE: cleanGroupId(process.env.GROUP_MRI_SOURCE),
+    MRI_TARGET: cleanGroupId(process.env.GROUP_MRI_TARGET)
   },
 
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
@@ -240,6 +250,21 @@ async function nukeSessionKeysFromMongo() {
   } catch (error) {
     log('❌', ` Failed to nuke keys: ${error.message}`);
     return 0;
+  }
+}
+
+// 🛡️ NEW: Total Wipe for corrupted auth state
+async function aggressiveAuthWipe() {
+  log('🚨', '[AUTO-HEAL] Initiating aggressive MongoDB Auth Wipe...');
+  try {
+      if (SessionModel) {
+          await SessionModel.collection.drop();
+          log('🗑️', '[AUTO-HEAL] Dropped whatsapp_sessions collection entirely.');
+      }
+  } catch (e) {
+      if (e.code !== 26) { // Code 26 is NamespaceNotFound (already dropped)
+          log('❌', `[AUTO-HEAL] Wipe error: ${e.message}`);
+      }
   }
 }
 
@@ -1432,6 +1457,18 @@ async function startBot() {
       await connectMongoDB();
     }
 
+    // 🛑 NEW: EMERGENCY RESET OVERRIDE
+    // If you add FORCE_RESET_AUTH=true in Render, it wipes the DB and cleanly restarts
+    if (process.env.FORCE_RESET_AUTH === 'true') {
+        log('⚠️', 'EMERGENCY OVERRIDE TRIGGERED: FORCE_RESET_AUTH=true');
+        if (!SessionModel && mongoConnected) {
+            SessionModel = mongoose.model('Session', sessionSchema);
+        }
+        await aggressiveAuthWipe();
+        log('🛑', 'Database completely wiped. Exiting process so Render restarts clean. IMPORTANT: Go remove FORCE_RESET_AUTH from Render Dashboard!');
+        process.exit(1);
+    }
+
     // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
     if (!startupHealDone && mongoConnected) {
       if (!SessionModel) {
@@ -1550,15 +1587,16 @@ async function startBot() {
           statusCode === 405;
 
         if (loggedOut) {
-          log('🔐', 'Session logged out - clearing credentials...');
-          botStatus = 'Logged out - clearing session...';
+          log('🚨', 'FATAL ERROR: Session logged out or Crypto-Desync (401/405).');
+          botStatus = 'Logged out - wiping session...';
 
           if (authState?.clearAll) {
             await authState.clearAll();
           }
+          await aggressiveAuthWipe(); // Ensure it's completely dead in MongoDB
 
-          log('🔄', 'Restarting with fresh session in 5 seconds...');
-          setTimeout(startBot, 5000);
+          log('🔄', 'Restarting container to generate fresh QR code cleanly...');
+          process.exit(1); // Force process restart to flush bad memory
         } else {
           if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
             log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
@@ -1584,8 +1622,8 @@ async function startBot() {
         }
 
         log('🌍', 'Universal Mode: Bot is active for ALL chats.');
-        if (CONFIG.GROUPS.CT_SOURCE) log('🏥', 'Monitoring CT Source Group');
-        if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
+        if (CONFIG.GROUPS.CT_SOURCE) log('🏥', `Monitoring CT Source Group: ${CONFIG.GROUPS.CT_SOURCE}`);
+        if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', `Monitoring MRI Source Group: ${CONFIG.GROUPS.MRI_SOURCE}`);
       }
     });
 
@@ -2857,7 +2895,7 @@ ${primaryResponseText}
 }
 
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.5              ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.6              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
@@ -2869,6 +2907,7 @@ console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
 console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
+console.log('║  🛡️ AUTO-WIPE: Force restarts if logged out / 401 error ║');
 console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
 console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
 console.log('║  👤 SENDER CONTACT: @mention tag for source sender     ║');
