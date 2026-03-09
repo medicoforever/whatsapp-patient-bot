@@ -234,7 +234,7 @@ function trackDecryptionFailure() {
 
   if (decryptFailTimestamps.length >= CONFIG.DECRYPT_FAIL_THRESHOLD && !isHealingInProgress) {
     log('🚨', `Decryption failure threshold reached (${decryptFailTimestamps.length} failures in ${CONFIG.DECRYPT_FAIL_WINDOW_MS / 1000}s). Triggering auto-heal...`);
-    triggerSessionHeal();
+    triggerSessionHeal('threshold');
   }
 }
 
@@ -710,6 +710,13 @@ function resetUserTimeout(chatId, senderId, senderName) {
   const shortId = getShortSenderId(senderId);
 
   const timeoutCallback = async () => {
+    // 🛡️ CRITICAL FIX: Ensure socket isn't closed before doing work
+    if (!isConnected || !sock) {
+        log('⚠️', 'Socket disconnected. Delaying auto-process by 10s...');
+        chatTimeoutMap.set(senderId, setTimeout(timeoutCallback, 10000));
+        return;
+    }
+
     if (isAutoGroup) {
       const mediaFiles = clearUserBuffer(chatId, senderId);
       if (mediaFiles.length > 0) {
@@ -2063,50 +2070,62 @@ async function handleMessage(sock, msg) {
         }
 
       } else {
-        await sock.sendMessage(chatId, {
-          text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
-          mentions: [senderId]
-        });
+        if (!isConnected || !sock) return;
+        try {
+            await sock.sendMessage(chatId, {
+            text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
+            mentions: [senderId]
+            });
+        } catch(e) {}
       }
     }
     else if (text.toLowerCase() === 'help' || text === '?') {
-      await sock.sendMessage(chatId, {
-        text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
-      });
+      if (!isConnected || !sock) return;
+      try {
+          await sock.sendMessage(chatId, {
+            text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
+          });
+      } catch (e) {}
     }
     else if (text.toLowerCase() === 'clear') {
       const userItems = clearUserBuffer(chatId, senderId);
       clearUserTimeout(chatId, senderId);
 
-      if (userItems.length > 0) {
-        const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
-        userItems.forEach(m => {
-          if (m.type === 'image') counts.images++;
-          else if (m.type === 'pdf') counts.pdfs++;
-          else if (m.type === 'audio' || m.type === 'voice') counts.audio++;
-          else if (m.type === 'video') counts.video++;
-          else if (m.type === 'text') counts.texts++;
-        });
+      if (!isConnected || !sock) return;
+      try {
+          if (userItems.length > 0) {
+            const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
+            userItems.forEach(m => {
+              if (m.type === 'image') counts.images++;
+              else if (m.type === 'pdf') counts.pdfs++;
+              else if (m.type === 'audio' || m.type === 'voice') counts.audio++;
+              else if (m.type === 'video') counts.video++;
+              else if (m.type === 'text') counts.texts++;
+            });
 
-        await sock.sendMessage(chatId, {
-          text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
-          mentions: [senderId]
-        });
-      } else {
-        await sock.sendMessage(chatId, {
-          text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
-          mentions: [senderId]
-        });
-      }
+            await sock.sendMessage(chatId, {
+              text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
+              mentions: [senderId]
+            });
+          } else {
+            await sock.sendMessage(chatId, {
+              text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
+              mentions: [senderId]
+            });
+          }
+      } catch(e) {}
     }
     else if (text.toLowerCase() === 'status') {
+      if (!isConnected || !sock) return;
       const stats = getTotalBufferStats(chatId);
       const userCount = getUserBufferCount(chatId, senderId);
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
-      await sock.sendMessage(chatId, {
-        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
-      });
+      try {
+          await sock.sendMessage(chatId, {
+            text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
+          });
+      } catch (e) {}
     }
     else {
       log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
@@ -2135,10 +2154,13 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   if (!storedContext) {
     // 🔧 FIX #1: Updated expiry message from "30 min limit" to "12 hour limit"
     log('⚠️', `Context expired for ...${shortId}`);
-    await sock.sendMessage(chatId, {
-      text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
-      mentions: [senderId]
-    });
+    if (!isConnected || !sock) return;
+    try {
+        await sock.sendMessage(chatId, {
+        text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
+        mentions: [senderId]
+        });
+    } catch(e) {}
     return;
   }
 
@@ -2162,10 +2184,13 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     }
 
     if (!userQuestion) {
-      await sock.sendMessage(chatId, {
-        text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
-        mentions: [senderId]
-      });
+      if (!isConnected || !sock) return;
+      try {
+          await sock.sendMessage(chatId, {
+            text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
+            mentions: [senderId]
+          });
+      } catch(e) {}
       return;
     }
 
@@ -2192,6 +2217,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       : [userQuestion];
 
     try {
+      if (!isConnected || !sock) return;
       await sock.sendPresenceUpdate('composing', chatId);
 
       log('🔄', `Group reply (NO system instruction): Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
@@ -2199,6 +2225,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       // Call Gemini with NO system instruction (null)
       const responseText = await generateGeminiContent(requestContent, null);
 
+      if (!isConnected || !sock) return;
       await sock.sendPresenceUpdate('paused', chatId);
 
       let finalText = responseText.length <= 60000
@@ -2226,10 +2253,13 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
     } catch (error) {
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
-      await sock.sendMessage(chatId, {
-        text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: [senderId]
-      });
+      if (!isConnected || !sock) return;
+      try {
+          await sock.sendMessage(chatId, {
+            text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
+            mentions: [senderId]
+          });
+      } catch(e) {}
     }
 
     return;
@@ -2393,10 +2423,13 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   }
 
   if (newContent.length === 0) {
-    await sock.sendMessage(chatId, {
-      text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
-      mentions: [senderId]
-    });
+    if (!isConnected || !sock) return;
+    try {
+        await sock.sendMessage(chatId, {
+        text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
+        mentions: [senderId]
+        });
+    } catch(e) {}
     return;
   }
 
@@ -2696,6 +2729,12 @@ ${allOriginalText.join('\n\n')}
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
     const rawPrimaryResponse = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
 
+    // 🛡️ CRITICAL FIX: Ensure socket is connected before trying to send the response
+    if (!isConnected || !sock) {
+        log('⚠️', `Socket disconnected during AI generation. Canceling message output for ...${shortId}`);
+        return;
+    }
+
     // Parse JSON from response
     const jsonData = parseJsonFromResponse(rawPrimaryResponse);
     const primaryResponseText = stripJsonFromResponse(rawPrimaryResponse);
@@ -2740,6 +2779,12 @@ ${primaryResponseText}
 
       const secondaryRequestContent = [secondaryPrompt];
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
+
+      // 🛡️ Ensure socket is still connected
+      if (!isConnected || !sock) {
+          log('⚠️', `Socket disconnected during Step 2 AI generation. Canceling output for ...${shortId}`);
+          return;
+      }
 
       // Build mentions array for secondary message
       const step2Mentions = [senderId];
@@ -2866,34 +2911,44 @@ ${primaryResponseText}
 
   } catch (error) {
     log('❌', `Error for ...${shortId}: ${error.message}`);
-    console.error(error);
+    // console.error(error); // Un-comment if you want detailed traces in console
 
-    if (retryAttempt === 0) {
-      log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
-
-      await sock.sendPresenceUpdate('composing', destinationChatId);
-      await new Promise(r => setTimeout(r, 1000));
-
-      await sock.sendMessage(destinationChatId, {
-        text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
-        mentions: [senderId]
-      });
-
-      setTimeout(() => {
-        log('🔄', `Executing 5-minute retry for ...${shortId}`);
-        processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
-      }, 300000);
-
-      return;
+    // 🛡️ CRITICAL FIX: Ensure socket is connected before trying to send error notifications
+    if (!isConnected || !sock) {
+        log('⚠️', `Socket disconnected. Cannot send error notification to ...${shortId}`);
+        return;
     }
 
-    await sock.sendPresenceUpdate('composing', destinationChatId);
-    await new Promise(r => setTimeout(r, 1500));
+    try {
+        if (retryAttempt === 0) {
+          log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
 
-    await sock.sendMessage(destinationChatId, {
-      text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-      mentions: [senderId]
-    });
+          await sock.sendPresenceUpdate('composing', destinationChatId);
+          await new Promise(r => setTimeout(r, 1000));
+
+          await sock.sendMessage(destinationChatId, {
+            text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
+            mentions: [senderId]
+          });
+
+          setTimeout(() => {
+            log('🔄', `Executing 5-minute retry for ...${shortId}`);
+            processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
+          }, 300000);
+
+          return;
+        }
+
+        await sock.sendPresenceUpdate('composing', destinationChatId);
+        await new Promise(r => setTimeout(r, 1500));
+
+        await sock.sendMessage(destinationChatId, {
+          text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
+          mentions: [senderId]
+        });
+    } catch (fallbackError) {
+        log('❌', `Failed to send error notification to ...${shortId}: ${fallbackError.message}`);
+    }
   }
 }
 
