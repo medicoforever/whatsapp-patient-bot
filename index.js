@@ -554,6 +554,22 @@ function isMessageAlreadyProcessed(msgId) {
 const pendingEmptyMessages = new Map(); // msgId -> { msg, retryCount, chatId, timestamp }
 // ======================================================================
 
+// 🛡️ WAIT FOR CONNECTION HELPER (PREVENTS RESPONSE LOSS)
+async function waitUntilConnected() {
+  if (isConnected && sock) return;
+  log('⏳', `Pausing AI response delivery until WhatsApp reconnects...`);
+  let waitTime = 0;
+  // Wait up to 2 minutes
+  while ((!isConnected || !sock) && waitTime < 120000) {
+    await new Promise(r => setTimeout(r, 2000));
+    waitTime += 2000;
+  }
+  if (!isConnected || !sock) {
+    throw new Error('WhatsApp connection could not be restored within 2 minutes.');
+  }
+  log('✅', `Connection restored. Resuming AI response delivery!`);
+}
+
 let sock = null;
 let isConnected = false;
 let qrCodeDataURL = null;
@@ -710,7 +726,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
   const shortId = getShortSenderId(senderId);
 
   const timeoutCallback = async () => {
-    // 🛡️ CRITICAL FIX: Ensure socket isn't closed before doing work
+    // 🛡️ Defers starting the process if socket is down, so tokens aren't wasted early
     if (!isConnected || !sock) {
         log('⚠️', 'Socket disconnected. Delaying auto-process by 10s...');
         chatTimeoutMap.set(senderId, setTimeout(timeoutCallback, 10000));
@@ -2225,7 +2241,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       // Call Gemini with NO system instruction (null)
       const responseText = await generateGeminiContent(requestContent, null);
 
-      if (!isConnected || !sock) return;
+      await waitUntilConnected(); // 🛡️ PAUSE IF DISCONNECTED
       await sock.sendPresenceUpdate('paused', chatId);
 
       let finalText = responseText.length <= 60000
@@ -2729,11 +2745,8 @@ ${allOriginalText.join('\n\n')}
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
     const rawPrimaryResponse = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
 
-    // 🛡️ CRITICAL FIX: Ensure socket is connected before trying to send the response
-    if (!isConnected || !sock) {
-        log('⚠️', `Socket disconnected during AI generation. Canceling message output for ...${shortId}`);
-        return;
-    }
+    // 🛡️ CRITICAL FIX: DO NOT DISMISS. Wait for socket to restore if healing.
+    await waitUntilConnected();
 
     // Parse JSON from response
     const jsonData = parseJsonFromResponse(rawPrimaryResponse);
@@ -2781,10 +2794,7 @@ ${primaryResponseText}
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
 
       // 🛡️ Ensure socket is still connected
-      if (!isConnected || !sock) {
-          log('⚠️', `Socket disconnected during Step 2 AI generation. Canceling output for ...${shortId}`);
-          return;
-      }
+      await waitUntilConnected();
 
       // Build mentions array for secondary message
       const step2Mentions = [senderId];
@@ -2913,32 +2923,33 @@ ${primaryResponseText}
     log('❌', `Error for ...${shortId}: ${error.message}`);
     // console.error(error); // Un-comment if you want detailed traces in console
 
-    // 🛡️ CRITICAL FIX: Ensure socket is connected before trying to send error notifications
-    if (!isConnected || !sock) {
-        log('⚠️', `Socket disconnected. Cannot send error notification to ...${shortId}`);
-        return;
-    }
-
-    try {
-        if (retryAttempt === 0) {
-          log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
-
+    if (retryAttempt === 0) {
+      log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
+      
+      try {
+          await waitUntilConnected(); // Wait to send notification
           await sock.sendPresenceUpdate('composing', destinationChatId);
           await new Promise(r => setTimeout(r, 1000));
 
           await sock.sendMessage(destinationChatId, {
-            text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
+            text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model or connection is currently unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
             mentions: [senderId]
           });
+      } catch (fallbackError) {
+          log('⚠️', `Could not send 5-min retry warning to ...${shortId}, but scheduling anyway.`);
+      }
 
-          setTimeout(() => {
-            log('🔄', `Executing 5-minute retry for ...${shortId}`);
-            processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
-          }, 300000);
+      // Schedule the retry regardless of whether the notification worked
+      setTimeout(() => {
+        log('🔄', `Executing 5-minute retry for ...${shortId}`);
+        processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
+      }, 300000);
 
-          return;
-        }
+      return;
+    }
 
+    try {
+        await waitUntilConnected();
         await sock.sendPresenceUpdate('composing', destinationChatId);
         await new Promise(r => setTimeout(r, 1500));
 
@@ -2946,8 +2957,8 @@ ${primaryResponseText}
           text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
           mentions: [senderId]
         });
-    } catch (fallbackError) {
-        log('❌', `Failed to send error notification to ...${shortId}: ${fallbackError.message}`);
+    } catch (finalError) {
+        log('❌', `Failed to send final error notification to ...${shortId}: ${finalError.message}`);
     }
   }
 }
