@@ -563,9 +563,9 @@ const pendingEmptyMessages = new Map(); // msgId -> { msg, retryCount, chatId, t
 // 🛡️ WAIT FOR CONNECTION HELPER (PREVENTS RESPONSE LOSS)
 async function waitUntilConnected() {
   if (isConnected && sock) return;
-  log('⏳', `Pausing AI response delivery until WhatsApp reconnects...`);
+  log('⏳', `Pausing delivery until WhatsApp reconnects...`);
   let waitTime = 0;
-  // Wait up to 2 minutes
+  // Wait up to 2 minutes for socket to heal
   while ((!isConnected || !sock) && waitTime < 120000) {
     await new Promise(r => setTimeout(r, 2000));
     waitTime += 2000;
@@ -573,7 +573,38 @@ async function waitUntilConnected() {
   if (!isConnected || !sock) {
     throw new Error('WhatsApp connection could not be restored within 2 minutes.');
   }
-  log('✅', `Connection restored. Resuming AI response delivery!`);
+  log('✅', `Connection restored. Resuming delivery!`);
+}
+
+// 🛡️ SAFE MESSAGE SENDER (PREVENTS AI RESPONSE LOSS ON NETWORK DROP)
+async function safeSendMessage(targetChatId, messageConfig, maxRetries = 10) {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            await waitUntilConnected();
+            if (!sock) throw new Error('Socket is null');
+            const sent = await sock.sendMessage(targetChatId, messageConfig);
+            return sent;
+        } catch (error) {
+            const errStr = error.message || '';
+            // If it's a network/connection drop, wait and retry. Do not fail!
+            if (errStr.includes('Connection Closed') || errStr.includes('Timeout') || errStr.includes('Socket') || errStr.includes('MAC') || errStr.includes('Precondition') || errStr.includes('not-authorized') || errStr.includes('null')) {
+                log('⚠️', `Delivery paused (Network Drop). Retrying in 10s... (${i+1}/${maxRetries})`);
+                isConnected = false; // Force the waitUntilConnected loop to block next time
+                await new Promise(r => setTimeout(r, 10000));
+            } else {
+                throw error; // If it's a legitimate format error, crash out
+            }
+        }
+    }
+    throw new Error('Message delivery failed after maximum network retries.');
+}
+
+async function safeSendPresenceUpdate(status, chatId) {
+    try {
+        if (isConnected && sock) {
+            await sock.sendPresenceUpdate(status, chatId);
+        }
+    } catch (e) {} // Non-critical, ignore fails
 }
 
 let sock = null;
@@ -2093,9 +2124,8 @@ async function handleMessage(sock, msg) {
         }
 
       } else {
-        if (!isConnected || !sock) return;
         try {
-            await sock.sendMessage(chatId, {
+            await safeSendMessage(chatId, {
             text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
             mentions: [senderId]
             });
@@ -2103,9 +2133,8 @@ async function handleMessage(sock, msg) {
       }
     }
     else if (text.toLowerCase() === 'help' || text === '?') {
-      if (!isConnected || !sock) return;
       try {
-          await sock.sendMessage(chatId, {
+          await safeSendMessage(chatId, {
             text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
           });
       } catch (e) {}
@@ -2114,7 +2143,6 @@ async function handleMessage(sock, msg) {
       const userItems = clearUserBuffer(chatId, senderId);
       clearUserTimeout(chatId, senderId);
 
-      if (!isConnected || !sock) return;
       try {
           if (userItems.length > 0) {
             const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
@@ -2126,12 +2154,12 @@ async function handleMessage(sock, msg) {
               else if (m.type === 'text') counts.texts++;
             });
 
-            await sock.sendMessage(chatId, {
+            await safeSendMessage(chatId, {
               text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
               mentions: [senderId]
             });
           } else {
-            await sock.sendMessage(chatId, {
+            await safeSendMessage(chatId, {
               text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
               mentions: [senderId]
             });
@@ -2139,13 +2167,12 @@ async function handleMessage(sock, msg) {
       } catch(e) {}
     }
     else if (text.toLowerCase() === 'status') {
-      if (!isConnected || !sock) return;
       const stats = getTotalBufferStats(chatId);
       const userCount = getUserBufferCount(chatId, senderId);
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
       try {
-          await sock.sendMessage(chatId, {
+          await safeSendMessage(chatId, {
             text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
           });
       } catch (e) {}
@@ -2180,9 +2207,8 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
   if (!storedContext) {
     log('⚠️', `Context expired for ...${shortId}`);
-    if (!isConnected || !sock) return;
     try {
-        await sock.sendMessage(chatId, {
+        await safeSendMessage(chatId, {
         text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
         mentions: [senderId]
         });
@@ -2209,9 +2235,8 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     }
 
     if (!userQuestion) {
-      if (!isConnected || !sock) return;
       try {
-          await sock.sendMessage(chatId, {
+          await safeSendMessage(chatId, {
             text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
             mentions: [senderId]
           });
@@ -2242,16 +2267,14 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       : [userQuestion];
 
     try {
-      if (!isConnected || !sock) return;
-      await sock.sendPresenceUpdate('composing', chatId);
+      await safeSendPresenceUpdate('composing', chatId);
 
       log('🔄', `Group reply (NO system instruction): Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
 
       // Call Gemini with NO system instruction (null)
       const responseText = await generateGeminiContent(requestContent, null);
 
-      await waitUntilConnected(); // 🛡️ PAUSE IF DISCONNECTED
-      await sock.sendPresenceUpdate('paused', chatId);
+      await safeSendPresenceUpdate('paused', chatId);
 
       let finalText = responseText.length <= 60000
         ? responseText
@@ -2260,7 +2283,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       // Add the group reply footer
       finalText += GROUP_REPLY_FOOTER;
 
-      const sentMessage = await sock.sendMessage(chatId, {
+      const sentMessage = await safeSendMessage(chatId, {
         text: finalText,
         mentions: [senderId]
       });
@@ -2278,9 +2301,8 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
     } catch (error) {
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
-      if (!isConnected || !sock) return;
       try {
-          await sock.sendMessage(chatId, {
+          await safeSendMessage(chatId, {
             text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
             mentions: [senderId]
           });
@@ -2448,9 +2470,8 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   }
 
   if (newContent.length === 0) {
-    if (!isConnected || !sock) return;
     try {
-        await sock.sendMessage(chatId, {
+        await safeSendMessage(chatId, {
         text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
         mentions: [senderId]
         });
@@ -2754,9 +2775,6 @@ ${allOriginalText.join('\n\n')}
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
     const rawPrimaryResponse = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
 
-    // 🛡️ CRITICAL FIX: DO NOT DISMISS. Wait for socket to restore if healing.
-    await waitUntilConnected();
-
     // Parse JSON from response
     const jsonData = parseJsonFromResponse(rawPrimaryResponse);
     const primaryResponseText = stripJsonFromResponse(rawPrimaryResponse);
@@ -2784,7 +2802,7 @@ ${allOriginalText.join('\n\n')}
         step1Text += GROUP_REPLY_FOOTER;
       }
 
-      await sock.sendMessage(destinationChatId, {
+      await safeSendMessage(destinationChatId, {
         text: step1Text,
         mentions: step1Mentions
       });
@@ -2801,9 +2819,6 @@ ${primaryResponseText}
 
       const secondaryRequestContent = [secondaryPrompt];
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
-
-      // 🛡️ Ensure socket is still connected
-      await waitUntilConnected();
 
       // Build mentions array for secondary message
       const step2Mentions = [senderId];
@@ -2833,11 +2848,11 @@ ${primaryResponseText}
       console.log(finalSecondaryText);
       console.log('═'.repeat(60) + '\n');
 
-      await sock.sendPresenceUpdate('composing', destinationChatId);
+      await safeSendPresenceUpdate('composing', destinationChatId);
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await sock.sendPresenceUpdate('paused', destinationChatId);
+      await safeSendPresenceUpdate('paused', destinationChatId);
 
-      const sentMessage = await sock.sendMessage(destinationChatId, {
+      const sentMessage = await safeSendMessage(destinationChatId, {
         text: finalSecondaryText,
         mentions: step2Mentions
       });
@@ -2871,10 +2886,10 @@ ${primaryResponseText}
     if (jsonData) console.log(`JSON: ${JSON.stringify(jsonData)}`);
     console.log('═'.repeat(60) + '\n');
 
-    await sock.sendPresenceUpdate('composing', destinationChatId);
+    await safeSendPresenceUpdate('composing', destinationChatId);
     const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
     await new Promise(resolve => setTimeout(resolve, delay));
-    await sock.sendPresenceUpdate('paused', destinationChatId);
+    await safeSendPresenceUpdate('paused', destinationChatId);
 
     let finalResponseText = primaryResponseText.length <= 60000
       ? primaryResponseText
@@ -2914,7 +2929,8 @@ ${primaryResponseText}
       finalResponseText += GROUP_REPLY_FOOTER;
     }
 
-    const sentMessage = await sock.sendMessage(destinationChatId, {
+    // 🛡️ SEND USING THE SAFE METHOD
+    const sentMessage = await safeSendMessage(destinationChatId, {
       text: finalResponseText,
       mentions: finalMentions
     });
@@ -2936,11 +2952,10 @@ ${primaryResponseText}
       log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
       
       try {
-          await waitUntilConnected(); // Wait to send notification
-          await sock.sendPresenceUpdate('composing', destinationChatId);
+          await safeSendPresenceUpdate('composing', destinationChatId);
           await new Promise(r => setTimeout(r, 1000));
 
-          await sock.sendMessage(destinationChatId, {
+          await safeSendMessage(destinationChatId, {
             text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model or connection is currently unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
             mentions: [senderId]
           });
@@ -2958,11 +2973,10 @@ ${primaryResponseText}
     }
 
     try {
-        await waitUntilConnected();
-        await sock.sendPresenceUpdate('composing', destinationChatId);
+        await safeSendPresenceUpdate('composing', destinationChatId);
         await new Promise(r => setTimeout(r, 1500));
 
-        await sock.sendMessage(destinationChatId, {
+        await safeSendMessage(destinationChatId, {
           text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
           mentions: [senderId]
         });
