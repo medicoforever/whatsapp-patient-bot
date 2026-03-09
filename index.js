@@ -80,12 +80,14 @@ const CONFIG = {
   SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
   // 🔗 Media Viewer URL expiry: 12 hours
   MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
-  // 🔧 Decryption failure auto-heal settings
-  DECRYPT_FAIL_THRESHOLD: 8,
+  
+  // 🛡️ BULLETPROOF: Auto-heal settings
+  DECRYPT_FAIL_THRESHOLD: 3, // 🔥 Lowered to 3 so it reacts instantly
   DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
-  EMPTY_MSG_RETRY_DELAY_MS: 5000, // Wait 5 seconds before retry
-  EMPTY_MSG_MAX_RETRIES: 10, // Max retries for empty messages (50s total buffer)
+  EMPTY_MSG_RETRY_DELAY_MS: 5000, 
+  EMPTY_MSG_MAX_RETRIES: 6, // 🔥 Lowered to 6 so it forces a heal faster
+  
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -253,7 +255,7 @@ async function nukeSessionKeysFromMongo() {
   }
 }
 
-// 🛡️ NEW: Total Wipe for corrupted auth state
+// 🚨 NEW: Emergency Aggressive Wipe
 async function aggressiveAuthWipe() {
   log('🚨', '[AUTO-HEAL] Initiating aggressive MongoDB Auth Wipe...');
   try {
@@ -262,9 +264,7 @@ async function aggressiveAuthWipe() {
           log('🗑️', '[AUTO-HEAL] Dropped whatsapp_sessions collection entirely.');
       }
   } catch (e) {
-      if (e.code !== 26) { // Code 26 is NamespaceNotFound (already dropped)
-          log('❌', `[AUTO-HEAL] Wipe error: ${e.message}`);
-      }
+      if (e.code !== 26) { log('❌', `[AUTO-HEAL] Wipe error: ${e.message}`); }
   }
 }
 
@@ -273,7 +273,7 @@ async function triggerSessionHeal(reason = 'threshold') {
   isHealingInProgress = true;
 
   log('🔧', '══════════════════════════════════════');
-  log('🔧', ' AUTO-HEAL: Signal session key reset ');
+  log('🔧', ` AUTO-HEAL TRIGGERED: ${reason} `);
   log('🔧', '══════════════════════════════════════');
 
   try {
@@ -285,11 +285,11 @@ async function triggerSessionHeal(reason = 'threshold') {
     }
 
     if (sock) {
-      log('🔄', ' Forcing reconnection...');
+      log('🔄', ' Forcing socket disconnect to renegotiate encryption...');
       try {
-        sock.end(new Error(`Session heal: ${reason}`));
+        sock.end(new Error(`428`)); // 428 tells the bot to reconnect safely
       } catch (e) {
-        log('⚠️', ` Socket close (harmless): ${e.message}`);
+        log('⚠️', ` Socket close: ${e.message}`);
       }
     }
 
@@ -1541,13 +1541,15 @@ async function startBot() {
 
     const baileysLogger = pino({ level: 'silent' });
 
+    // 🛡️ BULLETPROOF SOCKET CONFIG
     sock = makeWASocket({
       version,
       auth: state,
       logger: baileysLogger,
       browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
-      markOnlineOnConnect: false,
+      markOnlineOnConnect: true, // 🔥 Force presence sync to wake up keys
       syncFullHistory: false,
+      keepAliveIntervalMs: 25000, // 🔥 Crucial for Render: Keeps socket from dropping
       retryRequestDelayMs: 2000,
       getMessage: async (key) => {
         return { conversation: '' };
@@ -1732,24 +1734,25 @@ function scheduleEmptyMessageRetry(msgId) {
   const pending = pendingEmptyMessages.get(msgId);
   if (!pending) return;
 
-  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS; // Constant 5s intervals
+  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS; 
 
   setTimeout(async () => {
     const stillPending = pendingEmptyMessages.get(msgId);
-    if (!stillPending) return; // Already resolved via messages.update or upsert
+    if (!stillPending) return; 
 
     stillPending.retryCount++;
 
     try {
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
-        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (chat: ${stillPending.chatId})`);
+        log('🚨', `FATAL: Empty message ${msgId.substring(0, 8)}... failed after max retries. Session is desynced!`);
         pendingEmptyMessages.delete(msgId);
+        
+        // 🔥 THE FIX: Force the bot to repair itself instead of giving up!
+        triggerSessionHeal('Failed to decrypt message after max retries');
         return;
       }
 
       log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}...`);
-
-      // Schedule next retry
       scheduleEmptyMessageRetry(msgId);
 
     } catch (error) {
