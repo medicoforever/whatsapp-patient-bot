@@ -23,16 +23,6 @@ const getApiKeys = () => {
   return keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
 };
 
-// 🟢 HELPER: Clean Group IDs automatically to prevent Render config errors
-const cleanGroupId = (id) => {
-  if (!id) return undefined;
-  let clean = id.toString().trim();
-  if (clean && !clean.includes('@')) {
-    clean += '@g.us'; // Automatically add suffix if missing
-  }
-  return clean;
-};
-
 // ======================================================================
 // 🟢 NEW CONFIGURATION AREA
 // ======================================================================
@@ -50,12 +40,12 @@ const CONFIG = {
   GEMINI_MODEL: 'gemini-3-flash-preview',
   MONGODB_URI: process.env.MONGODB_URI,
 
-  // Group Routing Configuration (Automatically fixed formatting)
+  // Group Routing Configuration
   GROUPS: {
-    CT_SOURCE: cleanGroupId(process.env.GROUP_CT_SOURCE),
-    CT_TARGET: cleanGroupId(process.env.GROUP_CT_TARGET),
-    MRI_SOURCE: cleanGroupId(process.env.GROUP_MRI_SOURCE),
-    MRI_TARGET: cleanGroupId(process.env.GROUP_MRI_TARGET)
+    CT_SOURCE: process.env.GROUP_CT_SOURCE,
+    CT_TARGET: process.env.GROUP_CT_TARGET,
+    MRI_SOURCE: process.env.GROUP_MRI_SOURCE,
+    MRI_TARGET: process.env.GROUP_MRI_TARGET
   },
 
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
@@ -80,14 +70,12 @@ const CONFIG = {
   SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
   // 🔗 Media Viewer URL expiry: 12 hours
   MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
-  
-  // 🛡️ BULLETPROOF: Auto-heal settings
-  DECRYPT_FAIL_THRESHOLD: 3, // 🔥 Lowered to 3 so it reacts instantly
+  // 🔧 Decryption failure auto-heal settings
+  DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
-  EMPTY_MSG_RETRY_DELAY_MS: 5000, 
-  EMPTY_MSG_MAX_RETRIES: 6, // 🔥 Lowered to 6 so it forces a heal faster
-  
+  EMPTY_MSG_RETRY_DELAY_MS: 5000, // Wait 5 seconds before retry
+  EMPTY_MSG_MAX_RETRIES: 10, // Max retries for empty messages (50s total buffer)
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -234,7 +222,7 @@ function trackDecryptionFailure() {
 
   if (decryptFailTimestamps.length >= CONFIG.DECRYPT_FAIL_THRESHOLD && !isHealingInProgress) {
     log('🚨', `Decryption failure threshold reached (${decryptFailTimestamps.length} failures in ${CONFIG.DECRYPT_FAIL_WINDOW_MS / 1000}s). Triggering auto-heal...`);
-    triggerSessionHeal('threshold');
+    triggerSessionHeal();
   }
 }
 
@@ -255,25 +243,12 @@ async function nukeSessionKeysFromMongo() {
   }
 }
 
-// 🚨 NEW: Emergency Aggressive Wipe
-async function aggressiveAuthWipe() {
-  log('🚨', '[AUTO-HEAL] Initiating aggressive MongoDB Auth Wipe...');
-  try {
-      if (SessionModel) {
-          await SessionModel.collection.drop();
-          log('🗑️', '[AUTO-HEAL] Dropped whatsapp_sessions collection entirely.');
-      }
-  } catch (e) {
-      if (e.code !== 26) { log('❌', `[AUTO-HEAL] Wipe error: ${e.message}`); }
-  }
-}
-
 async function triggerSessionHeal(reason = 'threshold') {
   if (isHealingInProgress) return;
   isHealingInProgress = true;
 
   log('🔧', '══════════════════════════════════════');
-  log('🔧', ` AUTO-HEAL TRIGGERED: ${reason} `);
+  log('🔧', ' AUTO-HEAL: Signal session key reset ');
   log('🔧', '══════════════════════════════════════');
 
   try {
@@ -281,23 +256,17 @@ async function triggerSessionHeal(reason = 'threshold') {
     decryptFailTimestamps = [];
 
     if (deleted > 0) {
-      log('🔧', ` Cleared corrupted keys from Database. Auth creds preserved ✅`);
+      log('🔧', ` Cleared ${deleted} corrupted keys. Auth creds preserved ✅`);
     }
 
-    log('🔄', ' Soft Rebooting WhatsApp socket to flush memory cache...');
-    
-    // 🛡️ THE RENDER-SAFE FIX: We destroy the current socket and softly boot a new one
-    // WITHOUT exiting the Node.js process so Render doesn't crash the server.
     if (sock) {
-        try {
-            sock.ev.removeAllListeners();
-            sock.ws.close();
-        } catch (e) {}
+      log('🔄', ' Forcing reconnection...');
+      try {
+        sock.end(new Error(`Session heal: ${reason}`));
+      } catch (e) {
+        log('⚠️', ` Socket close (harmless): ${e.message}`);
+      }
     }
-    
-    setTimeout(() => {
-        startBot();
-    }, 3000);
 
     setTimeout(() => {
       isHealingInProgress = false;
@@ -521,7 +490,7 @@ async function useMongoDBAuthState() {
     },
     saveCreds: async () => {
       await writeData('auth_creds', creds);
-      // 🔇 Muted the constant console spam for standard saving
+      log('💾', 'Credentials saved to MongoDB');
     },
     clearAll,
     clearSessionKeys
@@ -559,53 +528,6 @@ function isMessageAlreadyProcessed(msgId) {
 // ======================================================================
 const pendingEmptyMessages = new Map(); // msgId -> { msg, retryCount, chatId, timestamp }
 // ======================================================================
-
-// 🛡️ WAIT FOR CONNECTION HELPER (PREVENTS RESPONSE LOSS)
-async function waitUntilConnected() {
-  if (isConnected && sock) return;
-  log('⏳', `Pausing delivery until WhatsApp reconnects...`);
-  let waitTime = 0;
-  // Wait up to 2 minutes for socket to heal
-  while ((!isConnected || !sock) && waitTime < 120000) {
-    await new Promise(r => setTimeout(r, 2000));
-    waitTime += 2000;
-  }
-  if (!isConnected || !sock) {
-    throw new Error('WhatsApp connection could not be restored within 2 minutes.');
-  }
-  log('✅', `Connection restored. Resuming delivery!`);
-}
-
-// 🛡️ SAFE MESSAGE SENDER (PREVENTS AI RESPONSE LOSS ON NETWORK DROP)
-async function safeSendMessage(targetChatId, messageConfig, maxRetries = 10) {
-    for (let i = 0; i < maxRetries; i++) {
-        try {
-            await waitUntilConnected();
-            if (!sock) throw new Error('Socket is null');
-            const sent = await sock.sendMessage(targetChatId, messageConfig);
-            return sent;
-        } catch (error) {
-            const errStr = error.message || '';
-            // If it's a network/connection drop, wait and retry. Do not fail!
-            if (errStr.includes('Connection Closed') || errStr.includes('Timeout') || errStr.includes('Socket') || errStr.includes('MAC') || errStr.includes('Precondition') || errStr.includes('not-authorized') || errStr.includes('null')) {
-                log('⚠️', `Delivery paused (Network Drop). Retrying in 10s... (${i+1}/${maxRetries})`);
-                isConnected = false; // Force the waitUntilConnected loop to block next time
-                await new Promise(r => setTimeout(r, 10000));
-            } else {
-                throw error; // If it's a legitimate format error, crash out
-            }
-        }
-    }
-    throw new Error('Message delivery failed after maximum network retries.');
-}
-
-async function safeSendPresenceUpdate(status, chatId) {
-    try {
-        if (isConnected && sock) {
-            await sock.sendPresenceUpdate(status, chatId);
-        }
-    } catch (e) {} // Non-critical, ignore fails
-}
 
 let sock = null;
 let isConnected = false;
@@ -763,13 +685,6 @@ function resetUserTimeout(chatId, senderId, senderName) {
   const shortId = getShortSenderId(senderId);
 
   const timeoutCallback = async () => {
-    // 🛡️ Defers starting the process if socket is down, so tokens aren't wasted early
-    if (!isConnected || !sock) {
-        log('⚠️', 'Socket disconnected. Delaying auto-process by 10s...');
-        chatTimeoutMap.set(senderId, setTimeout(timeoutCallback, 10000));
-        return;
-    }
-
     if (isAutoGroup) {
       const mediaFiles = clearUserBuffer(chatId, senderId);
       if (mediaFiles.length > 0) {
@@ -1517,18 +1432,7 @@ async function startBot() {
       await connectMongoDB();
     }
 
-    // 🛑 NEW: EMERGENCY RESET OVERRIDE
-    if (process.env.FORCE_RESET_AUTH === 'true') {
-        log('⚠️', 'EMERGENCY OVERRIDE TRIGGERED: FORCE_RESET_AUTH=true');
-        if (!SessionModel && mongoConnected) {
-            SessionModel = mongoose.model('Session', sessionSchema);
-        }
-        await aggressiveAuthWipe();
-        log('🛑', 'Database completely wiped. Please remove FORCE_RESET_AUTH from Render Dashboard!');
-        return; 
-    }
-
-    // ONE-TIME STARTUP HEAL
+    // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
     if (!startupHealDone && mongoConnected) {
       if (!SessionModel) {
         SessionModel = mongoose.model('Session', sessionSchema);
@@ -1600,15 +1504,13 @@ async function startBot() {
 
     const baileysLogger = pino({ level: 'silent' });
 
-    // 🛡️ BULLETPROOF SOCKET CONFIG
     sock = makeWASocket({
       version,
       auth: state,
       logger: baileysLogger,
       browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
-      markOnlineOnConnect: true, 
+      markOnlineOnConnect: false,
       syncFullHistory: false,
-      keepAliveIntervalMs: 25000, 
       retryRequestDelayMs: 2000,
       getMessage: async (key) => {
         return { conversation: '' };
@@ -1647,27 +1549,23 @@ async function startBot() {
           statusCode === 401 ||
           statusCode === 405;
 
-        // 🛡️ NO process.exit() used below! We use "Soft Reboots" for Render Compatibility.
         if (loggedOut) {
-          log('🚨', 'FATAL ERROR: Session logged out or Crypto-Desync (401/405).');
-          botStatus = 'Logged out - wiping session...';
+          log('🔐', 'Session logged out - clearing credentials...');
+          botStatus = 'Logged out - clearing session...';
 
           if (authState?.clearAll) {
             await authState.clearAll();
           }
-          await aggressiveAuthWipe(); 
 
-          log('🔄', 'Restarting to generate fresh QR code cleanly...');
-          setTimeout(startBot, 5000); 
+          log('🔄', 'Restarting with fresh session in 5 seconds...');
+          setTimeout(startBot, 5000);
         } else {
-          if (statusCode === 428 || statusCode === 515) {
+          if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
             log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
-            // Only clear keys if it's actually 428 (Precondition Required) or 515
             await nukeSessionKeysFromMongo();
           }
-          
           log('🔄', `Reconnecting in 5 seconds...`);
-          setTimeout(startBot, 5000); 
+          setTimeout(startBot, 5000);
         }
 
       } else if (connection === 'open') {
@@ -1682,11 +1580,12 @@ async function startBot() {
 
         if (authState?.saveCreds) {
           await authState.saveCreds();
+          log('💾', 'Credentials saved');
         }
 
         log('🌍', 'Universal Mode: Bot is active for ALL chats.');
-        if (CONFIG.GROUPS.CT_SOURCE) log('🏥', `Monitoring CT Source Group: ${CONFIG.GROUPS.CT_SOURCE}`);
-        if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', `Monitoring MRI Source Group: ${CONFIG.GROUPS.MRI_SOURCE}`);
+        if (CONFIG.GROUPS.CT_SOURCE) log('🏥', 'Monitoring CT Source Group');
+        if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
       }
     });
 
@@ -1795,25 +1694,24 @@ function scheduleEmptyMessageRetry(msgId) {
   const pending = pendingEmptyMessages.get(msgId);
   if (!pending) return;
 
-  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS; 
+  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS; // Constant 5s intervals
 
   setTimeout(async () => {
     const stillPending = pendingEmptyMessages.get(msgId);
-    if (!stillPending) return; 
+    if (!stillPending) return; // Already resolved via messages.update or upsert
 
     stillPending.retryCount++;
 
     try {
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
-        log('🚨', `FATAL: Empty message ${msgId.substring(0, 8)}... failed after max retries. Session is desynced!`);
+        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (chat: ${stillPending.chatId})`);
         pendingEmptyMessages.delete(msgId);
-        
-        // 🔥 THE FIX: Force the bot to repair itself instead of giving up!
-        triggerSessionHeal('Failed to decrypt message after max retries');
         return;
       }
 
       log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}...`);
+
+      // Schedule next retry
       scheduleEmptyMessageRetry(msgId);
 
     } catch (error) {
@@ -1880,7 +1778,7 @@ async function handleMessage(sock, msg) {
 
   const isGroup = chatId.endsWith('@g.us');
   if (isGroup) {
-    // Suppressed the global chat log spam to make debugging cleaner
+    log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
   }
 
   const content = unwrapMessage(msg.message);
@@ -2124,61 +2022,53 @@ async function handleMessage(sock, msg) {
         }
 
       } else {
-        try {
-            await safeSendMessage(chatId, {
-            text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
-            mentions: [senderId]
-            });
-        } catch(e) {}
+        await sock.sendMessage(chatId, {
+          text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
+          mentions: [senderId]
+        });
       }
     }
     else if (text.toLowerCase() === 'help' || text === '?') {
-      try {
-          await safeSendMessage(chatId, {
-            text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
-          });
-      } catch (e) {}
+      await sock.sendMessage(chatId, {
+        text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
+      });
     }
     else if (text.toLowerCase() === 'clear') {
       const userItems = clearUserBuffer(chatId, senderId);
       clearUserTimeout(chatId, senderId);
 
-      try {
-          if (userItems.length > 0) {
-            const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
-            userItems.forEach(m => {
-              if (m.type === 'image') counts.images++;
-              else if (m.type === 'pdf') counts.pdfs++;
-              else if (m.type === 'audio' || m.type === 'voice') counts.audio++;
-              else if (m.type === 'video') counts.video++;
-              else if (m.type === 'text') counts.texts++;
-            });
+      if (userItems.length > 0) {
+        const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
+        userItems.forEach(m => {
+          if (m.type === 'image') counts.images++;
+          else if (m.type === 'pdf') counts.pdfs++;
+          else if (m.type === 'audio' || m.type === 'voice') counts.audio++;
+          else if (m.type === 'video') counts.video++;
+          else if (m.type === 'text') counts.texts++;
+        });
 
-            await safeSendMessage(chatId, {
-              text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
-              mentions: [senderId]
-            });
-          } else {
-            await safeSendMessage(chatId, {
-              text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
-              mentions: [senderId]
-            });
-          }
-      } catch(e) {}
+        await sock.sendMessage(chatId, {
+          text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
+          mentions: [senderId]
+        });
+      } else {
+        await sock.sendMessage(chatId, {
+          text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
+          mentions: [senderId]
+        });
+      }
     }
     else if (text.toLowerCase() === 'status') {
       const stats = getTotalBufferStats(chatId);
       const userCount = getUserBufferCount(chatId, senderId);
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
-      try {
-          await safeSendMessage(chatId, {
-            text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
-          });
-      } catch (e) {}
+      await sock.sendMessage(chatId, {
+        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
+      });
     }
     else {
-      // log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+      log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
       const count = addToUserBuffer(chatId, senderId, {
         type: 'text',
@@ -2192,11 +2082,7 @@ async function handleMessage(sock, msg) {
     }
   }
   else {
-    // 🔇 Mute internal system protocols in console to prevent log spam
-    const ignored = ['protocolMessage', 'senderKeyDistributionMessage', 'messageContextInfo', 'reactionMessage', 'pollCreationMessage', 'pollUpdateMessage'];
-    if (!ignored.includes(messageType)) {
-        log('📎', `Skipping unhandled/system message type: ${messageType}`);
-    }
+    log('📎', `Skipping unhandled/system message type: ${messageType}`);
   }
 }
 
@@ -2206,13 +2092,12 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   const isGroup = chatId.endsWith('@g.us');
 
   if (!storedContext) {
+    // 🔧 FIX #1: Updated expiry message from "30 min limit" to "12 hour limit"
     log('⚠️', `Context expired for ...${shortId}`);
-    try {
-        await safeSendMessage(chatId, {
-        text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
-        mentions: [senderId]
-        });
-    } catch(e) {}
+    await sock.sendMessage(chatId, {
+      text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
+      mentions: [senderId]
+    });
     return;
   }
 
@@ -2220,6 +2105,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   // 🆕 GROUP CHAT REPLY: Exclusively use source media + user text, NO system instruction
   // ======================================================================
   if (isGroup) {
+    // 🔧 FIX: Correctly parse question/text from media captions during group replies
     let userQuestion = '';
 
     if (messageType === 'conversation') {
@@ -2235,12 +2121,10 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     }
 
     if (!userQuestion) {
-      try {
-          await safeSendMessage(chatId, {
-            text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
-            mentions: [senderId]
-          });
-      } catch(e) {}
+      await sock.sendMessage(chatId, {
+        text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
+        mentions: [senderId]
+      });
       return;
     }
 
@@ -2267,14 +2151,14 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       : [userQuestion];
 
     try {
-      await safeSendPresenceUpdate('composing', chatId);
+      await sock.sendPresenceUpdate('composing', chatId);
 
       log('🔄', `Group reply (NO system instruction): Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
 
       // Call Gemini with NO system instruction (null)
       const responseText = await generateGeminiContent(requestContent, null);
 
-      await safeSendPresenceUpdate('paused', chatId);
+      await sock.sendPresenceUpdate('paused', chatId);
 
       let finalText = responseText.length <= 60000
         ? responseText
@@ -2283,7 +2167,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       // Add the group reply footer
       finalText += GROUP_REPLY_FOOTER;
 
-      const sentMessage = await safeSendMessage(chatId, {
+      const sentMessage = await sock.sendMessage(chatId, {
         text: finalText,
         mentions: [senderId]
       });
@@ -2301,12 +2185,10 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
     } catch (error) {
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
-      try {
-          await safeSendMessage(chatId, {
-            text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
-            mentions: [senderId]
-          });
-      } catch(e) {}
+      await sock.sendMessage(chatId, {
+        text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
+        mentions: [senderId]
+      });
     }
 
     return;
@@ -2470,12 +2352,10 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   }
 
   if (newContent.length === 0) {
-    try {
-        await safeSendMessage(chatId, {
-        text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
-        mentions: [senderId]
-        });
-    } catch(e) {}
+    await sock.sendMessage(chatId, {
+      text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
+      mentions: [senderId]
+    });
     return;
   }
 
@@ -2802,7 +2682,7 @@ ${allOriginalText.join('\n\n')}
         step1Text += GROUP_REPLY_FOOTER;
       }
 
-      await safeSendMessage(destinationChatId, {
+      await sock.sendMessage(destinationChatId, {
         text: step1Text,
         mentions: step1Mentions
       });
@@ -2848,11 +2728,11 @@ ${primaryResponseText}
       console.log(finalSecondaryText);
       console.log('═'.repeat(60) + '\n');
 
-      await safeSendPresenceUpdate('composing', destinationChatId);
+      await sock.sendPresenceUpdate('composing', destinationChatId);
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await safeSendPresenceUpdate('paused', destinationChatId);
+      await sock.sendPresenceUpdate('paused', destinationChatId);
 
-      const sentMessage = await safeSendMessage(destinationChatId, {
+      const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
         mentions: step2Mentions
       });
@@ -2886,10 +2766,10 @@ ${primaryResponseText}
     if (jsonData) console.log(`JSON: ${JSON.stringify(jsonData)}`);
     console.log('═'.repeat(60) + '\n');
 
-    await safeSendPresenceUpdate('composing', destinationChatId);
+    await sock.sendPresenceUpdate('composing', destinationChatId);
     const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
     await new Promise(resolve => setTimeout(resolve, delay));
-    await safeSendPresenceUpdate('paused', destinationChatId);
+    await sock.sendPresenceUpdate('paused', destinationChatId);
 
     let finalResponseText = primaryResponseText.length <= 60000
       ? primaryResponseText
@@ -2929,8 +2809,7 @@ ${primaryResponseText}
       finalResponseText += GROUP_REPLY_FOOTER;
     }
 
-    // 🛡️ SEND USING THE SAFE METHOD
-    const sentMessage = await safeSendMessage(destinationChatId, {
+    const sentMessage = await sock.sendMessage(destinationChatId, {
       text: finalResponseText,
       mentions: finalMentions
     });
@@ -2946,24 +2825,19 @@ ${primaryResponseText}
 
   } catch (error) {
     log('❌', `Error for ...${shortId}: ${error.message}`);
-    // console.error(error); // Un-comment if you want detailed traces in console
+    console.error(error);
 
     if (retryAttempt === 0) {
       log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
-      
-      try {
-          await safeSendPresenceUpdate('composing', destinationChatId);
-          await new Promise(r => setTimeout(r, 1000));
 
-          await safeSendMessage(destinationChatId, {
-            text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model or connection is currently unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
-            mentions: [senderId]
-          });
-      } catch (fallbackError) {
-          log('⚠️', `Could not send 5-min retry warning to ...${shortId}, but scheduling anyway.`);
-      }
+      await sock.sendPresenceUpdate('composing', destinationChatId);
+      await new Promise(r => setTimeout(r, 1000));
 
-      // Schedule the retry regardless of whether the notification worked
+      await sock.sendMessage(destinationChatId, {
+        text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
+        mentions: [senderId]
+      });
+
       setTimeout(() => {
         log('🔄', `Executing 5-minute retry for ...${shortId}`);
         processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
@@ -2972,22 +2846,18 @@ ${primaryResponseText}
       return;
     }
 
-    try {
-        await safeSendPresenceUpdate('composing', destinationChatId);
-        await new Promise(r => setTimeout(r, 1500));
+    await sock.sendPresenceUpdate('composing', destinationChatId);
+    await new Promise(r => setTimeout(r, 1500));
 
-        await safeSendMessage(destinationChatId, {
-          text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-          mentions: [senderId]
-        });
-    } catch (finalError) {
-        log('❌', `Failed to send final error notification to ...${shortId}: ${finalError.message}`);
-    }
+    await sock.sendMessage(destinationChatId, {
+      text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
+      mentions: [senderId]
+    });
   }
 }
 
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.6              ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.5              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
@@ -2999,7 +2869,6 @@ console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
 console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
-console.log('║  🛡️ AUTO-WIPE: Force restarts if logged out / 401 error ║');
 console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
 console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
 console.log('║  👤 SENDER CONTACT: @mention tag for source sender     ║');
@@ -3027,5 +2896,6 @@ if (CONFIG.API_KEYS.length === 0) {
   } catch (error) {
     log('💥', `Startup error: ${error.message}`);
     console.error(error);
+    process.exit(1);
   }
 })();
