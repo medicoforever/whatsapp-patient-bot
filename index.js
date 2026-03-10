@@ -70,9 +70,9 @@ const CONFIG = {
   SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
   // 🔗 Media Viewer URL expiry: 12 hours
   MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
-  // 🔧 Decryption failure auto-heal settings (TUNED FOR ROBUSTNESS)
-  DECRYPT_FAIL_THRESHOLD: 15,
-  DECRYPT_FAIL_WINDOW_MS: 120000,
+  // 🔧 Decryption failure auto-heal settings
+  DECRYPT_FAIL_THRESHOLD: 8,
+  DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
   EMPTY_MSG_RETRY_DELAY_MS: 5000, // Wait 5 seconds before retry
   EMPTY_MSG_MAX_RETRIES: 10, // Max retries for empty messages (50s total buffer)
@@ -211,7 +211,6 @@ setInterval(() => {
 let decryptFailTimestamps = [];
 let isHealingInProgress = false;
 let startupHealDone = false;
-let autoHealEscalationTracker = []; // Tracks heal frequency to prevent infinite loops
 
 function trackDecryptionFailure() {
   const now = Date.now();
@@ -248,37 +247,18 @@ async function triggerSessionHeal(reason = 'threshold') {
   if (isHealingInProgress) return;
   isHealingInProgress = true;
 
-  const now = Date.now();
-  autoHealEscalationTracker.push(now);
-  // Keep heals from the last 60 minutes
-  autoHealEscalationTracker = autoHealEscalationTracker.filter(ts => (now - ts) < 60 * 60 * 1000);
-
   log('🔧', '══════════════════════════════════════');
-  
-  // 🚨 ESCALATING HARD RESET: If it auto-heals 5 times in 1 hour, wipe completely.
-  if (autoHealEscalationTracker.length > 5) {
-      log('🚨', ' ESCALATED AUTO-HEAL: Soft heal failed repeatedly in a short loop.');
-      log('🚨', ' Wiping ALL credentials to prevent infinite restart. (QR SCAN REQUIRED)');
-      if (authState && authState.clearAll) {
-          await authState.clearAll();
-      }
-      autoHealEscalationTracker = []; // Reset tracker
-  } else {
-      log('🔧', ' AUTO-HEAL: Signal session key reset ');
-      try {
-        const deleted = await nukeSessionKeysFromMongo();
-        decryptFailTimestamps = [];
-
-        if (deleted > 0) {
-          log('🔧', ` Cleared ${deleted} corrupted keys. Auth creds preserved ✅`);
-        }
-      } catch (error) {
-        log('❌', ` Heal error: ${error.message}`);
-      }
-  }
+  log('🔧', ' AUTO-HEAL: Signal session key reset ');
   log('🔧', '══════════════════════════════════════');
 
   try {
+    const deleted = await nukeSessionKeysFromMongo();
+    decryptFailTimestamps = [];
+
+    if (deleted > 0) {
+      log('🔧', ` Cleared ${deleted} corrupted keys. Auth creds preserved ✅`);
+    }
+
     if (sock) {
       log('🔄', ' Forcing reconnection...');
       try {
@@ -397,11 +377,7 @@ let SessionModel;
 
 async function useMongoDBAuthState() {
   if (!SessionModel) {
-    if (mongoose.models && mongoose.models.Session) {
-      SessionModel = mongoose.models.Session;
-    } else {
-      SessionModel = mongoose.model('Session', sessionSchema);
-    }
+    SessionModel = mongoose.model('Session', sessionSchema);
   }
 
   const writeData = async (key, data) => {
@@ -459,7 +435,7 @@ async function useMongoDBAuthState() {
     }
   };
 
-  // 🔧 Clear only signal session keys, keep auth creds
+  // 🔧 NEW: Clear only signal session keys, keep auth creds
   const clearSessionKeys = async () => {
     try {
       const result = await SessionModel.deleteMany({
@@ -1408,8 +1384,6 @@ async function loadBaileys() {
 }
 
 async function connectMongoDB() {
-  mongoose.set('strictQuery', false); // Surpress mongoose warning
-  
   if (!CONFIG.MONGODB_URI) {
     log('⚠️', 'No MONGODB_URI configured - sessions will not persist!');
     return false;
@@ -1461,23 +1435,8 @@ async function startBot() {
     // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
     if (!startupHealDone && mongoConnected) {
       if (!SessionModel) {
-        if (mongoose.models && mongoose.models.Session) {
-           SessionModel = mongoose.models.Session;
-        } else {
-           SessionModel = mongoose.model('Session', sessionSchema);
-        }
+        SessionModel = mongoose.model('Session', sessionSchema);
       }
-      
-      // 🚨 Handle environment variable hard reset
-      if (process.env.HARD_RESET === 'true') {
-        log('🚨', '╔══════════════════════════════════════════╗');
-        log('🚨', '║ HARD RESET REQUESTED VIA ENVIRONMENT     ║');
-        log('🚨', '╚══════════════════════════════════════════╝');
-        await SessionModel.deleteMany({});
-        log('✅', 'All Database credentials wiped. Please remove HARD_RESET=true and restart Server.');
-        process.exit(0);
-      }
-
       log('🔧', '╔══════════════════════════════════════════╗');
       log('🔧', '║ STARTUP HEAL: Cleaning session keys...  ║');
       log('🔧', '╚══════════════════════════════════════════╝');
@@ -1554,8 +1513,7 @@ async function startBot() {
       syncFullHistory: false,
       retryRequestDelayMs: 2000,
       getMessage: async (key) => {
-        // Prevents crashes by returning undefined if a quoted message can't be found
-        return undefined; 
+        return { conversation: '' };
       }
     });
 
@@ -1587,8 +1545,9 @@ async function startBot() {
 
         log('🔌', `Connection closed. Code: ${statusCode}, Reason: ${reason}`);
 
-        // 401: Unauthorized, LoggedOut: Explicit logout
-        const loggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+        const loggedOut = statusCode === DisconnectReason.loggedOut ||
+          statusCode === 401 ||
+          statusCode === 405;
 
         if (loggedOut) {
           log('🔐', 'Session logged out - clearing credentials...');
@@ -1601,8 +1560,7 @@ async function startBot() {
           log('🔄', 'Restarting with fresh session in 5 seconds...');
           setTimeout(startBot, 5000);
         } else {
-          // Stream Errored (515) or Precondition Required (428) might require key wipe to prevent loop
-          if (statusCode === 515 || statusCode === 428) {
+          if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
             log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
             await nukeSessionKeysFromMongo();
           }
@@ -1643,22 +1601,13 @@ async function startBot() {
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
 
-        // 🛡️ CRITICAL FIX: Skip messages older than 5 minutes completely
-        // This solves the decryption failure loop caused by WhatsApp history syncs 
-        // after being offline, safely skipping messages we don't need or can't decrypt.
-        const msgTimestamp = msg.messageTimestamp;
-        const nowSec = Math.floor(Date.now() / 1000);
-        if (msgTimestamp && (nowSec - msgTimestamp > 300)) {
-            continue;
-        }
-
         const msgId = msg.key.id;
 
         // 🔧 DECRYPTION FAILURE DETECTION & UNIVERSAL RETRY LOGIC
         if (!msg.message || Object.keys(msg.message).length === 0) {
           const chatId = msg.key.remoteJid;
           if (chatId && chatId !== 'status@broadcast') {
-            // Queue for retry to handle multi-device sync delays
+            // 🔄 ALL CHATS: Queue for retry to handle multi-device sync delays & transient decryption fails
             if (msgId) {
               processedMessageIds.delete(msgId); // ALLOW IT TO BE PROCESSED ONCE CONTENT ARRIVES
               if (!pendingEmptyMessages.has(msgId)) {
@@ -2115,7 +2064,7 @@ async function handleMessage(sock, msg) {
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
       await sock.sendMessage(chatId, {
-        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (2min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
+        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
       });
     }
     else {
@@ -2908,7 +2857,7 @@ ${primaryResponseText}
 }
 
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.6              ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.5              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
@@ -2919,7 +2868,7 @@ console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
 console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
 console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
-console.log('║  🔧 AUTO-HEAL: Smart Escaping (Ignores 5+ min history) ║');
+console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
 console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
 console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
 console.log('║  👤 SENDER CONTACT: @mention tag for source sender     ║');
