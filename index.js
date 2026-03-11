@@ -435,7 +435,6 @@ async function useMongoDBAuthState() {
     }
   };
 
-  // 🔧 NEW: Clear only signal session keys, keep auth creds
   const clearSessionKeys = async () => {
     try {
       const result = await SessionModel.deleteMany({
@@ -472,19 +471,40 @@ async function useMongoDBAuthState() {
           }
           return data;
         },
+        // 🚀 MASSIVE SPEED BOOST HERE: Using BulkWrite to prevent WhatsApp timeouts
         set: async (data) => {
-          const tasks =[];
-          for (const [type, entries] of Object.entries(data)) {
+          const bulkOps = [];
+          for (const[type, entries] of Object.entries(data)) {
             for (const [id, value] of Object.entries(entries)) {
               const key = `key_${type}_${id}`;
               if (value) {
-                tasks.push(writeData(key, value));
+                const serialized = JSON.stringify(value, (k, v) => {
+                  if (typeof v === 'bigint') return { type: 'BigInt', value: v.toString() };
+                  if (v instanceof Uint8Array) return { type: 'Uint8Array', value: Array.from(v) };
+                  if (Buffer.isBuffer(v)) return { type: 'Buffer', value: Array.from(v) };
+                  return v;
+                });
+                bulkOps.push({
+                  updateOne: {
+                    filter: { key },
+                    update: { $set: { key, value: serialized, updatedAt: new Date() } },
+                    upsert: true
+                  }
+                });
               } else {
-                tasks.push(removeData(key));
+                bulkOps.push({ deleteOne: { filter: { key } } });
               }
             }
           }
-          await Promise.all(tasks);
+          
+          if (bulkOps.length > 0) {
+            try {
+              // ordered: false tells MongoDB to do them all simultaneously
+              await SessionModel.bulkWrite(bulkOps, { ordered: false });
+            } catch (error) {
+              log('❌', `MongoDB bulk write error: ${error.message}`);
+            }
+          }
         }
       }
     },
@@ -496,6 +516,98 @@ async function useMongoDBAuthState() {
     clearSessionKeys
   };
 }
+
+async function useMongoDBAuthState() {
+  if (!SessionModel) {
+    SessionModel = mongoose.model('Session', sessionSchema);
+  }
+
+  const writeData = async (key, data) => {
+    try {
+      const serialized = JSON.stringify(data, (k, v) => {
+        if (typeof v === 'bigint') return { type: 'BigInt', value: v.toString() };
+        if (v instanceof Uint8Array) return { type: 'Uint8Array', value: Array.from(v) };
+        if (Buffer.isBuffer(v)) return { type: 'Buffer', value: Array.from(v) };
+        return v;
+      });
+
+      await SessionModel.findOneAndUpdate(
+        { key },
+        { key, value: serialized, updatedAt: new Date() },
+        { upsert: true, new: true }
+      );
+    } catch (error) {
+      log('❌', `MongoDB write error: ${error.message}`);
+    }
+  };
+
+  const readData = async (key) => {
+    try {
+      const doc = await SessionModel.findOne({ key });
+      if (!doc || !doc.value) return null;
+
+      return JSON.parse(doc.value, (k, v) => {
+        if (v && typeof v === 'object') {
+          if (v.type === 'BigInt') return BigInt(v.value);
+          if (v.type === 'Uint8Array') return new Uint8Array(v.data || v.value);
+          if (v.type === 'Buffer') return Buffer.from(v.data || v.value);
+        }
+        return v;
+      });
+    } catch (error) {
+      log('❌', `MongoDB read error: ${error.message}`);
+      return null;
+    }
+  };
+
+  const removeData = async (key) => {
+    try {
+      await SessionModel.deleteOne({ key });
+    } catch (error) {
+      log('❌', `MongoDB delete error: ${error.message}`);
+    }
+  };
+
+  const clearAll = async () => {
+    try {
+      await SessionModel.deleteMany({});
+      log('🗑', 'Cleared all MongoDB sessions');
+    } catch (error) {
+      log('❌', `MongoDB clear error: ${error.message}`);
+    }
+  };
+
+  // 🔧 NEW: Clear only signal session keys, keep auth creds
+  const clearSessionKeys = async () => {
+    try {
+      const result = await SessionModel.deleteMany({
+        key: { $regex: /^key_/ }
+      });
+      log('🗑', `Cleared ${result.deletedCount} signal session keys from MongoDB`);
+    } catch (error) {
+      log('❌', `MongoDB session key clear error: ${error.message}`);
+    }
+  };
+
+  let creds = await readData('auth_creds');
+
+  if (!creds) {
+    const { initAuthCreds } = await import('@whiskeysockets/baileys');
+    creds = initAuthCreds();
+    await writeData('auth_creds', creds);
+    log('🔑', 'Created new auth credentials');
+  } else {
+    log('🔑', 'Loaded existing auth credentials from MongoDB');
+  }
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            const value = await readData(`key_${type}_${id}`);
 
 const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
@@ -521,6 +633,7 @@ function isMessageAlreadyProcessed(msgId) {
   }
   return false;
 }
+            
 // ======================================================================
 
 // ======================================================================
