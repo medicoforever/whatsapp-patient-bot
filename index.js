@@ -1147,7 +1147,7 @@ app.get('/', (req, res) => {
     <head>
         <title>WhatsApp Patient Bot</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta http-equiv="refresh" content="5">
+        <meta http-equiv="refresh" content="${qrCodeDataURL ? 30 : 5}">
         <style>
             * { box-sizing: border-box; }
             body {
