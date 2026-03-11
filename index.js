@@ -634,7 +634,7 @@ function groupMediaSmartly(mediaFiles) {
     return[mediaFiles];
   }
 
-  const batches = [];
+  const batches =[];
   let currentBatch =[];
   let activeCaption = null;
 
@@ -1128,7 +1128,7 @@ app.get('/media/:viewerId/:index', (req, res) => {
 
 app.get('/', (req, res) => {
   let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
-  for (const [chatId, _] of chatMediaBuffers) {
+  for (const[chatId, _] of chatMediaBuffers) {
     const s = getTotalBufferStats(chatId);
     stats.users += s.users;
     stats.images += s.images;
@@ -1138,6 +1138,8 @@ app.get('/', (req, res) => {
     stats.texts += s.texts;
     stats.total += s.total;
   }
+
+  const isForceReset = process.env.FORCE_RESET === 'true';
 
   let html = `
     <!DOCTYPE html>
@@ -1180,6 +1182,8 @@ app.get('/', (req, res) => {
             }
             .connected { background: #4CAF50; }
             .waiting { background: rgba(255,255,255,0.2); }
+            .warning { background: #ff4444; color: white; border: 2px solid #ff0000; animation: blink 2s infinite; }
+            @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.8; } 100% { opacity: 1; } }
             .qr-container {
                 background: white;
                 padding: 15px;
@@ -1221,14 +1225,6 @@ app.get('/', (req, res) => {
             }
             .db-connected { background: rgba(76, 175, 80, 0.3); }
             .db-disconnected { background: rgba(244, 67, 54, 0.3); }
-            .feature-badge {
-                display: inline-block;
-                background: rgba(255,255,255,0.2);
-                padding: 3px 8px;
-                border-radius: 12px;
-                font-size: 10px;
-                margin: 2px;
-            }
         </style>
     </head>
     <body>
@@ -1240,6 +1236,13 @@ app.get('/', (req, res) => {
             </div>
             <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
     `;
+
+  if (isForceReset) {
+    html += `
+            <div class="status warning">🚨 FORCE_RESET IS ACTIVE 🚨</div>
+            <p><strong>IMPORTANT:</strong> Go to your Render Dashboard and delete the <code>FORCE_RESET</code> variable (or set to false), then restart. Otherwise, the bot will wipe its memory every time it restarts!</p>
+    `;
+  }
 
   if (isConnected) {
     html += `
@@ -1436,8 +1439,22 @@ async function startBot() {
       await connectMongoDB();
     }
 
-    // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
-    if (!startupHealDone && mongoConnected) {
+    // 🟢 NEW: FORCE RESET LOGIC
+    if (mongoConnected && process.env.FORCE_RESET === 'true') {
+      log('🚨', '╔══════════════════════════════════════════╗');
+      log('🚨', '║ FORCE_RESET IS TRUE! WIPING DATABASE...  ║');
+      log('🚨', '╚══════════════════════════════════════════╝');
+      try {
+        if (!SessionModel) {
+          SessionModel = mongoose.model('Session', sessionSchema);
+        }
+        await SessionModel.deleteMany({});
+        log('✅', 'Database successfully wiped! A new QR code will be generated.');
+      } catch (err) {
+        log('⚠️', `Wipe error (collection might not exist yet): ${err.message}`);
+      }
+    } else if (!startupHealDone && mongoConnected) {
+      // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
       if (!SessionModel) {
         SessionModel = mongoose.model('Session', sessionSchema);
       }
@@ -1517,7 +1534,7 @@ async function startBot() {
       version,
       auth: state,
       logger: baileysLogger,
-      browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
+      browser:['WhatsApp-Bot', 'Chrome', '120.0.0'],
       markOnlineOnConnect: false,
       syncFullHistory: false,
       retryRequestDelayMs: 2000,
@@ -2090,7 +2107,7 @@ async function handleMessage(msg) {
         if (sock) {
           await sock.sendMessage(chatId, {
             text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
-            mentions: [senderId]
+            mentions:[senderId]
           }).catch(() => {});
         }
       }
