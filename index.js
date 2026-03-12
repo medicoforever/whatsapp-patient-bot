@@ -55,7 +55,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 
 const CONFIG = {
   API_KEYS: getApiKeys(),
-  GEMINI_MODEL: 'gemini-2.5-flash-preview-04-17',
+  GEMINI_MODEL: 'gemini-3-flash-preview',
   MONGODB_URI: process.env.MONGODB_URI,
 
   GROUPS: {
