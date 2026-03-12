@@ -2207,9 +2207,9 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     return responseText;
   }
 
-  log('⚠️', `All keys failed for primary model. Falling back to gemini-2.0-flash-lite with HIGH thinking...`);
+  log('⚠️', `All keys failed for primary model. Falling back to gemini-3.1-flash-lite-preview with HIGH thinking...`);
 
-  responseText = await tryModel('gemini-2.0-flash-lite', true);
+  responseText = await tryModel('gemini-3.1-flash-lite-preview', true);
   if (responseText) {
     return responseText + '\n\n_{fallback model used}_';
   }
