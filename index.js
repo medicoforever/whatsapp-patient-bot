@@ -17,27 +17,6 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// ======================================================================
-// 🛡️ GLOBAL UNCAUGHT ERROR HANDLERS (prevents process crash)
-// ======================================================================
-process.on('uncaughtException', (err) => {
-  const time = new Date().toLocaleTimeString();
-  console.log(`[${time}] 🛡️ Uncaught Exception (handled): ${err.message}`);
-  // Don't crash — just log it
-  if (err.message?.includes('Connection Closed') || err.isBoom) {
-    console.log(`[${time}] 🛡️ This is a Baileys connection error, safe to ignore.`);
-  }
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  const time = new Date().toLocaleTimeString();
-  const msg = reason instanceof Error ? reason.message : String(reason);
-  console.log(`[${time}] 🛡️ Unhandled Rejection (handled): ${msg}`);
-  if (msg?.includes('Connection Closed') || (reason && reason.isBoom)) {
-    console.log(`[${time}] 🛡️ This is a Baileys connection error, safe to ignore.`);
-  }
-});
-
 // Helper to parse keys from comma-separated string
 const getApiKeys = () => {
   const keys = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
@@ -47,6 +26,7 @@ const getApiKeys = () => {
 // ======================================================================
 // 🟢 NEW CONFIGURATION AREA
 // ======================================================================
+
 const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist. When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
 
 const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from the patient's reports. Please analyze this profile according to your system instructions and provide the final output.`;
@@ -54,10 +34,13 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 // ======================================================================
 
 const CONFIG = {
+  // We now store an array of keys
   API_KEYS: getApiKeys(),
+  // 🔴 CHANGED TO STABLE MODEL to prevent 503 Overloaded errors
   GEMINI_MODEL: 'gemini-3-flash-preview',
   MONGODB_URI: process.env.MONGODB_URI,
 
+  // Group Routing Configuration
   GROUPS: {
     CT_SOURCE: process.env.GROUP_CT_SOURCE,
     CT_TARGET: process.env.GROUP_CT_TARGET,
@@ -65,11 +48,12 @@ const CONFIG = {
     MRI_TARGET: process.env.GROUP_MRI_TARGET
   },
 
-  MEDIA_TIMEOUT_MS: 300000,
-  AUTO_PROCESS_DELAY_MS: 60000,
+  MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
+  AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
 
-  CONTEXT_RETENTION_MS: 12 * 60 * 60 * 1000,
-  MAX_STORED_CONTEXTS: 1000,
+  // 🔧 FIX #1: Changed from 30 minutes to 12 hours to match media viewer expiry
+  CONTEXT_RETENTION_MS: 12 * 60 * 60 * 1000, // 12 hours
+  MAX_STORED_CONTEXTS: 20,
   COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
   TYPING_DELAY_MIN: 3000,
   TYPING_DELAY_MAX: 6000,
@@ -84,22 +68,14 @@ const CONFIG = {
     'video/quicktime', 'video/x-matroska', 'video/mkv', 'video/3gpp', 'video/3gp'
   ],
   SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
-
+  // 🔗 Media Viewer URL expiry: 12 hours
   MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
-
-  // 🔧 Decryption failure auto-heal settings — RELAXED thresholds
-  DECRYPT_FAIL_THRESHOLD: 15,      // Raised from 8 to 15
-  DECRYPT_FAIL_WINDOW_MS: 120000,  // Raised from 60s to 120s
-  HEAL_COOLDOWN_MS: 120000,        // 2 minutes cooldown (raised from 30s)
-
-  // 🔄 Retry settings for empty messages
-  EMPTY_MSG_RETRY_DELAY_MS: 5000,
-  EMPTY_MSG_MAX_RETRIES: 10,
-
-  // 🔧 Reconnection guard settings
-  RECONNECT_DELAY_MS: 5000,
-  MAX_RECONNECT_DELAY_MS: 60000,   // Max backoff 60s
-
+  // 🔧 Decryption failure auto-heal settings
+  DECRYPT_FAIL_THRESHOLD: 8,
+  DECRYPT_FAIL_WINDOW_MS: 60000,
+  // 🔄 Retry settings for empty source group messages
+  EMPTY_MSG_RETRY_DELAY_MS: 3000, // Wait 3 seconds before retry
+  EMPTY_MSG_MAX_RETRIES: 3, // Max retries for empty messages
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -155,20 +131,20 @@ Rules for the JSON line:
 When a user replies to a previously generated Clinical Profile, you should:
 
 1. If the user ASKS A QUESTION (e.g., "What does this mean?", "Can you explain the findings?", "What is hepatomegaly?", "Is this serious?"):
-  - Answer the question directly and helpfully based on the Clinical Profile and the original medical content
-  - Provide clear, understandable explanations
-  - If appropriate, explain medical terms in simple language
-  - Be informative but remind that this is AI analysis, not medical advice
+   - Answer the question directly and helpfully based on the Clinical Profile and the original medical content
+   - Provide clear, understandable explanations
+   - If appropriate, explain medical terms in simple language
+   - Be informative but remind that this is AI analysis, not medical advice
 
 2. If the user PROVIDES ADDITIONAL CONTEXT or CORRECTIONS (e.g., "The patient also has diabetes", "There was another report showing..."):
-  - Incorporate the new information into the Clinical Profile
-  - Generate an UPDATED Clinical Profile following the same format rules as MODE 1
-  - Also include the updated <<JSON>> line
+   - Incorporate the new information into the Clinical Profile
+   - Generate an UPDATED Clinical Profile following the same format rules as MODE 1
+   - Also include the updated <<JSON>> line
 
 3. If the user sends ADDITIONAL FILES in the reply:
-  - Analyze the new files along with the original context
-  - Generate an UPDATED Clinical Profile that includes information from all files
-  - Also include the updated <<JSON>> line
+   - Analyze the new files along with the original context
+   - Generate an UPDATED Clinical Profile that includes information from all files
+   - Also include the updated <<JSON>> line
 
 IMPORTANT: Always identify whether the user is asking a question or providing additional information, and respond appropriately.`
 };
@@ -181,8 +157,8 @@ const mediaViewerStore = new Map();
 function storeMediaForViewer(mediaFiles) {
   const viewerId = crypto.randomBytes(16).toString('hex');
   const expiresAt = Date.now() + CONFIG.MEDIA_VIEWER_EXPIRY_MS;
-  const viewableMedia = [];
 
+  const viewableMedia = [];
   for (const m of mediaFiles) {
     if (m.type === 'image' || m.type === 'pdf' || m.type === 'audio' || m.type === 'voice' || m.type === 'video') {
       viewableMedia.push({
@@ -230,11 +206,11 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 // ======================================================================
-// 🔧 DECRYPTION FAILURE TRACKER (Auto-Heal) — IMPROVED
+// 🔧 DECRYPTION FAILURE TRACKER (Auto-Heal)
 // ======================================================================
 let decryptFailTimestamps = [];
 let isHealingInProgress = false;
-let lastHealTime = 0;
+let startupHealDone = false;
 
 function trackDecryptionFailure() {
   const now = Date.now();
@@ -243,12 +219,6 @@ function trackDecryptionFailure() {
   decryptFailTimestamps = decryptFailTimestamps.filter(
     ts => (now - ts) < CONFIG.DECRYPT_FAIL_WINDOW_MS
   );
-
-  // Check cooldown — don't heal if we healed recently
-  const timeSinceLastHeal = now - lastHealTime;
-  if (timeSinceLastHeal < CONFIG.HEAL_COOLDOWN_MS) {
-    return; // Still in cooldown
-  }
 
   if (decryptFailTimestamps.length >= CONFIG.DECRYPT_FAIL_THRESHOLD && !isHealingInProgress) {
     log('🚨', `Decryption failure threshold reached (${decryptFailTimestamps.length} failures in ${CONFIG.DECRYPT_FAIL_WINDOW_MS / 1000}s). Triggering auto-heal...`);
@@ -275,16 +245,7 @@ async function nukeSessionKeysFromMongo() {
 
 async function triggerSessionHeal(reason = 'threshold') {
   if (isHealingInProgress) return;
-
-  // Check cooldown
-  const now = Date.now();
-  if (now - lastHealTime < CONFIG.HEAL_COOLDOWN_MS) {
-    log('🔧', `Heal skipped — cooldown active (${Math.round((CONFIG.HEAL_COOLDOWN_MS - (now - lastHealTime)) / 1000)}s remaining)`);
-    return;
-  }
-
   isHealingInProgress = true;
-  lastHealTime = now;
 
   log('🔧', '══════════════════════════════════════');
   log('🔧', ' AUTO-HEAL: Signal session key reset ');
@@ -298,9 +259,6 @@ async function triggerSessionHeal(reason = 'threshold') {
       log('🔧', ` Cleared ${deleted} corrupted keys. Auth creds preserved ✅`);
     }
 
-    // Clear all pending empty message retries — they belong to the old session
-    clearAllPendingRetries();
-
     if (sock) {
       log('🔄', ' Forcing reconnection...');
       try {
@@ -313,13 +271,15 @@ async function triggerSessionHeal(reason = 'threshold') {
     setTimeout(() => {
       isHealingInProgress = false;
       log('🔧', ' Heal cooldown complete.');
-    }, CONFIG.HEAL_COOLDOWN_MS);
+    }, 30000);
 
   } catch (error) {
     log('❌', ` Heal error: ${error.message}`);
     isHealingInProgress = false;
   }
 }
+
+// ======================================================================
 
 // ======================================================================
 // 🔄 API KEY ROTATION LOGIC (Every 2 Hours)
@@ -333,7 +293,6 @@ function rotateApiKeys() {
 }
 
 setInterval(rotateApiKeys, 2 * 60 * 60 * 1000);
-
 // ======================================================================
 
 function isAudioMime(mimeType) {
@@ -476,6 +435,7 @@ async function useMongoDBAuthState() {
     }
   };
 
+  // 🔧 NEW: Clear only signal session keys, keep auth creds
   const clearSessionKeys = async () => {
     try {
       const result = await SessionModel.deleteMany({
@@ -554,60 +514,19 @@ function isMessageAlreadyProcessed(msgId) {
     return true;
   }
   processedMessageIds.add(msgId);
+  // Prevent unbounded growth
   if (processedMessageIds.size > MAX_PROCESSED_IDS) {
     const arr = Array.from(processedMessageIds);
     arr.slice(0, Math.floor(MAX_PROCESSED_IDS / 2)).forEach(id => processedMessageIds.delete(id));
   }
   return false;
 }
+// ======================================================================
 
 // ======================================================================
-// 🔄 PENDING EMPTY MESSAGES TRACKER (for source group retry) — IMPROVED
+// 🔄 PENDING EMPTY MESSAGES TRACKER (for source group retry)
 // ======================================================================
-const pendingEmptyMessages = new Map();
-const pendingRetryTimers = new Map(); // Track timer IDs so we can cancel them
-
-function clearAllPendingRetries() {
-  let count = 0;
-  for (const [msgId, timerId] of pendingRetryTimers) {
-    clearTimeout(timerId);
-    count++;
-  }
-  pendingRetryTimers.clear();
-  pendingEmptyMessages.clear();
-  if (count > 0) {
-    log('🧹', `Cleared ${count} pending empty message retry timer(s) on disconnect`);
-  }
-}
-
-// ======================================================================
-// 🔧 CONNECTION STATE GUARDS — PREVENTS CONCURRENT startBot() CALLS
-// ======================================================================
-let isStartingBot = false;
-let reconnectTimer = null;
-let consecutiveReconnects = 0;
-
-function scheduleReconnect(delayMs) {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-
-  // Exponential backoff with cap
-  consecutiveReconnects++;
-  const backoffDelay = Math.min(
-    delayMs * Math.pow(1.5, Math.min(consecutiveReconnects - 1, 5)),
-    CONFIG.MAX_RECONNECT_DELAY_MS
-  );
-
-  log('🔄', `Reconnecting in ${Math.round(backoffDelay / 1000)} seconds... (attempt #${consecutiveReconnects})`);
-
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    startBot();
-  }, backoffDelay);
-}
-
+const pendingEmptyMessages = new Map(); // msgId -> { msg, retryCount, chatId, timestamp }
 // ======================================================================
 
 let sock = null;
@@ -624,23 +543,6 @@ let makeWASocket, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVers
 function log(emoji, message) {
   const time = new Date().toLocaleTimeString();
   console.log(`[${time}] ${emoji} ${message}`);
-}
-
-// 🛡️ Safe socket operation wrapper — prevents Connection Closed crashes
-async function safeSend(fn) {
-  if (!sock || !isConnected) {
-    log('⚠️', 'Socket not connected, skipping send operation');
-    return null;
-  }
-  try {
-    return await fn();
-  } catch (error) {
-    if (error.message?.includes('Connection Closed') || error.isBoom) {
-      log('⚠️', `Send failed (connection closed): ${error.message}`);
-      return null;
-    }
-    throw error; // Re-throw non-connection errors
-  }
 }
 
 function getSenderId(msg) {
@@ -747,6 +649,7 @@ function groupMediaSmartly(mediaFiles) {
       activeCaption = fileCaption;
     } else {
       currentBatch.push(file);
+
       if (!activeCaption && fileCaption) {
         activeCaption = fileCaption;
       }
@@ -767,7 +670,6 @@ function resetUserTimeout(chatId, senderId, senderName) {
   if (!chatTimeouts.has(chatId)) {
     chatTimeouts.set(chatId, new Map());
   }
-
   const chatTimeoutMap = chatTimeouts.get(chatId);
 
   if (chatTimeoutMap.has(senderId)) {
@@ -779,6 +681,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
   const isAutoGroup = isCTSource || isMRISource;
 
   const delay = isAutoGroup ? CONFIG.AUTO_PROCESS_DELAY_MS : CONFIG.MEDIA_TIMEOUT_MS;
+
   const shortId = getShortSenderId(senderId);
 
   const timeoutCallback = async () => {
@@ -808,6 +711,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
               await new Promise(r => setTimeout(r, 2000));
             }
           }
+
         } else {
           log('⚠️', 'Target group not configured for this source!');
         }
@@ -890,9 +794,9 @@ function trackBotMessage(chatId, messageId) {
   botMessageIds.get(chatId).add(messageId);
 
   const ids = botMessageIds.get(chatId);
-  if (ids.size > 2000) {
+  if (ids.size > 100) {
     const arr = Array.from(ids);
-    arr.slice(0, 1000).forEach(id => ids.delete(id));
+    arr.slice(0, 50).forEach(id => ids.delete(id));
   }
 }
 
@@ -913,6 +817,7 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 
     const batchSize = 3;
     const inputFps = targetFps * batchSize;
+
     const videoFilter = `fps=${inputFps},thumbnail=${batchSize}`;
 
     log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize})`);
@@ -950,7 +855,6 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
       .run();
   });
 }
-
 // ===================================
 
 const app = express();
@@ -968,22 +872,22 @@ app.get('/view/:viewerId', (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Link Expired</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
-        .container { text-align: center; padding: 40px; }
-        .icon { font-size: 64px; margin-bottom: 20px; }
-        h1 { color: #e94560; }
-        p { color: #aaa; }
-      </style>
+        <title>Link Expired</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+            .container { text-align: center; padding: 40px; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            h1 { color: #e94560; }
+            p { color: #aaa; }
+        </style>
     </head>
     <body>
-      <div class="container">
-        <div class="icon">⏰</div>
-        <h1>Link Expired or Invalid</h1>
-        <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
-      </div>
+        <div class="container">
+            <div class="icon">⏰</div>
+            <h1>Link Expired or Invalid</h1>
+            <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
+        </div>
     </body>
     </html>`);
   }
@@ -994,22 +898,22 @@ app.get('/view/:viewerId', (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Link Expired</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
-        .container { text-align: center; padding: 40px; }
-        .icon { font-size: 64px; margin-bottom: 20px; }
-        h1 { color: #e94560; }
-        p { color: #aaa; }
-      </style>
+        <title>Link Expired</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+            .container { text-align: center; padding: 40px; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            h1 { color: #e94560; }
+            p { color: #aaa; }
+        </style>
     </head>
     <body>
-      <div class="container">
-        <div class="icon">⏰</div>
-        <h1>Link Expired</h1>
-        <p>This media viewer link has expired (12 hour limit).</p>
-      </div>
+        <div class="container">
+            <div class="icon">⏰</div>
+            <h1>Link Expired</h1>
+            <p>This media viewer link has expired (12 hour limit).</p>
+        </div>
     </body>
     </html>`);
   }
@@ -1026,83 +930,173 @@ app.get('/view/:viewerId', (req, res) => {
 
     if (m.type === 'image') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — Image</div>
-        ${caption}${fileName}
-        <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Image</div>
+            ${caption}${fileName}
+            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+        </div>`;
     } else if (m.type === 'pdf') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — PDF</div>
-        ${caption}${fileName}
-        <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
-        <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — PDF</div>
+            ${caption}${fileName}
+            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
+            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+        </div>`;
     } else if (m.type === 'audio' || m.type === 'voice') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
-        ${caption}${fileName}
-        <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
+            ${caption}${fileName}
+            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+        </div>`;
     } else if (m.type === 'video') {
       mediaHtml += `
-      <div class="media-item">
-        <div class="media-index">#${index + 1} — Video</div>
-        ${caption}${fileName}
-        <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
-      </div>`;
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Video</div>
+            ${caption}${fileName}
+            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+        </div>`;
     }
   });
 
   res.send(`
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <title>Source Media Viewer</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 10px; }
-      .header { text-align: center; padding: 20px 10px; background: linear-gradient(135deg, #1a1a2e, #16213e); border-radius: 12px; margin-bottom: 15px; border: 1px solid #333; }
-      .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
-      .header .meta { font-size: 12px; color: #888; }
-      .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
-      .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-      .media-item { background: #1a1a2e; border-radius: 10px; overflow: hidden; border: 1px solid #2a2a4a; transition: transform 0.2s; }
-      .media-item:hover { transform: scale(1.01); border-color: #25D366; }
-      .media-item img { width: 100%; display: block; cursor: pointer; transition: opacity 0.2s; }
-      .media-item img:hover { opacity: 0.9; }
-      .media-index { padding: 8px 12px; font-size: 11px; font-weight: 600; color: #25D366; background: #0f0f1a; border-bottom: 1px solid #2a2a4a; }
-      .caption { padding: 6px 12px; font-size: 12px; color: #ccc; background: #16213e; font-style: italic; }
-      .filename { padding: 4px 12px; font-size: 11px; color: #888; }
-      .pdf-frame { width: 100%; height: 500px; border: none; }
-      .download-btn { display: block; text-align: center; padding: 10px; background: #25D366; color: #000; text-decoration: none; font-weight: 600; font-size: 13px; }
-      .download-btn:hover { background: #1da851; }
-      .fullscreen-overlay { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.95); z-index: 9999; justify-content: center; align-items: center; cursor: zoom-out; }
-      .fullscreen-overlay.active { display: flex; }
-      .fullscreen-overlay img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
-      @media (max-width: 600px) { .media-grid { grid-template-columns: 1fr; } body { padding: 5px; } }
-    </style>
-  </head>
-  <body>
-    <div class="header">
-      <h1>🔍 Source Media Viewer</h1>
-      <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
-      <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
-    </div>
-    <div class="media-grid">${mediaHtml}</div>
-    <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
-      <img id="fsImage" src="" alt="Fullscreen">
-    </div>
-    <script>
-      function openFullscreen(img) { const overlay = document.getElementById('fsOverlay'); const fsImg = document.getElementById('fsImage'); fsImg.src = img.src; overlay.classList.add('active'); }
-      function closeFullscreen() { document.getElementById('fsOverlay').classList.remove('active'); }
-      document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFullscreen(); });
-    </script>
-  </body>
-  </html>`);
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Source Media Viewer</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #0f0f1a;
+                color: #e0e0e0;
+                padding: 10px;
+            }
+            .header {
+                text-align: center;
+                padding: 20px 10px;
+                background: linear-gradient(135deg, #1a1a2e, #16213e);
+                border-radius: 12px;
+                margin-bottom: 15px;
+                border: 1px solid #333;
+            }
+            .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
+            .header .meta { font-size: 12px; color: #888; }
+            .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
+            .media-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 12px;
+            }
+            .media-item {
+                background: #1a1a2e;
+                border-radius: 10px;
+                overflow: hidden;
+                border: 1px solid #2a2a4a;
+                transition: transform 0.2s;
+            }
+            .media-item:hover { transform: scale(1.01); border-color: #25D366; }
+            .media-item img {
+                width: 100%;
+                display: block;
+                cursor: pointer;
+                transition: opacity 0.2s;
+            }
+            .media-item img:hover { opacity: 0.9; }
+            .media-index {
+                padding: 8px 12px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #25D366;
+                background: #0f0f1a;
+                border-bottom: 1px solid #2a2a4a;
+            }
+            .caption {
+                padding: 6px 12px;
+                font-size: 12px;
+                color: #ccc;
+                background: #16213e;
+                font-style: italic;
+            }
+            .filename {
+                padding: 4px 12px;
+                font-size: 11px;
+                color: #888;
+            }
+            .pdf-frame {
+                width: 100%;
+                height: 500px;
+                border: none;
+            }
+            .download-btn {
+                display: block;
+                text-align: center;
+                padding: 10px;
+                background: #25D366;
+                color: #000;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            .download-btn:hover { background: #1da851; }
+
+            .fullscreen-overlay {
+                display: none;
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                background: rgba(0,0,0,0.95);
+                z-index: 9999;
+                justify-content: center;
+                align-items: center;
+                cursor: zoom-out;
+            }
+            .fullscreen-overlay.active { display: flex; }
+            .fullscreen-overlay img {
+                max-width: 95vw;
+                max-height: 95vh;
+                object-fit: contain;
+            }
+
+            @media (max-width: 600px) {
+                .media-grid { grid-template-columns: 1fr; }
+                body { padding: 5px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🔍 Source Media Viewer</h1>
+            <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
+            <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
+        </div>
+
+        <div class="media-grid">
+            ${mediaHtml}
+        </div>
+
+        <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
+            <img id="fsImage" src="" alt="Fullscreen">
+        </div>
+
+        <script>
+            function openFullscreen(img) {
+                const overlay = document.getElementById('fsOverlay');
+                const fsImg = document.getElementById('fsImage');
+                fsImg.src = img.src;
+                overlay.classList.add('active');
+            }
+            function closeFullscreen() {
+                document.getElementById('fsOverlay').classList.remove('active');
+            }
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeFullscreen();
+            });
+        </script>
+    </body>
+    </html>`);
 });
 
 app.get('/media/:viewerId/:index', (req, res) => {
@@ -1124,7 +1118,6 @@ app.get('/media/:viewerId/:index', (req, res) => {
   res.setHeader('Content-Length', buffer.length);
   res.send(buffer);
 });
-
 // ======================================================================
 
 app.get('/', (req, res) => {
@@ -1140,14 +1133,149 @@ app.get('/', (req, res) => {
     stats.total += s.total;
   }
 
-  let html = `<!DOCTYPE html><html><head><title>WhatsApp Patient Bot</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="5"><style>* { box-sizing: border-box; } body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #25D366 0%, #128C7E 100%); color: white; padding: 20px; } .container { text-align: center; background: rgba(255,255,255,0.15); padding: 30px; border-radius: 20px; backdrop-filter: blur(10px); max-width: 600px; width: 100%; box-shadow: 0 10px 40px rgba(0,0,0,0.2); } h1 { margin: 0 0 10px 0; font-size: 24px; } .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; } .status { padding: 15px 20px; border-radius: 12px; margin: 20px 0; font-size: 16px; font-weight: 600; } .connected { background: #4CAF50; } .waiting { background: rgba(255,255,255,0.2); } .qr-container { background: white; padding: 15px; border-radius: 15px; display: inline-block; margin: 20px 0; } .qr-container img { display: block; max-width: 250px; width: 100%; } .info-box { text-align: left; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 12px; margin-top: 15px; font-size: 13px; } .info-box h3 { margin: 0 0 10px 0; font-size: 15px; } .stats { display: flex; justify-content: center; gap: 6px; margin-top: 20px; flex-wrap: wrap; } .stat { background: rgba(255,255,255,0.1); padding: 8px 10px; border-radius: 10px; min-width: 50px; } .stat-value { font-size: 16px; font-weight: bold; } .stat-label { font-size: 8px; opacity: 0.8; } .db-status { font-size: 11px; padding: 5px 10px; border-radius: 20px; display: inline-block; margin-bottom: 15px; } .db-connected { background: rgba(76, 175, 80, 0.3); } .db-disconnected { background: rgba(244, 67, 54, 0.3); }</style></head><body><div class="container"><h1>📱 WhatsApp Patient Bot</h1><p class="subtitle">Medical Clinical Profile Generator</p><div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">${mongoConnected ? '🗄 MongoDB Connected' : '⚠️ MongoDB Not Connected'}</div><div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>`;
+  let html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WhatsApp Patient Bot</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="5">
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
+                color: white;
+                padding: 20px;
+            }
+            .container {
+                text-align: center;
+                background: rgba(255,255,255,0.15);
+                padding: 30px;
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                max-width: 600px;
+                width: 100%;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            }
+            h1 { margin: 0 0 10px 0; font-size: 24px; }
+            .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; }
+            .status {
+                padding: 15px 20px;
+                border-radius: 12px;
+                margin: 20px 0;
+                font-size: 16px;
+                font-weight: 600;
+            }
+            .connected { background: #4CAF50; }
+            .waiting { background: rgba(255,255,255,0.2); }
+            .qr-container {
+                background: white;
+                padding: 15px;
+                border-radius: 15px;
+                display: inline-block;
+                margin: 20px 0;
+            }
+            .qr-container img { display: block; max-width: 250px; width: 100%; }
+            .info-box {
+                text-align: left;
+                background: rgba(0,0,0,0.2);
+                padding: 15px;
+                border-radius: 12px;
+                margin-top: 15px;
+                font-size: 13px;
+            }
+            .info-box h3 { margin: 0 0 10px 0; font-size: 15px; }
+            .stats {
+                display: flex;
+                justify-content: center;
+                gap: 6px;
+                margin-top: 20px;
+                flex-wrap: wrap;
+            }
+            .stat {
+                background: rgba(255,255,255,0.1);
+                padding: 8px 10px;
+                border-radius: 10px;
+                min-width: 50px;
+            }
+            .stat-value { font-size: 16px; font-weight: bold; }
+            .stat-label { font-size: 8px; opacity: 0.8; }
+            .db-status {
+                font-size: 11px;
+                padding: 5px 10px;
+                border-radius: 20px;
+                display: inline-block;
+                margin-bottom: 15px;
+            }
+            .db-connected { background: rgba(76, 175, 80, 0.3); }
+            .db-disconnected { background: rgba(244, 67, 54, 0.3); }
+            .feature-badge {
+                display: inline-block;
+                background: rgba(255,255,255,0.2);
+                padding: 3px 8px;
+                border-radius: 12px;
+                font-size: 10px;
+                margin: 2px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📱 WhatsApp Patient Bot</h1>
+            <p class="subtitle">Medical Clinical Profile Generator</p>
+            <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
+                ${mongoConnected ? '🗄 MongoDB Connected' : '⚠️ MongoDB Not Connected'}
+            </div>
+            <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
+    `;
 
   if (isConnected) {
-    html += `<div class="status connected">✅ UNIVERSAL MODE ACTIVE</div><p>Bot is active for all incoming messages</p><div class="stats"><div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active</div></div><div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div><div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div><div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div></div><div class="info-box"><h3>✨ Features:</h3><p><strong>🌍 Public Access:</strong> Works in any chat/group.<br><strong>🔄 Auto-Groups:</strong> Monitored CT/MRI groups active.<br><strong>🎥 Smart Video:</strong> Send <strong>.</strong> for 3FPS, <strong>.2</strong> for 2FPS, <strong>.1</strong> for 1FPS<br><strong>🧠 Secondary:</strong> Send <strong>..</strong> for Chained Analysis<br><strong>🔗 Source Viewer:</strong> 12h media link in each response<br><strong>🔧 Auto-Heal:</strong> Signal session key auto-repair<br><strong>↩️ Reply:</strong> Reply to bot to ask questions.</p></div>`;
+    html += `
+            <div class="status connected">✅ UNIVERSAL MODE ACTIVE</div>
+            <p>Bot is active for all incoming messages (Private & Group)</p>
+            <div class="stats">
+                <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
+                <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
+                <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
+                <div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div>
+            </div>
+            <div class="info-box">
+                <h3>✨ Features:</h3>
+                <p>
+                    <strong>🌍 Public Access:</strong> Works in any chat/group.<br>
+                    <strong>🔄 Auto-Groups:</strong> Monitored CT/MRI groups active.<br>
+                    <strong>🎥 Smart Video:</strong><br>
+                    - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
+                    - Send <strong>.2</strong> for Smart 2 FPS<br>
+                    - Send <strong>.1</strong> for Smart 1 FPS<br>
+                    <strong>🧠 Secondary Analysis:</strong><br>
+                    - Send <strong>..</strong> (double dot) for Chained Analysis<br>
+                    <strong>🔗 Source Viewer:</strong> Each response includes a link to view source media (12h expiry)<br>
+                    <strong>🔧 Auto-Heal:</strong> Signal session key auto-repair active<br>
+                    <strong>↩️ Reply:</strong> Reply to bot to ask questions.
+                </p>
+            </div>
+    `;
   } else if (qrCodeDataURL) {
-    html += `<div class="status waiting">📲 SCAN QR CODE</div><div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div><div class="info-box"><h3>📋 To connect:</h3><p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device</p></div>`;
+    html += `
+            <div class="status waiting">📲 SCAN QR CODE</div>
+            <div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>
+            <div class="info-box">
+                <h3>📋 To connect:</h3>
+                <p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device</p>
+            </div>
+    `;
   } else {
-    html += `<div class="status waiting">⏳ ${botStatus.toUpperCase()}</div><p>Please wait...</p>`;
+    html += `
+            <div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>
+            <p>Please wait...</p>
+    `;
   }
 
   html += `</div></body></html>`;
@@ -1166,7 +1294,6 @@ app.get('/health', (req, res) => {
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
-    consecutiveReconnects,
     timestamp: new Date().toISOString()
   });
 });
@@ -1176,13 +1303,18 @@ app.listen(PORT, () => {
 });
 
 // ======================================================================
+// 🔗 HELPER: Get the base URL for viewer links
+// ======================================================================
 function getBaseUrl() {
   if (process.env.RENDER_EXTERNAL_URL) {
     return process.env.RENDER_EXTERNAL_URL;
   }
   return `http://localhost:${PORT}`;
 }
+// ======================================================================
 
+// ======================================================================
+// 🔗 HELPER: Parse JSON block from AI response
 // ======================================================================
 function parseJsonFromResponse(responseText) {
   const jsonMatch = responseText.match(/<<JSON>>(.*?)<<JSON>>/s);
@@ -1210,26 +1342,46 @@ function formatJsonBlock(jsonData) {
   return `\n\n📋 *Quick Reference:*\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
 }
 
+// 🔧 FIX #2: Updated formatSenderContact to handle users without usernames properly
 function formatSenderContact(senderId, senderName) {
   if (!senderId) return { text: '', mentionId: null };
-  const userString = senderId.split('@')[0];
-  const namePart = senderName && senderName !== userString ? ` (${senderName})` : '';
-  const displayString = `\n\n👤 *Sent by:* @${userString}${namePart}`;
-  return { text: displayString, mentionId: senderId };
+  const phone = senderId.split('@')[0];
+  const domain = senderId.split('@')[1] || 's.whatsapp.net';
+  
+  // Check if this is a proper phone number (digits, possibly with + prefix)
+  // Phone-based JIDs look like: 919876543210@s.whatsapp.net
+  // LID-based JIDs look like: 120363047547742844@lid or long numbers @g.us participants
+  const isPhoneNumber = /^\d{7,15}$/.test(phone) && (domain === 's.whatsapp.net' || domain === 'c.us');
+  
+  if (isPhoneNumber) {
+    // This is a proper phone number - use @mention which creates a clickable link
+    return { text: `\n\n👤 *Sent by:* @${phone}`, mentionId: senderId };
+  } else {
+    // This is a LID or non-phone identifier - show the display name instead
+    // Don't create a broken @mention, just show the name
+    const displayName = senderName || phone;
+    return { text: `\n\n👤 *Sent by:* ${displayName}`, mentionId: null };
+  }
 }
 
+// ======================================================================
+// 💬 HELPER: Footer text for group chat bot messages
+// ======================================================================
 const GROUP_REPLY_FOOTER = `\n\n_💬 If you want to ask anything about this patient, select and reply to this message_`;
 
 // ======================================================================
 
 async function loadBaileys() {
   botStatus = 'Loading WhatsApp library...';
+
   try {
     const baileys = await import('@whiskeysockets/baileys');
+
     makeWASocket = baileys.default || baileys.makeWASocket;
     DisconnectReason = baileys.DisconnectReason;
     downloadMediaMessage = baileys.downloadMediaMessage;
     fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
+
     log('✅', 'Baileys loaded!');
     return true;
   } catch (error) {
@@ -1276,13 +1428,6 @@ async function connectMongoDB() {
 }
 
 async function startBot() {
-  // 🔧 GUARD: Prevent concurrent startBot() calls
-  if (isStartingBot) {
-    log('⚠️', 'startBot() already in progress, skipping duplicate call');
-    return;
-  }
-  isStartingBot = true;
-
   try {
     botStatus = 'Initializing...';
     log('🚀', 'Starting WhatsApp Bot...');
@@ -1294,24 +1439,18 @@ async function startBot() {
       await connectMongoDB();
     }
 
-    // 🔧 REMOVED STARTUP HEAL — it was causing the crash cycle!
-    // Signal keys are negotiated naturally by Baileys on reconnect.
-    // Only the auto-heal (triggered by actual repeated decryption failures) will nuke keys.
-
-    // 🔧 Gracefully close the old socket before creating a new one
-    if (sock) {
-      log('🔌', 'Closing previous socket before reconnecting...');
-      try {
-        sock.ev.removeAllListeners();
-        sock.end(undefined);
-      } catch (e) {
-        // ignore
+    // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
+    if (!startupHealDone && mongoConnected) {
+      if (!SessionModel) {
+        SessionModel = mongoose.model('Session', sessionSchema);
       }
-      sock = null;
+      log('🔧', '╔══════════════════════════════════════════╗');
+      log('🔧', '║ STARTUP HEAL: Cleaning session keys...  ║');
+      log('🔧', '╚══════════════════════════════════════════╝');
+      const deleted = await nukeSessionKeysFromMongo();
+      log('🔧', ` Startup heal complete. Removed ${deleted} stale keys.`);
+      startupHealDone = true;
     }
-
-    // Clear all pending empty message retries from previous connection
-    clearAllPendingRetries();
 
     let state, saveCreds, clearAll, clearSessionKeys;
 
@@ -1380,8 +1519,6 @@ async function startBot() {
       markOnlineOnConnect: false,
       syncFullHistory: false,
       retryRequestDelayMs: 2000,
-      connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 25000,
       getMessage: async (key) => {
         return { conversation: '' };
       }
@@ -1428,27 +1565,22 @@ async function startBot() {
           }
 
           log('🔄', 'Restarting with fresh session in 5 seconds...');
-          isStartingBot = false; // Allow restart
-          consecutiveReconnects = 0;
-          scheduleReconnect(5000);
+          setTimeout(startBot, 5000);
         } else {
-          // For 428 (Connection Closed) and 515 errors, nuke keys
-          if (statusCode === 428 || statusCode === 515) {
+          if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
             log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
             await nukeSessionKeysFromMongo();
           }
-
-          isStartingBot = false; // Allow restart
-          scheduleReconnect(CONFIG.RECONNECT_DELAY_MS);
+          log('🔄', `Reconnecting in 5 seconds...`);
+          setTimeout(startBot, 5000);
         }
-        return; // Don't proceed further
+
       } else if (connection === 'open') {
         isConnected = true;
         qrCodeDataURL = null;
         botStatus = 'Connected';
-        consecutiveReconnects = 0; // Reset backoff on successful connection
 
-        // Reset decryption failure counter on successful connection
+        // 🔧 Reset decryption failure counter on successful connection
         decryptFailTimestamps = [];
 
         log('✅', '🎉 CONNECTED TO WHATSAPP!');
@@ -1476,46 +1608,39 @@ async function startBot() {
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
 
+        // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
         const msgId = msg.key.id;
+        if (msgId && isMessageAlreadyProcessed(msgId)) {
+          log('🔁', `Skipping duplicate message ${msgId.substring(0, 8)}...`);
+          continue;
+        }
 
-        // 🔧 DECRYPTION FAILURE DETECTION & UNIVERSAL RETRY LOGIC
-        if (!msg.message || Object.keys(msg.message).length === 0) {
+        // 🔧 DECRYPTION FAILURE DETECTION
+        if (!msg.message) {
           const chatId = msg.key.remoteJid;
-
           if (chatId && chatId !== 'status@broadcast') {
-            if (msgId) {
-              processedMessageIds.delete(msgId);
-
-              if (!pendingEmptyMessages.has(msgId)) {
-                log('⏳', `Empty message body from ${chatId} — queuing for retry (msg: ${msgId.substring(0, 8)}...)`);
+            const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
+            if (isSourceGroup) {
+              // 🔄 SOURCE GROUP: Queue for retry instead of skipping
+              log('⏳', `Empty message body from source group ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
+              if (msgId && !pendingEmptyMessages.has(msgId)) {
+                // Remove from processedMessageIds so it can be reprocessed on retry
+                processedMessageIds.delete(msgId);
                 pendingEmptyMessages.set(msgId, {
                   msg: msg,
                   retryCount: 0,
                   chatId: chatId,
                   timestamp: Date.now()
                 });
+                // Schedule first retry
                 scheduleEmptyMessageRetry(msgId);
               }
+            } else {
+              log('⚠️', `Empty message body from ${chatId} (possible decryption failure)`);
+              trackDecryptionFailure();
             }
-            trackDecryptionFailure();
           }
           continue;
-        }
-
-        // 🆔 DEDUPLICATION
-        if (msgId && isMessageAlreadyProcessed(msgId)) {
-          continue;
-        }
-
-        // Check if this was previously an empty message that now has body
-        if (msgId && pendingEmptyMessages.has(msgId)) {
-          pendingEmptyMessages.delete(msgId);
-          // Cancel the retry timer
-          if (pendingRetryTimers.has(msgId)) {
-            clearTimeout(pendingRetryTimers.get(msgId));
-            pendingRetryTimers.delete(msgId);
-          }
-          log('✅', `Pending empty message ${msgId.substring(0, 8)}... now has content!`);
         }
 
         try {
@@ -1532,22 +1657,24 @@ async function startBot() {
         const msgId = update.key?.id;
         if (!msgId) continue;
 
+        // Check if this was a pending empty message that now has content
         if (pendingEmptyMessages.has(msgId) && update.update?.message) {
           const pending = pendingEmptyMessages.get(msgId);
           log('✅', `Message update received for pending empty msg ${msgId.substring(0, 8)}... — now has content!`);
 
+          // Reconstruct the message with the updated content
           const fullMsg = {
             ...pending.msg,
             message: update.update.message
           };
 
+          // Remove from pending
           pendingEmptyMessages.delete(msgId);
-          if (pendingRetryTimers.has(msgId)) {
-            clearTimeout(pendingRetryTimers.get(msgId));
-            pendingRetryTimers.delete(msgId);
-          }
+
+          // Check dedup - remove from processed so it can be handled
           processedMessageIds.delete(msgId);
 
+          // Now process it
           if (!fullMsg.key.fromMe && !isMessageAlreadyProcessed(msgId)) {
             try {
               await handleMessage(sock, fullMsg);
@@ -1563,38 +1690,38 @@ async function startBot() {
     log('💥', `Bot error: ${error.message}`);
     console.error(error);
     botStatus = 'Error - restarting...';
-    scheduleReconnect(10000);
-  } finally {
-    isStartingBot = false; // Always release the guard
+    setTimeout(startBot, 10000);
   }
 }
 
 // ======================================================================
-// 🔄 EMPTY MESSAGE RETRY LOGIC — IMPROVED with timer tracking
+// 🔄 EMPTY MESSAGE RETRY LOGIC (for source group messages)
 // ======================================================================
 function scheduleEmptyMessageRetry(msgId) {
   const pending = pendingEmptyMessages.get(msgId);
   if (!pending) return;
 
-  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS;
+  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS * (pending.retryCount + 1); // Progressive delay
 
-  const timerId = setTimeout(async () => {
-    pendingRetryTimers.delete(msgId);
-
+  setTimeout(async () => {
     const stillPending = pendingEmptyMessages.get(msgId);
-    if (!stillPending) return;
+    if (!stillPending) return; // Already resolved via messages.update
 
     stillPending.retryCount++;
 
+    // Try to load the message from the store/socket
     try {
+      // Attempt to use sock.loadMessage if available, or just check if message arrived via update
+      // The main mechanism is messages.update event, but we also check here
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
-        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (chat: ${stillPending.chatId})`);
+        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (source group: ${stillPending.chatId})`);
         pendingEmptyMessages.delete(msgId);
         return;
       }
 
-      log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}...`);
+      log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from source group`);
 
+      // Schedule next retry
       scheduleEmptyMessageRetry(msgId);
 
     } catch (error) {
@@ -1602,9 +1729,6 @@ function scheduleEmptyMessageRetry(msgId) {
       pendingEmptyMessages.delete(msgId);
     }
   }, retryDelay);
-
-  // Track the timer so we can cancel it on disconnect
-  pendingRetryTimers.set(msgId, timerId);
 }
 
 // Periodic cleanup for stale pending messages (older than 2 minutes)
@@ -1612,12 +1736,8 @@ setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [msgId, pending] of pendingEmptyMessages) {
-    if (now - pending.timestamp > 120000) {
+    if (now - pending.timestamp > 120000) { // 2 minutes
       pendingEmptyMessages.delete(msgId);
-      if (pendingRetryTimers.has(msgId)) {
-        clearTimeout(pendingRetryTimers.get(msgId));
-        pendingRetryTimers.delete(msgId);
-      }
       cleaned++;
     }
   }
@@ -1625,63 +1745,54 @@ setInterval(() => {
     log('🧹', `Cleaned ${cleaned} stale pending empty message(s)`);
   }
 }, 60000);
-
 // ======================================================================
+
+// 🟢 FIX: Helper to unwrap nested messages (ViewOnce, Ephemeral, etc.)
 const unwrapMessage = (m) => {
   if (!m) return null;
-  if (m.message) return unwrapMessage(m.message);
   if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
   if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
-  if (m.viewOnceMessageV2Extension?.message) return unwrapMessage(m.viewOnceMessageV2Extension.message);
   if (m.ephemeralMessage?.message) return unwrapMessage(m.ephemeralMessage.message);
   if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
   return m;
 };
 
-function getMessageType(content) {
-  if (!content) return null;
-  const keys = Object.keys(content);
-  const validTypes = [
-    'imageMessage',
-    'videoMessage',
-    'audioMessage',
-    'documentMessage',
-    'extendedTextMessage',
-    'conversation'
-  ];
-  for (const type of validTypes) {
-    if (keys.includes(type)) return type;
-  }
-  return keys[0];
-}
-
 async function handleMessage(sock, msg) {
   const chatId = msg.key.remoteJid;
+
   if (chatId === 'status@broadcast') return;
 
   const senderId = getSenderId(msg);
   const senderName = getSenderName(msg);
   const shortId = getShortSenderId(senderId);
-  const isGroup = chatId.endsWith('@g.us');
 
+  const isGroup = chatId.endsWith('@g.us');
   if (isGroup) {
     log('📋', `Message from group: ${chatId} (Allowed: ALL)`);
   }
 
   const content = unwrapMessage(msg.message);
-  if (!content || Object.keys(content).length === 0) {
+
+  if (!content) {
     return;
   }
 
-  const messageType = getMessageType(content);
+  const messageType = Object.keys(content)[0];
 
   let quotedMessageId = null;
-  let contextInfo = content.extendedTextMessage?.contextInfo ||
-    content.imageMessage?.contextInfo ||
-    content.videoMessage?.contextInfo ||
-    content.audioMessage?.contextInfo ||
-    content.documentMessage?.contextInfo ||
-    content[messageType]?.contextInfo;
+  let contextInfo = null;
+
+  if (messageType === 'extendedTextMessage') {
+    contextInfo = content.extendedTextMessage?.contextInfo;
+  } else if (messageType === 'imageMessage') {
+    contextInfo = content.imageMessage?.contextInfo;
+  } else if (messageType === 'documentMessage') {
+    contextInfo = content.documentMessage?.contextInfo;
+  } else if (messageType === 'audioMessage') {
+    contextInfo = content.audioMessage?.contextInfo;
+  } else if (messageType === 'videoMessage') {
+    contextInfo = content.videoMessage?.contextInfo;
+  }
 
   if (contextInfo?.stanzaId) {
     quotedMessageId = contextInfo.stanzaId;
@@ -1695,6 +1806,7 @@ async function handleMessage(sock, msg) {
 
   if (messageType === 'imageMessage') {
     log('📷', `Image from ${senderName} (...${shortId})`);
+
     try {
       const buffer = await downloadMediaMessage(msg, 'buffer', {});
       const caption = content.imageMessage.caption || '';
@@ -1713,12 +1825,14 @@ async function handleMessage(sock, msg) {
 
       log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
       resetUserTimeout(chatId, senderId, senderName);
+
     } catch (error) {
       log('❌', `Image error: ${error.message}`);
     }
   }
   else if (messageType === 'videoMessage') {
     log('🎬', `Video from ${senderName} (...${shortId})`);
+
     try {
       const buffer = await downloadMediaMessage(msg, 'buffer', {});
       const caption = content.videoMessage.caption || '';
@@ -1739,6 +1853,7 @@ async function handleMessage(sock, msg) {
 
       log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
       resetUserTimeout(chatId, senderId, senderName);
+
     } catch (error) {
       log('❌', `Video error: ${error.message}`);
     }
@@ -1746,6 +1861,7 @@ async function handleMessage(sock, msg) {
   else if (messageType === 'audioMessage') {
     const isVoice = content.audioMessage.ptt === true;
     const emoji = isVoice ? '🎤' : '🎵';
+
     log(emoji, `${isVoice ? 'Voice' : 'Audio'} from ${senderName} (...${shortId})`);
 
     try {
@@ -1761,6 +1877,7 @@ async function handleMessage(sock, msg) {
 
       log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
       resetUserTimeout(chatId, senderId, senderName);
+
     } catch (error) {
       log('❌', `Audio error: ${error.message}`);
     }
@@ -1774,6 +1891,7 @@ async function handleMessage(sock, msg) {
 
     if (fileType === 'pdf') {
       log('📄', `PDF from ${senderName} (...${shortId}): ${fileName}`);
+
       try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
 
@@ -1792,14 +1910,17 @@ async function handleMessage(sock, msg) {
 
         log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
         resetUserTimeout(chatId, senderId, senderName);
+
       } catch (error) {
         log('❌', `PDF error: ${error.message}`);
       }
     }
     else if (fileType === 'audio') {
       log('🎵', `Audio file from ${senderName} (...${shortId}): ${fileName}`);
+
       try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
+
         const count = addToUserBuffer(chatId, senderId, {
           type: 'audio',
           data: buffer.toString('base64'),
@@ -1808,17 +1929,24 @@ async function handleMessage(sock, msg) {
           caption: caption,
           timestamp: Date.now()
         });
-        if (caption) log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+
+        if (caption) {
+          log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+        }
+
         log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
         resetUserTimeout(chatId, senderId, senderName);
+
       } catch (error) {
         log('❌', `Audio file error: ${error.message}`);
       }
     }
     else if (fileType === 'video') {
       log('🎬', `Video file from ${senderName} (...${shortId}): ${fileName}`);
+
       try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
+
         const count = addToUserBuffer(chatId, senderId, {
           type: 'video',
           data: buffer.toString('base64'),
@@ -1827,9 +1955,14 @@ async function handleMessage(sock, msg) {
           caption: caption,
           timestamp: Date.now()
         });
-        if (caption) log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+
+        if (caption) {
+          log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+        }
+
         log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
         resetUserTimeout(chatId, senderId, senderName);
+
       } catch (error) {
         log('❌', `Video file error: ${error.message}`);
       }
@@ -1843,6 +1976,7 @@ async function handleMessage(sock, msg) {
 
     if (!text) return;
 
+    // CHECK FOR TRIGGERS
     const isPrimaryTrigger = /^(\.|(\.[1-3]))$/.test(text);
     const isSecondaryTrigger = /^(\.\.|(\.\.[1-3]))$/.test(text);
 
@@ -1882,17 +2016,18 @@ async function handleMessage(sock, msg) {
             await new Promise(r => setTimeout(r, 2000));
           }
         }
+
       } else {
-        await safeSend(() => sock.sendMessage(chatId, {
+        await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
           mentions: [senderId]
-        }));
+        });
       }
     }
     else if (text.toLowerCase() === 'help' || text === '?') {
-      await safeSend(() => sock.sendMessage(chatId, {
+      await sock.sendMessage(chatId, {
         text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
-      }));
+      });
     }
     else if (text.toLowerCase() === 'clear') {
       const userItems = clearUserBuffer(chatId, senderId);
@@ -1908,15 +2043,15 @@ async function handleMessage(sock, msg) {
           else if (m.type === 'text') counts.texts++;
         });
 
-        await safeSend(() => sock.sendMessage(chatId, {
+        await sock.sendMessage(chatId, {
           text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
           mentions: [senderId]
-        }));
+        });
       } else {
-        await safeSend(() => sock.sendMessage(chatId, {
+        await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
           mentions: [senderId]
-        }));
+        });
       }
     }
     else if (text.toLowerCase() === 'status') {
@@ -1924,9 +2059,9 @@ async function handleMessage(sock, msg) {
       const userCount = getUserBufferCount(chatId, senderId);
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
-      await safeSend(() => sock.sendMessage(chatId, {
-        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (2min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
-      }));
+      await sock.sendMessage(chatId, {
+        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
+      });
     }
     else {
       log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
@@ -1942,9 +2077,6 @@ async function handleMessage(sock, msg) {
       resetUserTimeout(chatId, senderId, senderName);
     }
   }
-  else {
-    log('📎', `Skipping unhandled/system message type: ${messageType}`);
-  }
 }
 
 async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType, content) {
@@ -1953,41 +2085,39 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   const isGroup = chatId.endsWith('@g.us');
 
   if (!storedContext) {
+    // 🔧 FIX #1: Updated expiry message from "30 min limit" to "12 hour limit"
     log('⚠️', `Context expired for ...${shortId}`);
-    await safeSend(() => sock.sendMessage(chatId, {
+    await sock.sendMessage(chatId, {
       text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
       mentions: [senderId]
-    }));
+    });
     return;
   }
 
   // ======================================================================
-  // GROUP CHAT REPLY
+  // 🆕 GROUP CHAT REPLY: Exclusively use source media + user text, NO system instruction
   // ======================================================================
   if (isGroup) {
+    // Extract user's question text
     let userQuestion = '';
+
     if (messageType === 'conversation') {
       userQuestion = (content.conversation || '').trim();
     } else if (messageType === 'extendedTextMessage') {
       userQuestion = (content.extendedTextMessage?.text || '').trim();
-    } else if (messageType === 'imageMessage') {
-      userQuestion = (content.imageMessage?.caption || '').trim();
-    } else if (messageType === 'videoMessage') {
-      userQuestion = (content.videoMessage?.caption || '').trim();
-    } else if (messageType === 'documentMessage') {
-      userQuestion = (content.documentMessage?.caption || '').trim();
     }
 
     if (!userQuestion) {
-      await safeSend(() => sock.sendMessage(chatId, {
+      await sock.sendMessage(chatId, {
         text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
         mentions: [senderId]
-      }));
+      });
       return;
     }
 
     log('💬', `Group reply-question from ...${shortId}: "${userQuestion.substring(0, 80)}..."`);
 
+    // Build content parts from the ORIGINAL source documents
     const sourceMedia = storedContext.mediaFiles;
     const contentParts = [];
 
@@ -2002,33 +2132,37 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       }
     }
 
+    // EXCLUSIVELY: source documents as inline data + user's question as text — NO system instruction
     const requestContent = contentParts.length > 0
       ? [userQuestion, ...contentParts]
       : [userQuestion];
 
     try {
-      await safeSend(() => sock.sendPresenceUpdate('composing', chatId));
+      await sock.sendPresenceUpdate('composing', chatId);
 
       log('🔄', `Group reply (NO system instruction): Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
 
+      // Call Gemini with NO system instruction (null)
       const responseText = await generateGeminiContent(requestContent, null);
 
-      await safeSend(() => sock.sendPresenceUpdate('paused', chatId));
+      await sock.sendPresenceUpdate('paused', chatId);
 
       let finalText = responseText.length <= 60000
         ? responseText
         : responseText.substring(0, 60000) + '\n\n_(truncated)_';
 
+      // Add the group reply footer
       finalText += GROUP_REPLY_FOOTER;
 
-      const sentMessage = await safeSend(() => sock.sendMessage(chatId, {
+      const sentMessage = await sock.sendMessage(chatId, {
         text: finalText,
         mentions: [senderId]
-      }));
+      });
 
       if (sentMessage?.key?.id) {
         const messageId = sentMessage.key.id;
         trackBotMessage(chatId, messageId);
+        // Store context with the SAME source media files so further replies also work
         storeContext(chatId, messageId, sourceMedia, responseText, senderId);
         log('💾', `Group reply context stored for ...${shortId}`);
       }
@@ -2038,18 +2172,18 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
     } catch (error) {
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
-      await safeSend(() => sock.sendMessage(chatId, {
+      await sock.sendMessage(chatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
         mentions: [senderId]
-      }));
+      });
     }
 
     return;
   }
+  // ======================================================================
+  // END GROUP CHAT REPLY — below is the original private chat reply logic
+  // ======================================================================
 
-  // ======================================================================
-  // PRIVATE CHAT REPLY
-  // ======================================================================
   const newContent = [];
   let userTextInput = '';
 
@@ -2057,85 +2191,163 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     const text = content.conversation || '';
     if (text.trim()) {
       userTextInput = text.trim();
-      newContent.push({ type: 'text', content: text.trim(), sender: senderName, timestamp: Date.now(), isFollowUp: true });
-      log('💬', `Follow-up text from ...${shortId}: "${text.substring(0, 50)}..."`);
+      newContent.push({
+        type: 'text',
+        content: text.trim(),
+        sender: senderName,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
+      log('💬', `Follow-up text (conversation) from ...${shortId}: "${text.substring(0, 50)}..."`);
     }
   }
   else if (messageType === 'extendedTextMessage') {
     const text = content.extendedTextMessage?.text || '';
     if (text.trim()) {
       userTextInput = text.trim();
-      newContent.push({ type: 'text', content: text.trim(), sender: senderName, timestamp: Date.now(), isFollowUp: true });
-      log('💬', `Follow-up text from ...${shortId}: "${text.substring(0, 50)}..."`);
+      newContent.push({
+        type: 'text',
+        content: text.trim(),
+        sender: senderName,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
+      log('💬', `Follow-up text (extended) from ...${shortId}: "${text.substring(0, 50)}..."`);
     }
   }
   else if (messageType === 'imageMessage') {
     try {
       const buffer = await downloadMediaMessage(msg, 'buffer', {});
       const caption = content.imageMessage.caption || '';
-      newContent.push({ type: 'image', data: buffer.toString('base64'), mimeType: content.imageMessage.mimetype || 'image/jpeg', caption: caption, timestamp: Date.now(), isFollowUp: true });
+
+      newContent.push({
+        type: 'image',
+        data: buffer.toString('base64'),
+        mimeType: content.imageMessage.mimetype || 'image/jpeg',
+        caption: caption,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
       if (caption) userTextInput = caption;
       log('📷', `Follow-up image from ...${shortId}`);
-    } catch (error) { log('❌', `Image error: ${error.message}`); }
+    } catch (error) {
+      log('❌', `Image error: ${error.message}`);
+    }
   }
   else if (messageType === 'videoMessage') {
     try {
       const buffer = await downloadMediaMessage(msg, 'buffer', {});
       const caption = content.videoMessage.caption || '';
-      newContent.push({ type: 'video', data: buffer.toString('base64'), mimeType: content.videoMessage.mimetype || 'video/mp4', caption: caption, duration: content.videoMessage.seconds || 0, timestamp: Date.now(), isFollowUp: true });
+
+      newContent.push({
+        type: 'video',
+        data: buffer.toString('base64'),
+        mimeType: content.videoMessage.mimetype || 'video/mp4',
+        caption: caption,
+        duration: content.videoMessage.seconds || 0,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
       if (caption) userTextInput = caption;
       log('🎬', `Follow-up video from ...${shortId}`);
-    } catch (error) { log('❌', `Video error: ${error.message}`); }
+    } catch (error) {
+      log('❌', `Video error: ${error.message}`);
+    }
   }
   else if (messageType === 'audioMessage') {
     try {
       const buffer = await downloadMediaMessage(msg, 'buffer', {});
       const isVoice = content.audioMessage.ptt === true;
-      newContent.push({ type: isVoice ? 'voice' : 'audio', data: buffer.toString('base64'), mimeType: content.audioMessage.mimetype || 'audio/ogg', duration: content.audioMessage.seconds || 0, timestamp: Date.now(), isFollowUp: true });
+
+      newContent.push({
+        type: isVoice ? 'voice' : 'audio',
+        data: buffer.toString('base64'),
+        mimeType: content.audioMessage.mimetype || 'audio/ogg',
+        duration: content.audioMessage.seconds || 0,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
       log(isVoice ? '🎤' : '🎵', `Follow-up audio from ...${shortId}`);
-    } catch (error) { log('❌', `Audio error: ${error.message}`); }
+    } catch (error) {
+      log('❌', `Audio error: ${error.message}`);
+    }
   }
   else if (messageType === 'documentMessage') {
     const docMime = content.documentMessage.mimetype || '';
     const fileName = content.documentMessage.fileName || 'document';
     const caption = content.documentMessage.caption || '';
+
     const fileType = getFileType(docMime, fileName);
 
     if (fileType === 'pdf') {
       try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
-        newContent.push({ type: 'pdf', data: buffer.toString('base64'), mimeType: 'application/pdf', fileName: fileName, caption: caption, timestamp: Date.now(), isFollowUp: true });
+
+        newContent.push({
+          type: 'pdf',
+          data: buffer.toString('base64'),
+          mimeType: 'application/pdf',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now(),
+          isFollowUp: true
+        });
         if (caption) userTextInput = caption;
         log('📄', `Follow-up PDF from ...${shortId}`);
-      } catch (error) { log('❌', `PDF error: ${error.message}`); }
+      } catch (error) {
+        log('❌', `PDF error: ${error.message}`);
+      }
     }
     else if (fileType === 'audio') {
       try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
-        newContent.push({ type: 'audio', data: buffer.toString('base64'), mimeType: docMime || 'audio/mpeg', fileName: fileName, caption: caption, timestamp: Date.now(), isFollowUp: true });
+
+        newContent.push({
+          type: 'audio',
+          data: buffer.toString('base64'),
+          mimeType: docMime || 'audio/mpeg',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now(),
+          isFollowUp: true
+        });
         if (caption) userTextInput = caption;
         log('🎵', `Follow-up audio file from ...${shortId}`);
-      } catch (error) { log('❌', `Audio file error: ${error.message}`); }
+      } catch (error) {
+        log('❌', `Audio file error: ${error.message}`);
+      }
     }
     else if (fileType === 'video') {
       try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
-        newContent.push({ type: 'video', data: buffer.toString('base64'), mimeType: docMime || 'video/mp4', fileName: fileName, caption: caption, timestamp: Date.now(), isFollowUp: true });
+
+        newContent.push({
+          type: 'video',
+          data: buffer.toString('base64'),
+          mimeType: docMime || 'video/mp4',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now(),
+          isFollowUp: true
+        });
         if (caption) userTextInput = caption;
         log('🎬', `Follow-up video file from ...${shortId}`);
-      } catch (error) { log('❌', `Video file error: ${error.message}`); }
+      } catch (error) {
+        log('❌', `Video file error: ${error.message}`);
+      }
     }
   }
 
   if (newContent.length === 0) {
-    await safeSend(() => sock.sendMessage(chatId, {
+    await sock.sendMessage(chatId, {
       text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
       mentions: [senderId]
-    }));
+    });
     return;
   }
 
   const isUserQuestion = isQuestion(userTextInput);
+
   const combinedMedia = [...storedContext.mediaFiles, ...newContent];
 
   log('🔄', `Regenerating for ...${shortId}: ${storedContext.mediaFiles.length} original + ${newContent.length} new (isQuestion: ${isUserQuestion})`);
@@ -2143,7 +2355,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
 
-// 🟢 Unified Helper Function for Gemini API Calls with Fallback logic
+// 🟢 MODIFIED: Fallback Lite Model with High Thinking Function
 async function generateGeminiContent(requestContent, systemInstruction) {
   const keys = CONFIG.API_KEYS;
   if (keys.length === 0) {
@@ -2172,11 +2384,9 @@ async function generateGeminiContent(requestContent, systemInstruction) {
           model: modelName,
           safetySettings: safetySettings
         };
-
         if (systemInstruction) {
           modelConfig.systemInstruction = systemInstruction;
         }
-
         if (useThinking) {
           modelConfig.generationConfig = {
             thinkingConfig: { thinkingLevel: 'HIGH' }
@@ -2199,9 +2409,10 @@ async function generateGeminiContent(requestContent, systemInstruction) {
         log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
       }
     }
-    return null;
+    return null; 
   };
 
+  // 1. Loop through keys using Primary Model
   let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
   if (responseText) {
     return responseText;
@@ -2209,11 +2420,13 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 
   log('⚠️', `All keys failed for primary model. Falling back to gemini-3.1-flash-lite-preview with HIGH thinking...`);
 
+  // 2. Loop through keys using Fallback Lite Model
   responseText = await tryModel('gemini-3.1-flash-lite-preview', true);
   if (responseText) {
-    return responseText + '\n\n_{fallback model used}_';
+    return responseText + '\n\n_{fallback model gemini-3.1-flash-lite used}_';
   }
 
+  // 3. Both models failed across all keys
   throw new Error(`All ${keys.length} API keys failed for both primary and fallback models. Last error: ${lastErrorMsg}`);
 }
 
@@ -2267,42 +2480,61 @@ async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previo
         counts.images++;
         binaryMedia.push(m);
         if (m.caption) {
-          if (m.isFollowUp) { followUpTexts.push(`[Additional image caption]: ${m.caption}`); }
-          else { captions.push(`[Image caption]: ${m.caption}`); }
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional image caption]: ${m.caption}`);
+          } else {
+            captions.push(`[Image caption]: ${m.caption}`);
+          }
         }
       }
       else if (m.type === 'pdf') {
         counts.pdfs++;
         binaryMedia.push(m);
         if (m.caption) {
-          if (m.isFollowUp) { followUpTexts.push(`[Additional PDF caption]: ${m.caption}`); }
-          else { captions.push(`[PDF caption]: ${m.caption}`); }
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional PDF caption]: ${m.caption}`);
+          } else {
+            captions.push(`[PDF caption]: ${m.caption}`);
+          }
         }
       }
       else if (m.type === 'audio' || m.type === 'voice') {
         counts.audio++;
         binaryMedia.push(m);
         if (m.caption) {
-          if (m.isFollowUp) { followUpTexts.push(`[Additional audio caption]: ${m.caption}`); }
-          else { captions.push(`[Audio caption]: ${m.caption}`); }
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional audio caption]: ${m.caption}`);
+          } else {
+            captions.push(`[Audio caption]: ${m.caption}`);
+          }
         }
       }
       else if (m.type === 'video') {
         counts.video++;
         binaryMedia.push(m);
         if (m.caption) {
-          if (m.isFollowUp) { followUpTexts.push(`[Additional video caption]: ${m.caption}`); }
-          else { captions.push(`[Video caption]: ${m.caption}`); }
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional video caption]: ${m.caption}`);
+          } else {
+            captions.push(`[Video caption]: ${m.caption}`);
+          }
         }
       }
       else if (m.type === 'text') {
         counts.texts++;
-        if (m.isFollowUp) { followUpTexts.push(`[User follow-up from ${m.sender}]: ${m.content}`); }
-        else { textContents.push(`[Text note from ${m.sender}]: ${m.content}`); }
+        if (m.isFollowUp) {
+          followUpTexts.push(`[User follow-up from ${m.sender}]: ${m.content}`);
+        } else {
+          textContents.push(`[Text note from ${m.sender}]: ${m.content}`);
+        }
       }
     });
 
-    log('🤖', `Processing for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
+    if (isFollowUp) {
+      log('🤖', `Processing follow-up for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
+    } else {
+      log('🤖', `Processing for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
+    }
 
     const contentParts = [];
     binaryMedia.forEach(media => {
@@ -2371,6 +2603,7 @@ Please analyze ALL the content (original files + original text + NEW additional 
 - Exclude patient name, age, gender
 - Include the <<JSON>> block after the profile`;
       }
+
     } else if (binaryMedia.length > 0 && allOriginalText.length > 0) {
       promptText = `Analyze these ${promptParts.join(', ')} along with the following additional text notes/context, and generate the Clinical Profile.
 
@@ -2405,18 +2638,23 @@ ${allOriginalText.join('\n\n')}
 
     // --- STEP 1: Generate Primary Clinical Profile ---
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
-
     const rawPrimaryResponse = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
 
+    // Parse JSON from response
     const jsonData = parseJsonFromResponse(rawPrimaryResponse);
     const primaryResponseText = stripJsonFromResponse(rawPrimaryResponse);
 
     if (isSecondaryMode && !isFollowUp) {
+      // Build mentions array for this message
       const step1Mentions = [senderId];
       let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
-      if (jsonData) { step1Text += formatJsonBlock(jsonData); }
-      if (viewerUrl) { step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`; }
-
+      if (jsonData) {
+        step1Text += formatJsonBlock(jsonData);
+      }
+      if (viewerUrl) {
+        step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+      }
+      // Add sender contact for auto-group routing using @mention
       if (targetChatId) {
         const senderContact = formatSenderContact(senderId, senderName);
         step1Text += senderContact.text;
@@ -2424,10 +2662,15 @@ ${allOriginalText.join('\n\n')}
           step1Mentions.push(senderContact.mentionId);
         }
       }
+      // Add group reply footer if destination is a group
+      if (isDestinationGroup) {
+        step1Text += GROUP_REPLY_FOOTER;
+      }
 
-      if (isDestinationGroup) { step1Text += GROUP_REPLY_FOOTER; }
-
-      await safeSend(() => sock.sendMessage(destinationChatId, { text: step1Text, mentions: step1Mentions }));
+      await sock.sendMessage(destinationChatId, {
+        text: step1Text,
+        mentions: step1Mentions
+      });
       log('📤', `Sent Primary (Step 1) to ...${shortId}`);
 
       // --- STEP 2: Generate Secondary Analysis ---
@@ -2442,10 +2685,12 @@ ${primaryResponseText}
       const secondaryRequestContent = [secondaryPrompt];
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
 
+      // Build mentions array for secondary message
       const step2Mentions = [senderId];
       let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
-      if (viewerUrl) { finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`; }
-
+      if (viewerUrl) {
+        finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+      }
       if (targetChatId) {
         const senderContact = formatSenderContact(senderId, senderName);
         finalSecondaryText += senderContact.text;
@@ -2453,8 +2698,10 @@ ${primaryResponseText}
           step2Mentions.push(senderContact.mentionId);
         }
       }
-
-      if (isDestinationGroup) { finalSecondaryText += GROUP_REPLY_FOOTER; }
+      // Add group reply footer if destination is a group
+      if (isDestinationGroup) {
+        finalSecondaryText += GROUP_REPLY_FOOTER;
+      }
 
       processedCount++;
 
@@ -2466,11 +2713,14 @@ ${primaryResponseText}
       console.log(finalSecondaryText);
       console.log('═'.repeat(60) + '\n');
 
-      await safeSend(() => sock.sendPresenceUpdate('composing', destinationChatId));
+      await sock.sendPresenceUpdate('composing', destinationChatId);
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await safeSend(() => sock.sendPresenceUpdate('paused', destinationChatId));
+      await sock.sendPresenceUpdate('paused', destinationChatId);
 
-      const sentMessage = await safeSend(() => sock.sendMessage(destinationChatId, { text: finalSecondaryText, mentions: step2Mentions }));
+      const sentMessage = await sock.sendMessage(destinationChatId, {
+        text: finalSecondaryText,
+        mentions: step2Mentions
+      });
 
       if (sentMessage?.key?.id) {
         const messageId = sentMessage.key.id;
@@ -2478,12 +2728,12 @@ ${primaryResponseText}
         storeContext(destinationChatId, messageId, mediaFiles, secondaryResponseText, senderId);
         log('💾', `Secondary Context stored for ...${shortId}`);
       }
-
       log('📤', `Sent Secondary (Step 2) to target!`);
       return;
     }
 
     // --- NORMAL PRIMARY MODE or FOLLOW-UP HANDLING ---
+
     if (!primaryResponseText || primaryResponseText.trim() === '') {
       throw new Error('Received empty response from AI');
     }
@@ -2501,10 +2751,10 @@ ${primaryResponseText}
     if (jsonData) console.log(`JSON: ${JSON.stringify(jsonData)}`);
     console.log('═'.repeat(60) + '\n');
 
-    await safeSend(() => sock.sendPresenceUpdate('composing', destinationChatId));
+    await sock.sendPresenceUpdate('composing', destinationChatId);
     const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
     await new Promise(resolve => setTimeout(resolve, delay));
-    await safeSend(() => sock.sendPresenceUpdate('paused', destinationChatId));
+    await sock.sendPresenceUpdate('paused', destinationChatId);
 
     let finalResponseText = primaryResponseText.length <= 60000
       ? primaryResponseText
@@ -2517,11 +2767,20 @@ ${primaryResponseText}
       }
     }
 
-    if (jsonData) { finalResponseText += formatJsonBlock(jsonData); }
-    if (viewerUrl) { finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`; }
+    // Append JSON block
+    if (jsonData) {
+      finalResponseText += formatJsonBlock(jsonData);
+    }
 
+    // 🔗 Append viewer URL to response
+    if (viewerUrl) {
+      finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+    }
+
+    // Build mentions array
     const finalMentions = [senderId];
 
+    // 👤 Append sender contact for auto-group routing using @mention
     if (targetChatId) {
       const senderContact = formatSenderContact(senderId, senderName);
       finalResponseText += senderContact.text;
@@ -2530,9 +2789,15 @@ ${primaryResponseText}
       }
     }
 
-    if (isDestinationGroup) { finalResponseText += GROUP_REPLY_FOOTER; }
+    // 💬 Append group reply footer if destination is a group
+    if (isDestinationGroup) {
+      finalResponseText += GROUP_REPLY_FOOTER;
+    }
 
-    const sentMessage = await safeSend(() => sock.sendMessage(destinationChatId, { text: finalResponseText, mentions: finalMentions }));
+    const sentMessage = await sock.sendMessage(destinationChatId, {
+      text: finalResponseText,
+      mentions: finalMentions
+    });
 
     if (sentMessage?.key?.id) {
       const messageId = sentMessage.key.id;
@@ -2545,28 +2810,18 @@ ${primaryResponseText}
 
   } catch (error) {
     log('❌', `Error for ...${shortId}: ${error.message}`);
-
-    // Don't retry or send error messages if connection is closed
-    if (error.message?.includes('Connection Closed') || error.isBoom) {
-      log('⚠️', `Connection was closed during processing for ...${shortId}. Will retry when reconnected.`);
-      // Re-buffer the media so it's not lost
-      if (retryAttempt === 0 && mediaFiles.length > 0) {
-        log('📦', `Re-buffering ${mediaFiles.length} files for ...${shortId} (connection lost)`);
-        for (const m of mediaFiles) {
-          addToUserBuffer(targetChatId || chatId, senderId, m);
-        }
-        resetUserTimeout(targetChatId || chatId, senderId, senderName);
-      }
-      return;
-    }
+    console.error(error);
 
     if (retryAttempt === 0) {
       log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
 
-      await safeSend(() => sock.sendMessage(destinationChatId, {
+      await sock.sendPresenceUpdate('composing', destinationChatId);
+      await new Promise(r => setTimeout(r, 1000));
+
+      await sock.sendMessage(destinationChatId, {
         text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
         mentions: [senderId]
-      }));
+      });
 
       setTimeout(() => {
         log('🔄', `Executing 5-minute retry for ...${shortId}`);
@@ -2576,32 +2831,43 @@ ${primaryResponseText}
       return;
     }
 
-    await safeSend(() => sock.sendMessage(destinationChatId, {
+    await sock.sendPresenceUpdate('composing', destinationChatId);
+    await new Promise(r => setTimeout(r, 1500));
+
+    await sock.sendMessage(destinationChatId, {
       text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
       mentions: [senderId]
-    }));
+    });
   }
 }
 
-console.log('\n╔═══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v4.0               ║');
-console.log('║                                                          ║');
-console.log('║ 📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text  ║');
-console.log('║                                                          ║');
-console.log('║ 🌍 UNIVERSAL MODE: Works in any chat (Group or Private) ║');
-console.log('║ 🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s) ║');
-console.log('║ 🔀 SMART BATCHING: Splits distinct patients automatically║');
-console.log('║ 🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames     ║');
-console.log('║ 🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain    ║');
-console.log('║ 🔗 SOURCE VIEWER: Each response has a 12h media link    ║');
-console.log('║ 🔧 AUTO-HEAL: Signal key auto-repair (relaxed threshold)║');
-console.log('║ 🛡️  CRASH GUARD: Uncaught exception handler active      ║');
-console.log('║ 🔒 RECONNECT GUARD: Prevents duplicate startBot() calls ║');
-console.log('║ 🆔 DEDUPLICATION: Prevents duplicate message processing ║');
-console.log('║ ↩️  Reply to ask questions OR add context                ║');
-console.log('║ 🗄 MongoDB Persistent Sessions                          ║');
-console.log('║ 🔑 Multi-Key Rotation (2hrs) + Failover Active          ║');
-console.log('╚═══════════════════════════════════════════════════════════╝\n');
+
+
+
+
+console.log('\n╔══════════════════════════════════════════════════════════╗');
+console.log('║         WhatsApp Clinical Profile Bot v3.3              ║');
+console.log('║                                                        ║');
+console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
+console.log('║                                                        ║');
+console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)║');
+console.log('║  🔄 AUTO-GROUPS: Monitors Source -> Sends to Target (60s)║');
+console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║');
+console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
+console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
+console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
+console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
+console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
+console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
+console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
+console.log('║  👤 SENDER CONTACT: @mention tag for source sender     ║');
+console.log('║  🔄 EMPTY MSG RETRY: Auto-retry empty source group msgs║');
+console.log('║                                                        ║');
+console.log('║  ✨ Per-User Buffers - Each user processed separately  ║');
+console.log('║  ↩️ Reply to ask questions OR add context               ║');
+console.log('║  🗄 MongoDB Persistent Sessions                        ║');
+console.log('║  🔑 Multi-Key Rotation (2hrs) + Failover Active        ║');
+console.log('╚══════════════════════════════════════════════════════════╝\n');
 
 log('🏁', 'Starting...');
 
