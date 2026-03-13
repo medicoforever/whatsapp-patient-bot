@@ -119,13 +119,15 @@ Return ONLY the single formatted paragraph described above.
 
 IMPORTANT ADDITIONAL OUTPUT:
 After the Clinical Profile paragraph, you MUST output a second line (separated by a blank line) in EXACTLY this format:
-<<JSON>>{"age":"<age or unknown>","sex":"<M/F/unknown>","study":"<imaging study indicated or Not mentioned>","brief":"<very concise reason for scan using abbreviations like H/o, c/o, s/o, etc., mentioning duration of symptoms>"}<<JSON>>
+<<JSON>>{"mrn":"<Registration Number/MRN or Not mentioned>","age":"<age or unknown>","sex":"<M/F/unknown>","study":"<imaging study indicated or Not mentioned>","brief":"<very concise reason for scan using abbreviations like H/o, C/o, K/c/o, etc., mentioning duration of symptoms>"}<<JSON>>
 
 Rules for the JSON line:
+- mrn: Extract the patient's Medical Record Number (MRN), Registration Number, ID, UID, or IP/OP number from the content. If not found, use "Not mentioned".
 - age: Extract patient age from the content. If not found, use "unknown".
 - sex: Extract patient sex/gender from the content. Use "M" for male, "F" for female. If not found, use "unknown".
 - study: The imaging study that is currently indicated/requested (e.g., "CT Thorax", "MRI Brain", "USG Abdomen"). If not obvious from the content, use "Not mentioned".
-- brief: A very short clinical summary (max 15-20 words) using medical abbreviations. Example: "H/o fever 4d, cough, SOB, k/c ILD - r/o infective exacerbation" or "Giddiness 15d, slurred speech, R UL weakness, k/c HTN/DM - r/o cerebellar infarct"
+- brief: A very short clinical summary using medical abbreviations. Example: "H/o fever and cough for 4 days, SOB for 2 days, K/c/o ILD, Now scan done to r/o infective exacerbation" or "C/o Giddiness for 15 days, slurred speech for 5 days, Right upper limb weakness for 2 days, K/c/o HTN/DM, Now scan done to r/o cerebellar infarct"
+
 
 **MODE 2: FOLLOW-UP INTERACTION**
 When a user replies to a previously generated Clinical Profile, you should:
@@ -1335,11 +1337,12 @@ function stripJsonFromResponse(responseText) {
 
 function formatJsonBlock(jsonData) {
   if (!jsonData) return '';
+  const mrn = jsonData.mrn || 'Not mentioned';
   const age = jsonData.age || 'unknown';
   const sex = jsonData.sex || 'unknown';
   const study = jsonData.study || 'Not mentioned';
   const brief = jsonData.brief || '';
-  return `\n\n📋 *Quick Reference:*\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
+  return `\n\n📋 *Quick Reference:*\n• MRN/Reg No: ${mrn}\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
 }
 
 // 🔧 FIX #2: Updated formatSenderContact to handle users without usernames properly
@@ -2617,13 +2620,24 @@ For video files (or video frames provided as images), analyze visual content and
     else if (binaryMedia.length > 0) {
       promptText = `Analyze these ${promptParts.join(', ')} containing medical information and generate the Clinical Profile. For audio files, transcribe the content first. For video files (or video frames provided as images), analyze visual content and extract text.`;
     }
-    else if (allOriginalText.length > 0) {
+else if (allOriginalText.length > 0) {
       promptText = `Analyze the following text notes containing medical information and generate the Clinical Profile.
 
 === TEXT NOTES ===
 ${allOriginalText.join('\n\n')}
 === END OF TEXT NOTES ===`;
     }
+
+    // ======================================================================
+    // 🟢 ADDED: DYNAMIC DATE ANCHOR TO PREVENT YEAR HALLUCINATIONS
+    // ======================================================================
+    const currentDate = new Date().toLocaleDateString('en-GB', { 
+      day: 'numeric', month: 'long', year: 'numeric' 
+    });
+    
+    promptText += `\n\n⚠️ CRITICAL INSTRUCTION REGARDING DATES: 
+Today's current date is ${currentDate}. Please pay extremely close attention to the dates printed or handwritten on the medical reports. You MUST extract and transcribe the year EXACTLY as it appears in the images/documents. Do NOT let your training biases replace the current year with past years.`;
+    // ======================================================================
 
     let requestContent;
     if (binaryMedia.length > 0) {
