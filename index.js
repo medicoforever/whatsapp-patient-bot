@@ -618,58 +618,102 @@ function getShortSenderId(senderId) {
   return phone;
 }
 
-function getUserBuffer(chatId, senderId) {
-  if (!chatMediaBuffers.has(chatId)) {
-    chatMediaBuffers.set(chatId, new Map());
-  }
-  const chatBuffer = chatMediaBuffers.get(chatId);
-  if (!chatBuffer.has(senderId)) {
-    chatBuffer.set(senderId, []);
-  }
-  return chatBuffer.get(senderId);
-}
-
-function addToUserBuffer(chatId, senderId, mediaItem) {
-  const buffer = getUserBuffer(chatId, senderId);
-  buffer.push(mediaItem);
-  return buffer.length;
-}
-
-function clearUserBuffer(chatId, senderId) {
-  if (chatMediaBuffers.has(chatId)) {
-    const chatBuffer = chatMediaBuffers.get(chatId);
-    if (chatBuffer.has(senderId)) {
-      const items = chatBuffer.get(senderId);
-      chatBuffer.delete(senderId);
-      return items;
+// ======================================================================
+// 📥 PERSISTENT USER MEDIA BUFFER MANAGEMENT
+// ======================================================================
+async function addToUserBuffer(chatId, senderId, mediaItem, msgId = null, senderName = '') {
+  const model = getPendingMediaModel();
+  if (model) {
+    try {
+      await model.create({
+        chatId,
+        senderId,
+        senderName,
+        messageId: msgId || require('crypto').randomBytes(8).toString('hex'),
+        type: mediaItem.type,
+        data: mediaItem.data,
+        mimeType: mediaItem.mimeType,
+        caption: mediaItem.caption || '',
+        fileName: mediaItem.fileName || ''
+      });
+      const count = await model.countDocuments({ chatId, senderId, processed: false });
+      return count;
+    } catch (err) {
+      log('⚠️', 'MongoDB buffer save error: ' + err.message + '. Falling back to RAM.');
     }
   }
-  return [];
+
+  // RAM Fallback
+  if (!chatMediaBuffers.has(chatId)) chatMediaBuffers.set(chatId, new Map());
+  const chatBuf = chatMediaBuffers.get(chatId);
+  if (!chatBuf.has(senderId)) chatBuf.set(senderId, []);
+  const buf = chatBuf.get(senderId);
+  buf.push(mediaItem);
+  return buf.length;
 }
 
-function getUserBufferCount(chatId, senderId) {
-  if (!chatMediaBuffers.has(chatId)) return 0;
-  const chatBuffer = chatMediaBuffers.get(chatId);
-  if (!chatBuffer.has(senderId)) return 0;
-  return chatBuffer.get(senderId).length;
+async function clearUserBuffer(chatId, senderId) {
+  const model = getPendingMediaModel();
+  let mongoItems = [];
+
+  if (model) {
+    try {
+      const docs = await model.find({ chatId, senderId, processed: false }).sort({ createdAt: 1 });
+      if (docs.length > 0) {
+        await model.updateMany({ chatId, senderId, processed: false }, { processed: true });
+        mongoItems = docs.map(d => ({
+          type: d.type,
+          data: d.data,
+          mimeType: d.mimeType,
+          caption: d.caption,
+          fileName: d.fileName
+        }));
+      }
+    } catch (err) {}
+  }
+
+  // RAM Fallback
+  let ramItems = [];
+  if (chatMediaBuffers.has(chatId)) {
+    const chatBuf = chatMediaBuffers.get(chatId);
+    if (chatBuf.has(senderId)) {
+      ramItems = chatBuf.get(senderId);
+      chatBuf.delete(senderId);
+    }
+  }
+  return [...mongoItems, ...ramItems];
 }
 
-function getTotalBufferStats(chatId) {
+async function getUserBufferCount(chatId, senderId) {
+  const model = getPendingMediaModel();
+  let count = 0;
+  if (model) {
+    try { count = await model.countDocuments({ chatId, senderId, processed: false }); } catch (err) {}
+  }
+  if (chatMediaBuffers.has(chatId) && chatMediaBuffers.get(chatId).has(senderId)) {
+    count += chatMediaBuffers.get(chatId).get(senderId).length;
+  }
+  return count;
+}
+
+async function getTotalBufferStats(chatId) {
   const stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
-  if (!chatMediaBuffers.has(chatId)) return stats;
-
-  const chatBuffer = chatMediaBuffers.get(chatId);
-  stats.users = chatBuffer.size;
-
-  for (const [senderId, items] of chatBuffer) {
-    items.forEach(m => {
-      if (m.type === 'image') stats.images++;
-      else if (m.type === 'pdf') stats.pdfs++;
-      else if (m.type === 'audio' || m.type === 'voice') stats.audio++;
-      else if (m.type === 'video') stats.video++;
-      else if (m.type === 'text') stats.texts++;
-      stats.total++;
-    });
+  const model = getPendingMediaModel();
+  if (model) {
+    try {
+      const docs = await model.find({ chatId, processed: false });
+      const uniqueUsers = new Set();
+      for (const d of docs) {
+        uniqueUsers.add(d.senderId);
+        if (d.type === 'image') stats.images++;
+        else if (d.type === 'pdf') stats.pdfs++;
+        else if (d.type === 'audio' || d.type === 'voice') stats.audio++;
+        else if (d.type === 'video') stats.video++;
+        else if (d.type === 'text') stats.texts++;
+        stats.total++;
+      }
+      stats.users = uniqueUsers.size;
+    } catch(e) {}
   }
   return stats;
 }
@@ -741,7 +785,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
 
   const timeoutCallback = async () => {
     if (isAutoGroup) {
-      const mediaFiles = clearUserBuffer(chatId, senderId);
+      const mediaFiles = await clearUserBuffer(chatId, senderId);
       if (mediaFiles.length > 0) {
         log('⏱️', `Auto-processing ${mediaFiles.length} item(s) from Auto Group (${isCTGroup ? 'CT' : 'MRI'})`);
 
@@ -772,7 +816,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
         }
       }
     } else {
-      const clearedItems = clearUserBuffer(chatId, senderId);
+      const clearedItems = await clearUserBuffer(chatId, senderId);
       if (clearedItems.length > 0) {
         log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
       }
@@ -1176,10 +1220,10 @@ app.get('/media/:viewerId/:index', (req, res) => {
 });
 // ======================================================================
 
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
   let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
   for (const [chatId, _] of chatMediaBuffers) {
-    const s = getTotalBufferStats(chatId);
+    const s = await getTotalBufferStats(chatId);
     stats.users += s.users;
     stats.images += s.images;
     stats.pdfs += s.pdfs;
@@ -1488,6 +1532,28 @@ async function connectMongoDB() {
 
     mongoConnected = true;
     log('✅', 'MongoDB connected! Sessions will persist.');
+
+    // 🔥 Startup Recovery: Process any pending media that was abandoned during a restart
+    setTimeout(async () => {
+      const pendingModel = getPendingMediaModel();
+      if (pendingModel) {
+        try {
+          const abandoned = await pendingModel.distinct('chatId', { processed: false });
+          if (abandoned.length > 0) {
+            log('🔄', `Found ${abandoned.length} chats with unprocessed media. Waking up queues...`);
+            for (const chatId of abandoned) {
+              const users = await pendingModel.distinct('senderId', { chatId, processed: false });
+              for (const senderId of users) {
+                const count = await getUserBufferCount(chatId, senderId);
+                log('🔄', `Recovered ${count} pending items for ${senderId} in ${chatId}`);
+              }
+            }
+          }
+        } catch(e) {
+          log('⚠️', 'Error during startup recovery: ' + e.message);
+        }
+      }
+    }, 5000);
     return true;
   } catch (error) {
     log('❌', `MongoDB connection failed: ${error.message}`);
@@ -1889,7 +1955,7 @@ async function handleMessage(sock, msg) {
       const buffer = await downloadMediaWithRetry(msg, 5);
       const caption = content.imageMessage.caption || '';
 
-      const count = addToUserBuffer(chatId, senderId, {
+      const count = await addToUserBuffer(chatId, senderId, {
         type: 'image',
         data: buffer.toString('base64'),
         mimeType: content.imageMessage.mimetype || 'image/jpeg',
@@ -1916,7 +1982,7 @@ async function handleMessage(sock, msg) {
       const caption = content.videoMessage.caption || '';
       const mimeType = content.videoMessage.mimetype || 'video/mp4';
 
-      const count = addToUserBuffer(chatId, senderId, {
+      const count = await addToUserBuffer(chatId, senderId, {
         type: 'video',
         data: buffer.toString('base64'),
         mimeType: mimeType,
@@ -1945,7 +2011,7 @@ async function handleMessage(sock, msg) {
     try {
       const buffer = await downloadMediaWithRetry(msg, 5);
 
-      const count = addToUserBuffer(chatId, senderId, {
+      const count = await addToUserBuffer(chatId, senderId, {
         type: isVoice ? 'voice' : 'audio',
         data: buffer.toString('base64'),
         mimeType: content.audioMessage.mimetype || 'audio/ogg',
@@ -1973,7 +2039,7 @@ async function handleMessage(sock, msg) {
       try {
         const buffer = await downloadMediaWithRetry(msg, 5);
 
-        const count = addToUserBuffer(chatId, senderId, {
+        const count = await addToUserBuffer(chatId, senderId, {
           type: 'pdf',
           data: buffer.toString('base64'),
           mimeType: 'application/pdf',
@@ -1999,7 +2065,7 @@ async function handleMessage(sock, msg) {
       try {
         const buffer = await downloadMediaWithRetry(msg, 5);
 
-        const count = addToUserBuffer(chatId, senderId, {
+        const count = await addToUserBuffer(chatId, senderId, {
           type: 'audio',
           data: buffer.toString('base64'),
           mimeType: docMime || 'audio/mpeg',
@@ -2025,7 +2091,7 @@ async function handleMessage(sock, msg) {
       try {
         const buffer = await downloadMediaWithRetry(msg, 5);
 
-        const count = addToUserBuffer(chatId, senderId, {
+        const count = await addToUserBuffer(chatId, senderId, {
           type: 'video',
           data: buffer.toString('base64'),
           mimeType: docMime || 'video/mp4',
@@ -2080,11 +2146,11 @@ async function handleMessage(sock, msg) {
 
       await new Promise(r => setTimeout(r, 1000));
 
-      const userBufferCount = getUserBufferCount(chatId, senderId);
+      const userBufferCount = await getUserBufferCount(chatId, senderId);
 
       if (userBufferCount > 0) {
         clearUserTimeout(chatId, senderId);
-        const mediaFiles = clearUserBuffer(chatId, senderId);
+        const mediaFiles = await clearUserBuffer(chatId, senderId);
 
         const lastChar = text.slice(-1);
         let targetFps = 3;
@@ -2125,7 +2191,7 @@ async function handleMessage(sock, msg) {
       });
     }
     else if (text.toLowerCase() === 'clear') {
-      const userItems = clearUserBuffer(chatId, senderId);
+      const userItems = await clearUserBuffer(chatId, senderId);
       clearUserTimeout(chatId, senderId);
 
       if (userItems.length > 0) {
@@ -2150,8 +2216,8 @@ async function handleMessage(sock, msg) {
       }
     }
     else if (text.toLowerCase() === 'status') {
-      const stats = getTotalBufferStats(chatId);
-      const userCount = getUserBufferCount(chatId, senderId);
+      const stats = await getTotalBufferStats(chatId);
+      const userCount = await getUserBufferCount(chatId, senderId);
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
       await sock.sendMessage(chatId, {
@@ -2161,7 +2227,7 @@ async function handleMessage(sock, msg) {
     else {
       log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
-      const count = addToUserBuffer(chatId, senderId, {
+      const count = await addToUserBuffer(chatId, senderId, {
         type: 'text',
         content: text,
         sender: senderName,
