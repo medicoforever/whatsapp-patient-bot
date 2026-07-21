@@ -24,7 +24,7 @@ const getApiKeys = () => {
 };
 
 // ======================================================================
-// 🟢 CONFIGURATION AREA
+// 🟢 NEW CONFIGURATION AREA
 // ======================================================================
 
 const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist. When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
@@ -34,13 +34,16 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 // ======================================================================
 
 const CONFIG = {
+  // We now store an array of keys
   API_KEYS: getApiKeys(),
+  // 🔴 Model Chain Configuration
   GEMINI_MODEL: 'gemini-3.6-flash',
   GEMINI_MODEL_FALLBACK_1: 'gemini-3.5-flash',
   GEMINI_MODEL_FALLBACK_2: 'gemini-3-flash-preview',
   GEMINI_MODEL_FALLBACK_3: 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
+  // Group Routing Configuration
   GROUPS: {
     CT_SOURCE: process.env.GROUP_CT_SOURCE,
     CT_TARGET: process.env.GROUP_CT_TARGET,
@@ -51,6 +54,7 @@ const CONFIG = {
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
   AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
 
+  // 🔧 FIX #1: Changed from 30 minutes to 12 hours to match media viewer expiry
   CONTEXT_RETENTION_MS: 12 * 60 * 60 * 1000, // 12 hours
   MAX_STORED_CONTEXTS: 20,
   COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
@@ -67,11 +71,14 @@ const CONFIG = {
     'video/quicktime', 'video/x-matroska', 'video/mkv', 'video/3gpp', 'video/3gp'
   ],
   SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
+  // 🔗 Media Viewer URL expiry: 12 hours
   MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
+  // 🔧 Decryption failure auto-heal settings
   DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
-  EMPTY_MSG_RETRY_DELAY_MS: 3000,
-  EMPTY_MSG_MAX_RETRIES: 3,
+  // 🔄 Retry settings for empty source group messages
+  EMPTY_MSG_RETRY_DELAY_MS: 3000, // Wait 3 seconds before retry
+  EMPTY_MSG_MAX_RETRIES: 3, // Max retries for empty messages
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -148,37 +155,6 @@ IMPORTANT: Always identify whether the user is asking a question or providing ad
 };
 
 // ======================================================================
-// 🗄️ PERSISTENT MEDIA BUFFER SCHEMA (MongoDB + RAM Backup)
-// ======================================================================
-const pendingMediaSchema = new mongoose.Schema({
-  chatId: { type: String, required: true, index: true },
-  senderId: { type: String, required: true, index: true },
-  senderName: String,
-  messageId: { type: String, required: true, unique: true },
-  type: String,
-  data: String, // Base64 content
-  mimeType: String,
-  caption: String,
-  fileName: String,
-  processed: { type: Boolean, default: false },
-  createdAt: { type: Date, default: Date.now }
-}, { collection: 'whatsapp_pending_media' });
-
-pendingMediaSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86400 * 7 }); // 7 days auto-cleanup
-
-let PendingMediaModel;
-
-function getPendingMediaModel() {
-  if (!PendingMediaModel && mongoose.connection.readyState === 1) {
-    PendingMediaModel = mongoose.model('PendingMedia', pendingMediaSchema);
-  }
-  return PendingMediaModel;
-}
-
-// Fallback in-memory map if MongoDB is temporarily unavailable
-const ramMediaBuffers = new Map();
-
-// ======================================================================
 // 🔗 MEDIA VIEWER STORE (In-Memory with 12hr Expiry)
 // ======================================================================
 const mediaViewerStore = new Map();
@@ -239,10 +215,12 @@ setInterval(() => {
 // ======================================================================
 let decryptFailTimestamps = [];
 let isHealingInProgress = false;
+let startupHealDone = false;
 
 function trackDecryptionFailure() {
   const now = Date.now();
   decryptFailTimestamps.push(now);
+  // Keep only timestamps within the window
   decryptFailTimestamps = decryptFailTimestamps.filter(
     ts => (now - ts) < CONFIG.DECRYPT_FAIL_WINDOW_MS
   );
@@ -307,6 +285,8 @@ async function triggerSessionHeal(reason = 'threshold') {
 }
 
 // ======================================================================
+
+// ======================================================================
 // 🔄 API KEY ROTATION LOGIC (Every 2 Hours)
 // ======================================================================
 function rotateApiKeys() {
@@ -318,9 +298,6 @@ function rotateApiKeys() {
 }
 
 setInterval(rotateApiKeys, 2 * 60 * 60 * 1000);
-
-// ======================================================================
-// 🛠️ UTILITY FUNCTIONS & MIME CHECKS
 // ======================================================================
 
 function isAudioMime(mimeType) {
@@ -393,10 +370,6 @@ function isQuestion(text) {
   return false;
 }
 
-// ======================================================================
-// 🔐 MONGODB AUTH & SESSION MANAGEMENT
-// ======================================================================
-
 const sessionSchema = new mongoose.Schema({
   key: { type: String, required: true, unique: true },
   value: { type: mongoose.Schema.Types.Mixed, required: true },
@@ -406,6 +379,34 @@ const sessionSchema = new mongoose.Schema({
 sessionSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 86400 * 30 });
 
 let SessionModel;
+
+// ======================================================================
+// 🗄️ PERSISTENT MEDIA BUFFER SCHEMA (MongoDB + RAM Backup)
+// ======================================================================
+const pendingMediaSchema = new mongoose.Schema({
+  chatId: { type: String, required: true, index: true },
+  senderId: { type: String, required: true, index: true },
+  senderName: String,
+  messageId: { type: String },
+  type: String,
+  data: String,
+  mimeType: String,
+  caption: String,
+  fileName: String,
+  processed: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+}, { collection: 'whatsapp_pending_media' });
+
+pendingMediaSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86400 * 7 });
+
+let PendingMediaModel;
+function getPendingMediaModel() {
+  if (!PendingMediaModel && mongoose.connection && mongoose.connection.readyState === 1) {
+    PendingMediaModel = mongoose.model('PendingMedia', pendingMediaSchema);
+  }
+  return PendingMediaModel;
+}
+
 
 async function useMongoDBAuthState() {
   if (!SessionModel) {
@@ -467,6 +468,7 @@ async function useMongoDBAuthState() {
     }
   };
 
+  // 🔧 NEW: Clear only signal session keys, keep auth creds
   const clearSessionKeys = async () => {
     try {
       const result = await SessionModel.deleteMany({
@@ -528,91 +530,7 @@ async function useMongoDBAuthState() {
   };
 }
 
-// ======================================================================
-// 📥 PERSISTENT USER MEDIA BUFFER MANAGEMENT
-// ======================================================================
-
-async function addToUserBuffer(chatId, senderId, senderName, mediaItem, msgId) {
-  const model = getPendingMediaModel();
-  if (model) {
-    try {
-      await model.create({
-        chatId,
-        senderId,
-        senderName,
-        messageId: msgId || crypto.randomBytes(8).toString('hex'),
-        type: mediaItem.type,
-        data: mediaItem.data,
-        mimeType: mediaItem.mimeType,
-        caption: mediaItem.caption || '',
-        fileName: mediaItem.fileName || ''
-      });
-      const count = await model.countDocuments({ chatId, senderId, processed: false });
-      log('💾', `Saved media [${mediaItem.type}] to MongoDB buffer (Total: ${count})`);
-      return count;
-    } catch (err) {
-      log('⚠️', `MongoDB buffer save error: ${err.message}. Falling back to RAM.`);
-    }
-  }
-
-  // RAM Fallback
-  if (!ramMediaBuffers.has(chatId)) ramMediaBuffers.set(chatId, new Map());
-  const chatBuf = ramMediaBuffers.get(chatId);
-  if (!chatBuf.has(senderId)) chatBuf.set(senderId, []);
-  const buf = chatBuf.get(senderId);
-  buf.push(mediaItem);
-  return buf.length;
-}
-
-async function clearUserBuffer(chatId, senderId) {
-  const model = getPendingMediaModel();
-  let mongoItems = [];
-
-  if (model) {
-    try {
-      const docs = await model.find({ chatId, senderId, processed: false }).sort({ createdAt: 1 });
-      if (docs.length > 0) {
-        await model.updateMany({ chatId, senderId, processed: false }, { processed: true });
-        mongoItems = docs.map(d => ({
-          type: d.type,
-          data: d.data,
-          mimeType: d.mimeType,
-          caption: d.caption,
-          fileName: d.fileName
-        }));
-      }
-    } catch (err) {
-      log('⚠️', `MongoDB clear buffer error: ${err.message}`);
-    }
-  }
-
-  // Also check RAM buffer fallback
-  let ramItems = [];
-  if (ramMediaBuffers.has(chatId)) {
-    const chatBuf = ramMediaBuffers.get(chatId);
-    if (chatBuf.has(senderId)) {
-      ramItems = chatBuf.get(senderId);
-      chatBuf.delete(senderId);
-    }
-  }
-
-  return [...mongoItems, ...ramItems];
-}
-
-async function getUserBufferCount(chatId, senderId) {
-  const model = getPendingMediaModel();
-  let count = 0;
-  if (model) {
-    try {
-      count = await model.countDocuments({ chatId, senderId, processed: false });
-    } catch (err) {}
-  }
-  if (ramMediaBuffers.has(chatId) && ramMediaBuffers.get(chatId).has(senderId)) {
-    count += ramMediaBuffers.get(chatId).get(senderId).length;
-  }
-  return count;
-}
-
+const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
 const chatContexts = new Map();
 const botMessageIds = new Map();
@@ -625,17 +543,24 @@ const MAX_PROCESSED_IDS = 5000;
 
 function isMessageAlreadyProcessed(msgId) {
   if (!msgId) return false;
-  if (processedMessageIds.has(msgId)) return true;
+  if (processedMessageIds.has(msgId)) {
+    return true;
+  }
   processedMessageIds.add(msgId);
+  // Prevent unbounded growth
   if (processedMessageIds.size > MAX_PROCESSED_IDS) {
     const arr = Array.from(processedMessageIds);
     arr.slice(0, Math.floor(MAX_PROCESSED_IDS / 2)).forEach(id => processedMessageIds.delete(id));
   }
   return false;
 }
+// ======================================================================
 
-// Track pending empty messages
-const pendingEmptyMessages = new Map();
+// ======================================================================
+// 🔄 PENDING EMPTY MESSAGES TRACKER (for source group retry)
+// ======================================================================
+const pendingEmptyMessages = new Map(); // msgId -> { msg, retryCount, chatId, timestamp }
+// ======================================================================
 
 let sock = null;
 let isConnected = false;
@@ -647,6 +572,28 @@ let mongoConnected = false;
 let authState = null;
 
 let makeWASocket, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion;
+
+
+async function downloadMediaWithRetry(msg, maxRetries = 5) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
+      );
+      if (buffer && buffer.length > 0) return buffer;
+    } catch (err) {
+      attempt++;
+      log('⚠️', `Media download attempt ${attempt}/${maxRetries} failed: ${err.message}`);
+      if (attempt >= maxRetries) throw err;
+      await new Promise(res => setTimeout(res, 1500 * Math.pow(2, attempt)));
+    }
+  }
+  return null;
+}
 
 function log(emoji, message) {
   const time = new Date().toLocaleTimeString();
@@ -669,6 +616,62 @@ function getShortSenderId(senderId) {
     return phone.slice(-4);
   }
   return phone;
+}
+
+function getUserBuffer(chatId, senderId) {
+  if (!chatMediaBuffers.has(chatId)) {
+    chatMediaBuffers.set(chatId, new Map());
+  }
+  const chatBuffer = chatMediaBuffers.get(chatId);
+  if (!chatBuffer.has(senderId)) {
+    chatBuffer.set(senderId, []);
+  }
+  return chatBuffer.get(senderId);
+}
+
+function addToUserBuffer(chatId, senderId, mediaItem) {
+  const buffer = getUserBuffer(chatId, senderId);
+  buffer.push(mediaItem);
+  return buffer.length;
+}
+
+function clearUserBuffer(chatId, senderId) {
+  if (chatMediaBuffers.has(chatId)) {
+    const chatBuffer = chatMediaBuffers.get(chatId);
+    if (chatBuffer.has(senderId)) {
+      const items = chatBuffer.get(senderId);
+      chatBuffer.delete(senderId);
+      return items;
+    }
+  }
+  return [];
+}
+
+function getUserBufferCount(chatId, senderId) {
+  if (!chatMediaBuffers.has(chatId)) return 0;
+  const chatBuffer = chatMediaBuffers.get(chatId);
+  if (!chatBuffer.has(senderId)) return 0;
+  return chatBuffer.get(senderId).length;
+}
+
+function getTotalBufferStats(chatId) {
+  const stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
+  if (!chatMediaBuffers.has(chatId)) return stats;
+
+  const chatBuffer = chatMediaBuffers.get(chatId);
+  stats.users = chatBuffer.size;
+
+  for (const [senderId, items] of chatBuffer) {
+    items.forEach(m => {
+      if (m.type === 'image') stats.images++;
+      else if (m.type === 'pdf') stats.pdfs++;
+      else if (m.type === 'audio' || m.type === 'voice') stats.audio++;
+      else if (m.type === 'video') stats.video++;
+      else if (m.type === 'text') stats.texts++;
+      stats.total++;
+    });
+  }
+  return stats;
 }
 
 // ======================================================================
@@ -716,7 +719,7 @@ function groupMediaSmartly(mediaFiles) {
 }
 
 // ======================================================================
-// 🔄 TIMEOUT LOGIC
+// 🔄 UPDATED TIMEOUT LOGIC (Includes Smart Batching & Target Groups)
 // ======================================================================
 function resetUserTimeout(chatId, senderId, senderName) {
   if (!chatTimeouts.has(chatId)) {
@@ -733,11 +736,12 @@ function resetUserTimeout(chatId, senderId, senderName) {
   const isAutoGroup = isCTGroup || isMRIGroup;
 
   const delay = isAutoGroup ? CONFIG.AUTO_PROCESS_DELAY_MS : CONFIG.MEDIA_TIMEOUT_MS;
+
   const shortId = getShortSenderId(senderId);
 
   const timeoutCallback = async () => {
     if (isAutoGroup) {
-      const mediaFiles = await clearUserBuffer(chatId, senderId);
+      const mediaFiles = clearUserBuffer(chatId, senderId);
       if (mediaFiles.length > 0) {
         log('⏱️', `Auto-processing ${mediaFiles.length} item(s) from Auto Group (${isCTGroup ? 'CT' : 'MRI'})`);
 
@@ -755,6 +759,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
             if (batch.length === 0) continue;
 
             log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
+
             await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
 
             if (i < batches.length - 1) {
@@ -767,7 +772,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
         }
       }
     } else {
-      const clearedItems = await clearUserBuffer(chatId, senderId);
+      const clearedItems = clearUserBuffer(chatId, senderId);
       if (clearedItems.length > 0) {
         log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
       }
@@ -828,10 +833,12 @@ function getStoredContext(chatId, messageId) {
   if (!contexts.has(messageId)) return null;
 
   const context = contexts.get(messageId);
+
   if (Date.now() - context.timestamp > CONFIG.CONTEXT_RETENTION_MS) {
     contexts.delete(messageId);
     return null;
   }
+
   return context;
 }
 
@@ -853,9 +860,7 @@ function isBotMessage(chatId, messageId) {
   return botMessageIds.get(chatId).has(messageId);
 }
 
-// ======================================================================
-// 🎥 SMART VIDEO FRAME EXTRACTION
-// ======================================================================
+// === SMART VIDEO PROCESSING LOGIC (Oversample -> Filter) ===
 async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
   return new Promise((resolve, reject) => {
     const tempId = Math.random().toString(36).substring(7);
@@ -867,6 +872,7 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 
     const batchSize = 3;
     const inputFps = targetFps * batchSize;
+
     const videoFilter = `fps=${inputFps},thumbnail=${batchSize}`;
 
     log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize})`);
@@ -904,11 +910,14 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
       .run();
   });
 }
+// ===================================
 
-// Express App Setup
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ======================================================================
+// 🔗 MEDIA VIEWER ROUTE
+// ======================================================================
 app.get('/view/:viewerId', (req, res) => {
   const { viewerId } = req.params;
   const entry = mediaViewerStore.get(viewerId);
@@ -930,7 +939,7 @@ app.get('/view/:viewerId', (req, res) => {
     </head>
     <body>
         <div class="container">
-            <div class="icon">⌛</div>
+            <div class="icon">⏰</div>
             <h1>Link Expired or Invalid</h1>
             <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
         </div>
@@ -940,362 +949,2057 @@ app.get('/view/:viewerId', (req, res) => {
 
   if (Date.now() >= entry.expiresAt) {
     mediaViewerStore.delete(viewerId);
-    return res.status(410).send('Link Expired');
+    return res.status(410).send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Link Expired</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+            .container { text-align: center; padding: 40px; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            h1 { color: #e94560; }
+            p { color: #aaa; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="icon">⏰</div>
+            <h1>Link Expired</h1>
+            <p>This media viewer link has expired (12 hour limit).</p>
+        </div>
+    </body>
+    </html>`);
   }
 
+  const media = entry.media;
+  const remainingMs = entry.expiresAt - Date.now();
+  const remainingHours = Math.floor(remainingMs / 3600000);
+  const remainingMins = Math.floor((remainingMs % 3600000) / 60000);
+
   let mediaHtml = '';
-  entry.media.forEach((item, index) => {
-    if (item.type === 'image') {
-      mediaHtml += `<div class="media-card"><img src="data:${item.mimeType};base64,${item.data}" alt="Medical Image ${index+1}"/>${item.caption ? `<p class="caption">${item.caption}</p>` : ''}</div>`;
-    } else if (item.type === 'pdf') {
-      mediaHtml += `<div class="media-card"><object data="data:application/pdf;base64,${item.data}" type="application/pdf" width="100%" height="600px"><p>PDF document: ${item.fileName || 'Report.pdf'}</p></object></div>`;
-    } else if (item.type === 'audio' || item.type === 'voice') {
-      mediaHtml += `<div class="media-card"><audio controls src="data:${item.mimeType};base64,${item.data}"></audio></div>`;
-    } else if (item.type === 'video') {
-      mediaHtml += `<div class="media-card"><video controls width="100%" src="data:${item.mimeType};base64,${item.data}"></video></div>`;
+  media.forEach((m, index) => {
+    const caption = m.caption ? `<div class="caption">${m.caption.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+    const fileName = m.fileName ? `<div class="filename">${m.fileName.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+
+    if (m.type === 'image') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Image</div>
+            ${caption}${fileName}
+            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+        </div>`;
+    } else if (m.type === 'pdf') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — PDF</div>
+            ${caption}${fileName}
+            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
+            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+        </div>`;
+    } else if (m.type === 'audio' || m.type === 'voice') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
+            ${caption}${fileName}
+            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+        </div>`;
+    } else if (m.type === 'video') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Video</div>
+            ${caption}${fileName}
+            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+        </div>`;
     }
   });
 
   res.send(`
-  <!DOCTYPE html>
-  <html>
-  <head>
-      <title>Medical Media Viewer</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: #0f172a; color: #f8fafc; padding: 20px; }
-          .header { text-align: center; margin-bottom: 30px; padding-bottom: 15px; border-bottom: 1px solid #1e293b; }
-          .header h1 { margin: 0; color: #38bdf8; font-size: 24px; }
-          .grid { display: flex; flex-direction: column; gap: 20px; max-width: 900px; margin: 0 auto; }
-          .media-card { background: #1e293b; border-radius: 12px; padding: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
-          .media-card img { width: 100%; height: auto; border-radius: 8px; display: block; }
-          .caption { margin-top: 10px; color: #cbd5e1; font-size: 14px; }
-      </style>
-  </head>
-  <body>
-      <div class="header">
-          <h1>📋 Medical Reports & Media (${entry.media.length} items)</h1>
-      </div>
-      <div class="grid">${mediaHtml}</div>
-  </body>
-  </html>`);
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Source Media Viewer</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #0f0f1a;
+                color: #e0e0e0;
+                padding: 10px;
+            }
+            .header {
+                text-align: center;
+                padding: 20px 10px;
+                background: linear-gradient(135deg, #1a1a2e, #16213e);
+                border-radius: 12px;
+                margin-bottom: 15px;
+                border: 1px solid #333;
+            }
+            .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
+            .header .meta { font-size: 12px; color: #888; }
+            .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
+            .media-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 12px;
+            }
+            .media-item {
+                background: #1a1a2e;
+                border-radius: 10px;
+                overflow: hidden;
+                border: 1px solid #2a2a4a;
+                transition: transform 0.2s;
+            }
+            .media-item:hover { transform: scale(1.01); border-color: #25D366; }
+            .media-item img {
+                width: 100%;
+                display: block;
+                cursor: pointer;
+                transition: opacity 0.2s;
+            }
+            .media-item img:hover { opacity: 0.9; }
+            .media-index {
+                padding: 8px 12px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #25D366;
+                background: #0f0f1a;
+                border-bottom: 1px solid #2a2a4a;
+                transition: opacity 0.2s;
+            }
+            .caption {
+                padding: 6px 12px;
+                font-size: 12px;
+                color: #ccc;
+                background: #16213e;
+                font-style: italic;
+            }
+            .filename {
+                padding: 4px 12px;
+                font-size: 11px;
+                color: #888;
+            }
+            .pdf-frame {
+                width: 100%;
+                height: 500px;
+                border: none;
+            }
+            .download-btn {
+                display: block;
+                text-align: center;
+                padding: 10px;
+                background: #25D366;
+                color: #000;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            .download-btn:hover { background: #1da851; }
+
+            .fullscreen-overlay {
+                display: none;
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                background: rgba(0,0,0,0.95);
+                z-index: 9999;
+                justify-content: center;
+                align-items: center;
+                cursor: zoom-out;
+            }
+            .fullscreen-overlay.active { display: flex; }
+            .fullscreen-overlay img {
+                max-width: 95vw;
+                max-height: 95vh;
+                object-fit: contain;
+            }
+
+            @media (max-width: 600px) {
+                .media-grid { grid-template-columns: 1fr; }
+                body { padding: 5px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🔍 Source Media Viewer</h1>
+            <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
+            <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
+        </div>
+
+        <div class="media-grid">
+            ${mediaHtml}
+        </div>
+
+        <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
+            <img id="fsImage" src="" alt="Fullscreen">
+        </div>
+
+        <script>
+            function openFullscreen(img) {
+                const overlay = document.getElementById('fsOverlay');
+                const fsImg = document.getElementById('fsImage');
+                fsImg.src = img.src;
+                overlay.classList.add('active');
+            }
+            function closeFullscreen() {
+                document.getElementById('fsOverlay').classList.remove('active');
+            }
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeFullscreen();
+            });
+        </script>
+    </body>
+    </html>`);
 });
 
-app.get('/health', (req, res) => res.status(200).send('OK'));
+app.get('/media/:viewerId/:index', (req, res) => {
+  const { viewerId, index } = req.params;
+  const idx = parseInt(index);
+  const entry = mediaViewerStore.get(viewerId);
 
-app.listen(PORT, () => log('🌐', `HTTP Server listening on port ${PORT}`));
+  if (!entry || Date.now() >= entry.expiresAt) {
+    return res.status(404).send('Not found or expired');
+  }
 
+  if (isNaN(idx) || idx < 0 || idx >= entry.media.length) {
+    return res.status(404).send('Invalid index');
+  }
+
+  const m = entry.media[idx];
+  const buffer = Buffer.from(m.data, 'base64');
+  res.setHeader('Content-Type', m.mimeType);
+  res.setHeader('Content-Length', buffer.length);
+  res.send(buffer);
+});
 // ======================================================================
-// 🤖 GEMINI API & AI INFERENCE LOGIC
-// ======================================================================
 
-async function callGeminiApi(modelName, apiKey, promptParts, systemInstruction) {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: modelName,
-    systemInstruction: systemInstruction
+app.get('/', (req, res) => {
+  let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
+  for (const [chatId, _] of chatMediaBuffers) {
+    const s = getTotalBufferStats(chatId);
+    stats.users += s.users;
+    stats.images += s.images;
+    stats.pdfs += s.pdfs;
+    stats.audio += s.audio;
+    stats.video += s.video;
+    stats.texts += s.texts;
+    stats.total += s.total;
+  }
+
+  let html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WhatsApp Patient Bot</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="5">
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
+                color: white;
+                padding: 20px;
+            }
+            .container {
+                text-align: center;
+                background: rgba(255,255,255,0.15);
+                padding: 30px;
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                max-width: 600px;
+                width: 100%;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            }
+            h1 { margin: 0 0 10px 0; font-size: 24px; }
+            .subtitle { opacity: 0.9; margin-bottom: 20px; font-size: 14px; }
+            .status {
+                padding: 15px 20px;
+                border-radius: 12px;
+                margin: 20px 0;
+                font-size: 16px;
+                font-weight: 600;
+            }
+            .connected { background: #4CAF50; }
+            .waiting { background: rgba(255,255,255,0.2); }
+            .qr-container {
+                background: white;
+                padding: 15px;
+                border-radius: 15px;
+                display: inline-block;
+                margin: 20px 0;
+            }
+            .qr-container img { display: block; max-width: 250px; width: 100%; }
+            .info-box {
+                text-align: left;
+                background: rgba(0,0,0,0.2);
+                padding: 15px;
+                border-radius: 12px;
+                margin-top: 15px;
+                font-size: 13px;
+            }
+            .info-box h3 { margin: 0 0 10px 0; font-size: 15px; }
+            .stats {
+                display: flex;
+                justify-content: center;
+                gap: 6px;
+                margin-top: 20px;
+                flex-wrap: wrap;
+            }
+            .stat {
+                background: rgba(255,255,255,0.1);
+                padding: 8px 10px;
+                border-radius: 10px;
+                min-width: 50px;
+            }
+            .stat-value { font-size: 16px; font-weight: bold; }
+            .stat-label { font-size: 8px; opacity: 0.8; }
+            .db-status {
+                font-size: 11px;
+                padding: 5px 10px;
+                border-radius: 20px;
+                display: inline-block;
+                margin-bottom: 15px;
+            }
+            .db-connected { background: rgba(76, 175, 80, 0.3); }
+            .db-disconnected { background: rgba(244, 67, 54, 0.3); }
+            .feature-badge {
+                display: inline-block;
+                background: rgba(255,255,255,0.2);
+                padding: 3px 8px;
+                border-radius: 12px;
+                font-size: 10px;
+                margin: 2px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📱 WhatsApp Patient Bot</h1>
+            <p class="subtitle">Medical Clinical Profile Generator</p>
+            <div class="db-status ${mongoConnected ? 'db-connected' : 'db-disconnected'}">
+                ${mongoConnected ? '🗄 MongoDB Connected' : '⚠️ MongoDB Not Connected'}
+            </div>
+            <div>ℹ️ API Keys Loaded: ${CONFIG.API_KEYS.length}</div>
+    `;
+
+  if (isConnected) {
+    html += `
+            <div class="status connected">✅ UNIVERSAL MODE ACTIVE</div>
+            <p>Bot is active for all incoming messages (Private & Group)</p>
+            <div class="stats">
+                <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
+                <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
+                <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
+                <div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div>
+            </div>
+            <div class="info-box">
+                <h3>✨ Features:</h3>
+                <p>
+                    <strong>🌍 Public Access:</strong> Works in any chat/group.<br>
+                    <strong>🔄 Auto-Groups:</strong> Monitored CT/MRI groups active.<br>
+                    <strong>🎥 Smart Video:</strong><br>
+                    - Send <strong>.</strong> for Smart 3 FPS (Best for fast flipping)<br>
+                    - Send <strong>.2</strong> for Smart 2 FPS<br>
+                    - Send <strong>.1</strong> for Smart 1 FPS<br>
+                    <strong>🧠 Secondary Analysis:</strong><br>
+                    - Send <strong>..</strong> (double dot) for Chained Analysis<br>
+                    <strong>🔗 Source Viewer:</strong> Each response includes a link to view source media (12h expiry)<br>
+                    <strong>🔧 Auto-Heal:</strong> Signal session key auto-repair active<br>
+                    <strong>↩️ Reply:</strong> Reply to bot to ask questions.
+                </p>
+            </div>
+    `;
+  } else if (qrCodeDataURL) {
+    html += `
+            <div class="status waiting">📲 SCAN QR CODE</div>
+            <div class="qr-container"><img src="${qrCodeDataURL}" alt="QR Code"></div>
+            <div class="info-box">
+                <h3>📋 To connect:</h3>
+                <p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device</p>
+            </div>
+    `;
+  } else {
+    html += `
+            <div class="status waiting">⏳ ${botStatus.toUpperCase()}</div>
+            <p>Please wait...</p>
+    `;
+  }
+
+  html += `</div></body></html>`;
+  res.send(html);
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'running',
+    connected: isConnected,
+    mongoConnected: mongoConnected,
+    mode: 'universal',
+    processedCount,
+    activeKeys: CONFIG.API_KEYS.length,
+    activeViewers: mediaViewerStore.size,
+    decryptFailures: decryptFailTimestamps.length,
+    healingInProgress: isHealingInProgress,
+    pendingRetries: pendingEmptyMessages.size,
+    timestamp: new Date().toISOString()
   });
+});
 
-  const safetySettings = [
-    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE }
-  ];
+app.listen(PORT, () => {
+  log('🌐', `Web server running on port ${PORT}`);
+});
 
-  const result = await model.generateContent({
-    contents: [{ role: 'user', parts: promptParts }],
-    safetySettings
-  });
-
-  return result.response.text();
-}
-
-async function runGeminiWithFallback(promptParts, systemInstruction) {
-  const models = [
-    CONFIG.GEMINI_MODEL,
-    CONFIG.GEMINI_MODEL_FALLBACK_1,
-    CONFIG.GEMINI_MODEL_FALLBACK_2,
-    CONFIG.GEMINI_MODEL_FALLBACK_3
-  ];
-
-  const apiKeys = CONFIG.API_KEYS;
-  if (!apiKeys || apiKeys.length === 0) {
-    throw new Error('No GEMINI_API_KEYS configured');
+// ======================================================================
+// 🔗 HELPER: Get the base URL for viewer links
+// ======================================================================
+function getBaseUrl() {
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL;
   }
-
-  let lastErr = null;
-
-  for (const apiKey of apiKeys) {
-    for (const modelName of models) {
-      try {
-        log('🧠', `Calling Gemini API (${modelName}) with key ...${apiKey.slice(-4)}`);
-        const text = await callGeminiApi(modelName, apiKey, promptParts, systemInstruction);
-        if (text && text.trim().length > 0) return text;
-      } catch (err) {
-        log('⚠️', `Model ${modelName} failed with key ...${apiKey.slice(-4)}: ${err.message}`);
-        lastErr = err;
-      }
-    }
-  }
-
-  throw lastErr || new Error('All Gemini models and API keys failed.');
+  return `http://localhost:${PORT}`;
 }
-
-// ======================================================================
-// 🔄 MEDIA PROCESSOR & SENDER
 // ======================================================================
 
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, followUpText = null, senderId = null, senderName = null, originalMsgKey = null, retriesLeft = 3, isSecondary = false, customTargetChatId = null) {
-  try {
-    const promptParts = [];
-
-    for (const file of mediaFiles) {
-      if (file.type === 'text') {
-        promptParts.push({ text: `Accompanying Note/Text: ${file.caption}` });
-      } else if (file.type === 'video') {
-        try {
-          const videoBuf = Buffer.from(file.data, 'base64');
-          const frames = await extractFramesFromVideo(videoBuf, 3);
-          frames.forEach(frameB64 => {
-            promptParts.push({
-              inlineData: { data: frameB64, mimeType: 'image/jpeg' }
-            });
-          });
-        } catch (e) {
-          log('⚠️', `Video frame extraction failed: ${e.message}`);
-        }
-      } else {
-        promptParts.push({
-          inlineData: { data: file.data, mimeType: file.mimeType }
-        });
-      }
-    }
-
-    if (isFollowUp && followUpText) {
-      promptParts.push({ text: `User Follow-Up Query: ${followUpText}` });
-    }
-
-    const sysInst = isSecondary ? SECONDARY_SYSTEM_INSTRUCTION : CONFIG.SYSTEM_INSTRUCTION;
-    const responseText = await runGeminiWithFallback(promptParts, sysInst);
-
-    const targetChat = customTargetChatId || chatId;
-
-    let viewerUrl = null;
-    const viewerId = storeMediaForViewer(mediaFiles);
-    if (viewerId) {
-      const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-      viewerUrl = `${baseUrl}/view/${viewerId}`;
-    }
-
-    let finalMessage = responseText;
-    if (viewerUrl) {
-      finalMessage += `\n\n🔗 View Original Files: ${viewerUrl}`;
-    }
-
-    const sentMsg = await sock.sendMessage(targetChat, { text: finalMessage });
-    if (sentMsg && sentMsg.key) {
-      trackBotMessage(targetChat, sentMsg.key.id);
-      storeContext(targetChat, sentMsg.key.id, mediaFiles, responseText, senderId);
-    }
-
-    log('✅', `Successfully processed & sent response to ${targetChat}`);
-
-  } catch (err) {
-    log('❌', `Process media error: ${err.message}`);
-    if (retriesLeft > 0) {
-      log('🔄', `Retrying media processing (${retriesLeft} retries remaining)...`);
-      await new Promise(r => setTimeout(r, 3000));
-      return processMedia(sock, chatId, mediaFiles, isFollowUp, followUpText, senderId, senderName, originalMsgKey, retriesLeft - 1, isSecondary, customTargetChatId);
-    }
-  }
-}
-
 // ======================================================================
-// 📥 PERSISTENT DOWNLOAD WITH EXPONENTIAL BACKOFF (SURVIVES CDN DROPS)
+// 🔗 HELPER: Parse JSON block from AI response
 // ======================================================================
-
-async function downloadMediaWithRetry(msg, maxRetries = 5) {
-  let attempt = 0;
-  while (attempt < maxRetries) {
+function parseJsonFromResponse(responseText) {
+  const jsonMatch = responseText.match(/<<JSON>>(.*?)<<JSON>>/s);
+  if (jsonMatch && jsonMatch[1]) {
     try {
-      const buffer = await downloadMediaMessage(
-        msg,
-        'buffer',
-        {},
-        { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
-      );
-      if (buffer && buffer.length > 0) return buffer;
-    } catch (err) {
-      attempt++;
-      log('⚠️', `Media download retry ${attempt}/${maxRetries}: ${err.message}`);
-      if (attempt >= maxRetries) throw err;
-      await new Promise(res => setTimeout(res, 1500 * Math.pow(2, attempt)));
+      return JSON.parse(jsonMatch[1].trim());
+    } catch (e) {
+      log('⚠️', `Failed to parse JSON block from response: ${e.message}`);
+      return null;
     }
   }
   return null;
 }
 
+function stripJsonFromResponse(responseText) {
+  return responseText.replace(/\n*<<JSON>>.*?<<JSON>>\n*/s, '').trim();
+}
+
+function formatJsonBlock(jsonData) {
+  if (!jsonData) return '';
+  const mrn = jsonData.mrn || 'Not mentioned';
+  const age = jsonData.age || 'unknown';
+  const sex = jsonData.sex || 'unknown';
+  const study = jsonData.study || 'Not mentioned';
+  const brief = jsonData.brief || '';
+  return `\n\n📋 *Quick Reference:*\n• MRN/Reg No: ${mrn}\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
+}
+
+// 🔧 FIX #2: Updated formatSenderContact to handle users without usernames properly
+function formatSenderContact(senderId, senderName) {
+  if (!senderId) return { text: '', mentionId: null };
+  const phone = senderId.split('@')[0];
+  const domain = senderId.split('@')[1] || 's.whatsapp.net';
+  
+  // Check if this is a proper phone number (digits, possibly with + prefix)
+  // Phone-based JIDs look like: 919876543210@s.whatsapp.net
+  // LID-based JIDs look like: 120363047547742844@lid or long numbers @g.us participants
+  const isPhoneNumber = /^\d{7,15}$/.test(phone) && (domain === 's.whatsapp.net' || domain === 'c.us');
+  
+  if (isPhoneNumber) {
+    // This is a proper phone number - use @mention which creates a clickable link
+    return { text: `\n\n👤 *Sent by:* @${phone}`, mentionId: senderId };
+  } else {
+    // This is a LID or non-phone identifier - show the display name instead
+    // Don't create a broken @mention, just show the name
+    const displayName = senderName || phone;
+    return { text: `\n\n👤 *Sent by:* ${displayName}`, mentionId: null };
+  }
+}
+
 // ======================================================================
-// 🚀 MAIN BAILEYS SOCKET INITIALIZATION & STARTUP RECOVERY
 // ======================================================================
+// 💬 HELPER: Footer text for group chat bot messages
+// ======================================================================
+const GROUP_REPLY_FOOTER = `
+
+━━━━━━━━━━━━━━━━━━━━━━
+🖼️ *Go here to see the scan images:*
+https://view.stradus.com/
+
+🤖 *Copy-paste the clinical profile here to get suggestions regarding MRI protocols:*
+https://ai.studio/apps/86a65a19-cf2f-46de-b4d0-9a941be83604
+
+🔗 https://mri-protocols.vercel.app/
+
+📚 *MRI protocol books*
+https://notebooklm.google.com/notebook/467e8684-c512-488f-b1f7-3a450e344cd5`;
+// ======================================================================
+
+async function loadBaileys() {
+  botStatus = 'Loading WhatsApp library...';
+
+  try {
+    const baileys = await import('@whiskeysockets/baileys');
+
+    makeWASocket = baileys.default || baileys.makeWASocket;
+    DisconnectReason = baileys.DisconnectReason;
+    downloadMediaMessage = baileys.downloadMediaMessage;
+    fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
+
+    log('✅', 'Baileys loaded!');
+    return true;
+  } catch (error) {
+    log('❌', `Baileys load failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function connectMongoDB() {
+  if (!CONFIG.MONGODB_URI) {
+    log('⚠️', 'No MONGODB_URI configured - sessions will not persist!');
+    return false;
+  }
+
+  try {
+    log('🔄', 'Connecting to MongoDB...');
+
+    mongoose.connection.on('connected', () => {
+      log('✅', 'MongoDB connection established');
+    });
+
+    mongoose.connection.on('error', (err) => {
+      log('❌', `MongoDB connection error: ${err.message}`);
+    });
+
+    mongoose.connection.on('disconnected', () => {
+      log('⚠️', 'MongoDB disconnected');
+      mongoConnected = false;
+    });
+
+    await mongoose.connect(CONFIG.MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+    });
+
+    mongoConnected = true;
+    log('✅', 'MongoDB connected! Sessions will persist.');
+    return true;
+  } catch (error) {
+    log('❌', `MongoDB connection failed: ${error.message}`);
+    mongoConnected = false;
+    return false;
+  }
+}
 
 async function startBot() {
   try {
-    const baileysModule = await import('@whiskeysockets/baileys');
-    makeWASocket = baileysModule.default;
-    DisconnectReason = baileysModule.DisconnectReason;
-    downloadMediaMessage = baileysModule.downloadMediaMessage;
-    fetchLatestBaileysVersion = baileysModule.fetchLatestBaileysVersion;
+    botStatus = 'Initializing...';
+    log('🚀', 'Starting WhatsApp Bot...');
 
-    if (CONFIG.MONGODB_URI) {
-      try {
-        await mongoose.connect(CONFIG.MONGODB_URI);
-        mongoConnected = true;
-        log('🟢', 'Connected to MongoDB');
+    if (!makeWASocket) await loadBaileys();
 
-        // Startup Recovery: Check for un-processed pending media from previous server restarts
-        const model = getPendingMediaModel();
-        if (model) {
-          const pendingChats = await model.distinct('chatId', { processed: false });
-          if (pendingChats.length > 0) {
-            log('🔄', `Startup Recovery: Found pending un-processed media in ${pendingChats.length} chat(s)`);
-            for (const cId of pendingChats) {
-              const senders = await model.distinct('senderId', { chatId: cId, processed: false });
-              for (const sId of senders) {
-                resetUserTimeout(cId, sId, 'Restored User');
-              }
-            }
-          }
-        }
-
-      } catch (mErr) {
-        log('❌', `MongoDB connection failed: ${mErr.message}`);
-      }
+    if (!mongoConnected && CONFIG.MONGODB_URI) {
+      log('⚠️', 'MongoDB appears disconnected. Attempting to reconnect...');
+      await connectMongoDB();
     }
 
-    authState = await useMongoDBAuthState();
-    const { version } = await fetchLatestBaileysVersion();
+    // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
+    if (!startupHealDone && mongoConnected) {
+      if (!SessionModel) {
+        SessionModel = mongoose.model('Session', sessionSchema);
+      }
+      log('🔧', '╔══════════════════════════════════════════╗');
+      log('🔧', '║ STARTUP HEAL: Cleaning session keys...  ║');
+      log('🔧', '╚══════════════════════════════════════════╝');
+      const deleted = await nukeSessionKeysFromMongo();
+      log('🔧', ` Startup heal complete. Removed ${deleted} stale keys.`);
+      startupHealDone = true;
+    }
+
+    let state, saveCreds, clearAll, clearSessionKeys;
+
+    if (mongoConnected) {
+      try {
+        const mongoAuth = await useMongoDBAuthState();
+        state = mongoAuth.state;
+        saveCreds = mongoAuth.saveCreds;
+        clearAll = mongoAuth.clearAll;
+        clearSessionKeys = mongoAuth.clearSessionKeys;
+        log('✅', 'Using MongoDB for session storage');
+      } catch (e) {
+        log('❌', `MongoDB auth failed: ${e.message}`);
+        throw e;
+      }
+    } else {
+      const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
+      const authPath = join(__dirname, 'auth_session');
+      const fileAuth = await useMultiFileAuthState(authPath);
+      state = fileAuth.state;
+      saveCreds = fileAuth.saveCreds;
+      clearAll = async () => {
+        try { fs.rmSync(authPath, { recursive: true, force: true }); } catch(e) {}
+      };
+      clearSessionKeys = async () => {
+        try {
+          if (fs.existsSync(authPath)) {
+            const files = fs.readdirSync(authPath);
+            let cleared = 0;
+            for (const file of files) {
+              if (file !== 'creds.json') {
+                fs.unlinkSync(join(authPath, file));
+                cleared++;
+              }
+            }
+            log('🗑', `Cleared ${cleared} session key files (kept creds.json)`);
+          }
+        } catch(e) {
+          log('❌', `File session key clear error: ${e.message}`);
+        }
+      };
+      log('📁', 'Using file-based auth (session will be lost on restart)');
+    }
+
+    authState = { state, saveCreds, clearAll, clearSessionKeys };
+
+    let version;
+    try {
+      const v = await fetchLatestBaileysVersion();
+      version = v.version;
+      log('📱', `Using WA version: ${version.join('.')}`);
+    } catch (e) {
+      version = [2, 3000, 1015901307];
+      log('⚠️', 'Using fallback WA version');
+    }
+
+    botStatus = 'Connecting...';
+
+    const baileysLogger = pino({ level: 'silent' });
 
     sock = makeWASocket({
       version,
-      logger: pino({ level: 'silent' }),
-      printQRInTerminal: true,
-      auth: authState.state,
-      browser: ['WhatsApp Medical Bot', 'Chrome', '1.0.0']
+      auth: state,
+      logger: baileysLogger,
+      browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      retryRequestDelayMs: 2000,
+      getMessage: async (key) => {
+        return { conversation: '' };
+      }
     });
 
-    sock.ev.on('creds.update', authState.saveCreds);
-
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        QRCode.toDataURL(qr, (err, url) => {
-          if (!err) qrCodeDataURL = url;
-        });
-      }
-
-      if (connection === 'open') {
-        isConnected = true;
-        qrCodeDataURL = null;
-        botStatus = 'Connected & Listening 🟢';
-        log('🚀', 'WhatsApp Bot is Connected!');
+        try {
+          botStatus = 'QR Code ready';
+          qrCodeDataURL = await QRCode.toDataURL(qr, {
+            width: 300,
+            margin: 2,
+            color: { dark: '#128C7E', light: '#FFFFFF' }
+          });
+          isConnected = false;
+          log('📱', 'QR Code generated - please scan!');
+        } catch (err) {
+          log('❌', `QR generation error: ${err.message}`);
+          lastError = err.message;
+        }
       }
 
       if (connection === 'close') {
         isConnected = false;
-        const reason = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.message;
-        log('⚠️', `Connection closed. Reason: ${reason}`);
+        qrCodeDataURL = null;
 
-        if (reason !== DisconnectReason.loggedOut) {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reason = lastDisconnect?.error?.output?.payload?.message || 'Unknown';
+
+        log('🔌', `Connection closed. Code: ${statusCode}, Reason: ${reason}`);
+
+        const loggedOut = statusCode === DisconnectReason.loggedOut ||
+          statusCode === 401 ||
+          statusCode === 405;
+
+        if (loggedOut) {
+          log('🔐', 'Session logged out - clearing credentials...');
+          botStatus = 'Logged out - clearing session...';
+
+          if (authState?.clearAll) {
+            await authState.clearAll();
+          }
+
+          log('🔄', 'Restarting with fresh session in 5 seconds...');
           setTimeout(startBot, 5000);
         } else {
-          log('❌', 'Logged out. Clearing auth...');
-          authState.clearAll();
+          if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
+            log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
+            await nukeSessionKeysFromMongo();
+          }
+          log('🔄', `Reconnecting in 5 seconds...`);
           setTimeout(startBot, 5000);
+        }
+
+      } else if (connection === 'open') {
+        isConnected = true;
+        qrCodeDataURL = null;
+        botStatus = 'Connected';
+
+        // 🔧 Reset decryption failure counter on successful connection
+        decryptFailTimestamps = [];
+
+        log('✅', '🎉 CONNECTED TO WHATSAPP!');
+
+        if (authState?.saveCreds) {
+          await authState.saveCreds();
+          log('💾', 'Credentials saved');
+        }
+
+        log('🌍', 'Universal Mode: Bot is active for ALL chats.');
+        if (CONFIG.GROUPS.CT_SOURCE) log('🏥', 'Monitoring CT Source Group');
+        if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
+      }
+    });
+
+    sock.ev.on('creds.update', async () => {
+      if (authState?.saveCreds) {
+        await authState.saveCreds();
+      }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue;
+
+        // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
+        const msgId = msg.key.id;
+        if (msgId && isMessageAlreadyProcessed(msgId)) {
+          log('🔁', `Skipping duplicate message ${msgId.substring(0, 8)}...`);
+          continue;
+        }
+
+        // 🔧 DECRYPTION FAILURE DETECTION
+        if (!msg.message) {
+          const chatId = msg.key.remoteJid;
+          if (chatId && chatId !== 'status@broadcast') {
+            const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
+            const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
+            if (isSourceGroup || isTargetGroup) {
+              // 🔄 AUTO GROUP: Queue for retry instead of skipping
+              log('⏳', `Empty message body from auto group ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
+              if (msgId && !pendingEmptyMessages.has(msgId)) {
+                // Remove from processedMessageIds so it can be reprocessed on retry
+                processedMessageIds.delete(msgId);
+                pendingEmptyMessages.set(msgId, {
+                  msg: msg,
+                  retryCount: 0,
+                  chatId: chatId,
+                  timestamp: Date.now()
+                });
+                // Schedule first retry
+                scheduleEmptyMessageRetry(msgId);
+              }
+            } else {
+              log('⚠️', `Empty message body from ${chatId} (possible decryption failure)`);
+              trackDecryptionFailure();
+            }
+          }
+          continue;
+        }
+
+        try {
+          await handleMessage(sock, msg);
+        } catch (error) {
+          log('❌', `Message handling error: ${error.message}`);
         }
       }
     });
 
-    sock.ev.on('messages.upsert', async (m) => {
-      if (!m.messages || m.messages.length === 0) return;
-      const msg = m.messages[0];
-      if (msg.key.fromMe) return;
+    // 🔄 Listen for message updates (content populated after initial delivery)
+    sock.ev.on('messages.update', async (updates) => {
+      for (const update of updates) {
+        const msgId = update.key?.id;
+        if (!msgId) continue;
 
-      const msgId = msg.key.id;
-      const chatId = msg.key.remoteJid;
-      const senderId = getSenderId(msg);
-      const senderName = getSenderName(msg);
+        // Check if this was a pending empty message that now has content
+        if (pendingEmptyMessages.has(msgId) && update.update?.message) {
+          const pending = pendingEmptyMessages.get(msgId);
+          log('✅', `Message update received for pending empty msg ${msgId.substring(0, 8)}... — now has content!`);
 
-      if (isMessageAlreadyProcessed(msgId)) return;
-
-      const messageType = Object.keys(msg.message || {})[0];
-      if (!messageType) return;
-
-      // Handle Decryption Failure Logging
-      if (messageType === 'ciphertext' || messageType === 'protocolMessage') {
-        trackDecryptionFailure();
-        return;
-      }
-
-      const isImage = messageType === 'imageMessage';
-      const isDocument = messageType === 'documentMessage';
-      const isAudio = messageType === 'audioMessage';
-      const isVideo = messageType === 'videoMessage';
-      const isText = messageType === 'conversation' || messageType === 'extendedTextMessage';
-
-      if (isImage || isDocument || isAudio || isVideo) {
-        try {
-          const buffer = await downloadMediaWithRetry(msg, 5);
-          if (!buffer) return;
-
-          const mediaContent = msg.message.imageMessage || msg.message.documentMessage || msg.message.audioMessage || msg.message.videoMessage;
-          const mimeType = mediaContent.mimetype || 'image/jpeg';
-          const caption = mediaContent.caption || '';
-          const fileName = mediaContent.fileName || '';
-
-          const mediaItem = {
-            type: isImage ? 'image' : (isDocument ? 'pdf' : (isAudio ? 'audio' : 'video')),
-            data: buffer.toString('base64'),
-            mimeType: mimeType,
-            caption: caption,
-            fileName: fileName
+          // Reconstruct the message with the updated content
+          const fullMsg = {
+            ...pending.msg,
+            message: update.update.message
           };
 
-          await addToUserBuffer(chatId, senderId, senderName, mediaItem, msgId);
-          resetUserTimeout(chatId, senderId, senderName);
+          // Remove from pending
+          pendingEmptyMessages.delete(msgId);
 
-        } catch (err) {
-          log('❌', `Error ingesting incoming media: ${err.message}`);
-        }
-      } else if (isText) {
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-        const contextInfo = msg.message.extendedTextMessage?.contextInfo;
-        const quotedMsgId = contextInfo?.stanzaId;
+          // Check dedup - remove from processed so it can be handled
+          processedMessageIds.delete(msgId);
 
-        if (quotedMsgId && getStoredContext(chatId, quotedMsgId)) {
-          const ctx = getStoredContext(chatId, quotedMsgId);
-          log('💬', `Handling follow-up query for quote ${quotedMsgId.substring(0, 8)}...`);
-          await processMedia(sock, chatId, ctx.mediaFiles, true, text, senderId, senderName, quotedMsgKey);
-        } else if (COMMANDS.includes(text.toLowerCase().trim())) {
-          // Handle commands (.1, .2, etc.)
-          if (text === '.' || text === 'status') {
-            const count = await getUserBufferCount(chatId, senderId);
-            await sock.sendMessage(chatId, { text: `📊 Status: ${count} media file(s) currently buffered for you.` });
-          } else if (text === 'clear') {
-            await clearUserBuffer(chatId, senderId);
-            clearUserTimeout(chatId, senderId);
-            await sock.sendMessage(chatId, { text: '🧹 Cleared your buffered media.' });
+          // Now process it
+          if (!fullMsg.key.fromMe && !isMessageAlreadyProcessed(msgId)) {
+            try {
+              await handleMessage(sock, fullMsg);
+            } catch (error) {
+              log('❌', `Message handling error (from update): ${error.message}`);
+            }
           }
         }
       }
     });
 
-  } catch (err) {
-    log('❌', `Start bot error: ${err.message}`);
+  } catch (error) {
+    log('💥', `Bot error: ${error.message}`);
+    console.error(error);
+    botStatus = 'Error - restarting...';
     setTimeout(startBot, 10000);
   }
 }
 
-startBot();
+// ======================================================================
+// 🔄 EMPTY MESSAGE RETRY LOGIC (for auto group messages)
+// ======================================================================
+function scheduleEmptyMessageRetry(msgId) {
+  const pending = pendingEmptyMessages.get(msgId);
+  if (!pending) return;
+
+  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS * (pending.retryCount + 1); // Progressive delay
+
+  setTimeout(async () => {
+    const stillPending = pendingEmptyMessages.get(msgId);
+    if (!stillPending) return; // Already resolved via messages.update
+
+    stillPending.retryCount++;
+
+    // Try to load the message from the store/socket
+    try {
+      // Attempt to use sock.loadMessage if available, or just check if message arrived via update
+      // The main mechanism is messages.update event, but we also check here
+      if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
+        log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (auto group: ${stillPending.chatId})`);
+        pendingEmptyMessages.delete(msgId);
+        return;
+      }
+
+      log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from auto group`);
+
+      // Schedule next retry
+      scheduleEmptyMessageRetry(msgId);
+
+    } catch (error) {
+      log('❌', `Retry error for ${msgId.substring(0, 8)}...: ${error.message}`);
+      pendingEmptyMessages.delete(msgId);
+    }
+  }, retryDelay);
+}
+
+// Periodic cleanup for stale pending messages (older than 2 minutes)
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [msgId, pending] of pendingEmptyMessages) {
+    if (now - pending.timestamp > 120000) { // 2 minutes
+      pendingEmptyMessages.delete(msgId);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    log('🧹', `Cleaned ${cleaned} stale pending empty message(s)`);
+  }
+}, 60000);
+// ======================================================================
+
+// 🟢 FIX: Helper to unwrap nested messages (ViewOnce, Ephemeral, etc.)
+const unwrapMessage = (m) => {
+  if (!m) return null;
+  if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
+  if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
+  if (m.ephemeralMessage?.message) return unwrapMessage(m.ephemeralMessage.message);
+  if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
+  return m;
+};
+
+async function handleMessage(sock, msg) {
+  const chatId = msg.key.remoteJid;
+
+  if (chatId === 'status@broadcast') return;
+
+  const senderId = getSenderId(msg);
+  const senderName = getSenderName(msg);
+  const shortId = getShortSenderId(senderId);
+
+  const isGroup = chatId.endsWith('@g.us');
+  const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
+  const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
+  
+  if (isGroup) {
+    log('📋', `Message from group: ${chatId} (Allowed: ALL)${isSourceGroup ? ' [SOURCE GROUP - silent mode]' : ''}${isTargetGroup ? ' [TARGET GROUP]' : ''}`);
+  }
+
+  const content = unwrapMessage(msg.message);
+
+  if (!content) {
+    return;
+  }
+
+  const messageType = Object.keys(content)[0];
+
+  let quotedMessageId = null;
+  let contextInfo = null;
+
+  if (messageType === 'extendedTextMessage') {
+    contextInfo = content.extendedTextMessage?.contextInfo;
+  } else if (messageType === 'imageMessage') {
+    contextInfo = content.imageMessage?.contextInfo;
+  } else if (messageType === 'documentMessage') {
+    contextInfo = content.documentMessage?.contextInfo;
+  } else if (messageType === 'audioMessage') {
+    contextInfo = content.audioMessage?.contextInfo;
+  } else if (messageType === 'videoMessage') {
+    contextInfo = content.videoMessage?.contextInfo;
+  }
+
+  if (contextInfo?.stanzaId) {
+    quotedMessageId = contextInfo.stanzaId;
+
+    if (isBotMessage(chatId, quotedMessageId)) {
+      if (isSourceGroup) {
+        log('🔇', `Ignoring reply-to-bot in source group from ${senderName} (...${shortId})`);
+        return;
+      }
+      log('↩️', `Reply to bot from ${senderName} (...${shortId})`);
+
+      await handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType, content);
+      return;
+    }
+  }
+
+  if (messageType === 'imageMessage') {
+    log('📷', `Image from ${senderName} (...${shortId})`);
+
+    try {
+      const buffer = await downloadMediaWithRetry(msg, 5);
+      const caption = content.imageMessage.caption || '';
+
+      const count = addToUserBuffer(chatId, senderId, {
+        type: 'image',
+        data: buffer.toString('base64'),
+        mimeType: content.imageMessage.mimetype || 'image/jpeg',
+        caption: caption,
+        timestamp: Date.now()
+      });
+
+      if (caption) {
+        log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+      }
+
+      log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+      resetUserTimeout(chatId, senderId, senderName);
+
+    } catch (error) {
+      log('❌', `Image error: ${error.message}`);
+    }
+  }
+  else if (messageType === 'videoMessage') {
+    log('🎬', `Video from ${senderName} (...${shortId})`);
+
+    try {
+      const buffer = await downloadMediaWithRetry(msg, 5);
+      const caption = content.videoMessage.caption || '';
+      const mimeType = content.videoMessage.mimetype || 'video/mp4';
+
+      const count = addToUserBuffer(chatId, senderId, {
+        type: 'video',
+        data: buffer.toString('base64'),
+        mimeType: mimeType,
+        caption: caption,
+        duration: content.videoMessage.seconds || 0,
+        timestamp: Date.now()
+      });
+
+      if (caption) {
+        log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+      }
+
+      log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+      resetUserTimeout(chatId, senderId, senderName);
+
+    } catch (error) {
+      log('❌', `Video error: ${error.message}`);
+    }
+  }
+  else if (messageType === 'audioMessage') {
+    const isVoice = content.audioMessage.ptt === true;
+    const emoji = isVoice ? '🎤' : '🎵';
+
+    log(emoji, `${isVoice ? 'Voice' : 'Audio'} from ${senderName} (...${shortId})`);
+
+    try {
+      const buffer = await downloadMediaWithRetry(msg, 5);
+
+      const count = addToUserBuffer(chatId, senderId, {
+        type: isVoice ? 'voice' : 'audio',
+        data: buffer.toString('base64'),
+        mimeType: content.audioMessage.mimetype || 'audio/ogg',
+        duration: content.audioMessage.seconds || 0,
+        timestamp: Date.now()
+      });
+
+      log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+      resetUserTimeout(chatId, senderId, senderName);
+
+    } catch (error) {
+      log('❌', `Audio error: ${error.message}`);
+    }
+  }
+  else if (messageType === 'documentMessage') {
+    const docMime = content.documentMessage.mimetype || '';
+    const fileName = content.documentMessage.fileName || 'document';
+    const caption = content.documentMessage.caption || '';
+
+    const fileType = getFileType(docMime, fileName);
+
+    if (fileType === 'pdf') {
+      log('📄', `PDF from ${senderName} (...${shortId}): ${fileName}`);
+
+      try {
+        const buffer = await downloadMediaWithRetry(msg, 5);
+
+        const count = addToUserBuffer(chatId, senderId, {
+          type: 'pdf',
+          data: buffer.toString('base64'),
+          mimeType: 'application/pdf',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now()
+        });
+
+        if (caption) {
+          log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+        }
+
+        log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+        resetUserTimeout(chatId, senderId, senderName);
+
+      } catch (error) {
+        log('❌', `PDF error: ${error.message}`);
+      }
+    }
+    else if (fileType === 'audio') {
+      log('🎵', `Audio file from ${senderName} (...${shortId}): ${fileName}`);
+
+      try {
+        const buffer = await downloadMediaWithRetry(msg, 5);
+
+        const count = addToUserBuffer(chatId, senderId, {
+          type: 'audio',
+          data: buffer.toString('base64'),
+          mimeType: docMime || 'audio/mpeg',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now()
+        });
+
+        if (caption) {
+          log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+        }
+
+        log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+        resetUserTimeout(chatId, senderId, senderName);
+
+      } catch (error) {
+        log('❌', `Audio file error: ${error.message}`);
+      }
+    }
+    else if (fileType === 'video') {
+      log('🎬', `Video file from ${senderName} (...${shortId}): ${fileName}`);
+
+      try {
+        const buffer = await downloadMediaWithRetry(msg, 5);
+
+        const count = addToUserBuffer(chatId, senderId, {
+          type: 'video',
+          data: buffer.toString('base64'),
+          mimeType: docMime || 'video/mp4',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now()
+        });
+
+        if (caption) {
+          log('💬', ` └─ Caption: "${caption.substring(0, 50)}${caption.length > 50 ? '...' : ''}"`);
+        }
+
+        log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+        resetUserTimeout(chatId, senderId, senderName);
+
+      } catch (error) {
+        log('❌', `Video file error: ${error.message}`);
+      }
+    }
+    else {
+      log('📎', `Skipping unsupported file: ${fileName} (${docMime})`);
+    }
+  }
+  else if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
+    const text = (content.conversation || content.extendedTextMessage?.text || '').trim();
+
+    if (!text) return;
+
+    // 🔇 SOURCE GROUP: Ignore ALL text messages — bot should never reply in source groups
+    if (isSourceGroup) {
+      log('🔇', `Ignoring text "${text.substring(0, 20)}" in source group from ${senderName} (...${shortId})`);
+      return;
+    }
+
+    // 🔇 TARGET GROUP: Ignore plain text to avoid processing random chatter, but allow commands
+    if (isTargetGroup) {
+      const lowerText = text.toLowerCase().trim();
+      const isCommand = CONFIG.COMMANDS.includes(lowerText) || /^(\.|\.\.|help|\?|clear|status)$/.test(lowerText);
+      if (!isCommand) {
+        log('🔇', `Ignoring plain text "${text.substring(0, 20)}" in target group from ${senderName} (...${shortId})`);
+        return;
+      }
+    }
+
+    // CHECK FOR TRIGGERS
+
+    const isPrimaryTrigger = /^(\.|(\.[1-3]))$/.test(text);
+    const isSecondaryTrigger = /^(\.\.|(\.\.[1-3]))$/.test(text);
+
+    if (isPrimaryTrigger || isSecondaryTrigger) {
+      log('🔔', `Trigger command "${text}" from ${senderName} (...${shortId})`);
+
+      await new Promise(r => setTimeout(r, 1000));
+
+      const userBufferCount = getUserBufferCount(chatId, senderId);
+
+      if (userBufferCount > 0) {
+        clearUserTimeout(chatId, senderId);
+        const mediaFiles = clearUserBuffer(chatId, senderId);
+
+        const lastChar = text.slice(-1);
+        let targetFps = 3;
+        if (!isNaN(parseInt(lastChar))) {
+          targetFps = parseInt(lastChar);
+        }
+
+        const batches = groupMediaSmartly(mediaFiles);
+
+        if (batches.length > 1) {
+          log('🔀', `Manual Trigger: Detected ${batches.length} distinct patient contexts.`);
+        }
+
+        for (let i = 0; i < batches.length; i++) {
+          const batch = batches[i];
+          if (batch.length === 0) continue;
+
+          const modeLabel = isSecondaryTrigger ? 'SECONDARY/CHAINED' : 'PRIMARY';
+          log('🤖', `Processing Batch ${i+1}/${batches.length} (${batch.length} items) with FPS=${targetFps}. Mode: ${modeLabel}`);
+
+          await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger);
+
+          if (i < batches.length - 1) {
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        }
+
+      } else {
+        await sock.sendMessage(chatId, {
+          text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
+          mentions: [senderId]
+        });
+      }
+    }
+    else if (text.toLowerCase() === 'help' || text === '?') {
+      await sock.sendMessage(chatId, {
+        text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
+      });
+    }
+    else if (text.toLowerCase() === 'clear') {
+      const userItems = clearUserBuffer(chatId, senderId);
+      clearUserTimeout(chatId, senderId);
+
+      if (userItems.length > 0) {
+        const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
+        userItems.forEach(m => {
+          if (m.type === 'image') counts.images++;
+          else if (m.type === 'pdf') counts.pdfs++;
+          else if (m.type === 'audio' || m.type === 'voice') counts.audio++;
+          else if (m.type === 'video') counts.video++;
+          else if (m.type === 'text') counts.texts++;
+        });
+
+        await sock.sendMessage(chatId, {
+          text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
+          mentions: [senderId]
+        });
+      } else {
+        await sock.sendMessage(chatId, {
+          text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
+          mentions: [senderId]
+        });
+      }
+    }
+    else if (text.toLowerCase() === 'status') {
+      const stats = getTotalBufferStats(chatId);
+      const userCount = getUserBufferCount(chatId, senderId);
+      const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
+
+      await sock.sendMessage(chatId, {
+        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
+      });
+    }
+    else {
+      log('💬', `Text from ${senderName} (...${shortId}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+
+      const count = addToUserBuffer(chatId, senderId, {
+        type: 'text',
+        content: text,
+        sender: senderName,
+        timestamp: Date.now()
+      });
+
+      log('📦', `Buffer for ...${shortId}: ${count} item(s)`);
+      resetUserTimeout(chatId, senderId, senderName);
+    }
+  }
+}
+
+async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType, content) {
+  const storedContext = getStoredContext(chatId, quotedMessageId);
+  const shortId = getShortSenderId(senderId);
+  const isGroup = chatId.endsWith('@g.us');
+
+  if (!storedContext) {
+    // 🔧 FIX #1: Updated expiry message from "30 min limit" to "12 hour limit"
+    log('⚠️', `Context expired for ...${shortId}`);
+    await sock.sendMessage(chatId, {
+      text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
+      mentions: [senderId]
+    });
+    return;
+  }
+
+  // ======================================================================
+  // 🆕 GROUP CHAT REPLY: Exclusively use source media + user text, NO system instruction
+  // ======================================================================
+  if (isGroup) {
+    // Extract user's question text
+    let userQuestion = '';
+
+    if (messageType === 'conversation') {
+      userQuestion = (content.conversation || '').trim();
+    } else if (messageType === 'extendedTextMessage') {
+      userQuestion = (content.extendedTextMessage?.text || '').trim();
+    }
+
+    if (!userQuestion) {
+      await sock.sendMessage(chatId, {
+        text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
+        mentions: [senderId]
+      });
+      return;
+    }
+
+    log('💬', `Group reply-question from ...${shortId}: "${userQuestion.substring(0, 80)}..."`);
+
+    // Build content parts from the ORIGINAL source documents
+    const sourceMedia = storedContext.mediaFiles;
+    const contentParts = [];
+
+    for (const media of sourceMedia) {
+      if (media.data && media.mimeType && (media.type === 'image' || media.type === 'pdf' || media.type === 'audio' || media.type === 'voice' || media.type === 'video')) {
+        contentParts.push({
+          inlineData: {
+            data: media.data,
+            mimeType: media.mimeType
+          }
+        });
+      }
+    }
+
+    // EXCLUSIVELY: source documents as inline data + user's question as text — NO system instruction
+    const requestContent = contentParts.length > 0
+      ? [userQuestion, ...contentParts]
+      : [userQuestion];
+
+    try {
+      await sock.sendPresenceUpdate('composing', chatId);
+
+      log('🔄', `Group reply (NO system instruction): Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
+
+      // Call Gemini with NO system instruction (null)
+      const responseText = await generateGeminiContent(requestContent, null);
+
+      await sock.sendPresenceUpdate('paused', chatId);
+
+      let finalText = responseText.length <= 60000
+        ? responseText
+        : responseText.substring(0, 60000) + '\n\n_(truncated)_';
+
+      // Add the group reply footer
+      finalText += GROUP_REPLY_FOOTER;
+
+      const sentMessage = await sock.sendMessage(chatId, {
+        text: finalText,
+        mentions: [senderId]
+      });
+
+      if (sentMessage?.key?.id) {
+        const messageId = sentMessage.key.id;
+        trackBotMessage(chatId, messageId);
+        // Store context with the SAME source media files so further replies also work
+        storeContext(chatId, messageId, sourceMedia, responseText, senderId);
+        log('💾', `Group reply context stored for ...${shortId}`);
+      }
+
+      processedCount++;
+      log('📤', `Group reply sent for ...${shortId}`);
+
+    } catch (error) {
+      log('❌', `Group reply error for ...${shortId}: ${error.message}`);
+      await sock.sendMessage(chatId, {
+        text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
+        mentions: [senderId]
+      });
+    }
+
+    return;
+  }
+  // ======================================================================
+  // END GROUP CHAT REPLY — below is the original private chat reply logic
+  // ======================================================================
+
+  const newContent = [];
+  let userTextInput = '';
+
+  if (messageType === 'conversation') {
+    const text = content.conversation || '';
+    if (text.trim()) {
+      userTextInput = text.trim();
+      newContent.push({
+        type: 'text',
+        content: text.trim(),
+        sender: senderName,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
+      log('💬', `Follow-up text (conversation) from ...${shortId}: "${text.substring(0, 50)}..."`);
+    }
+  }
+  else if (messageType === 'extendedTextMessage') {
+    const text = content.extendedTextMessage?.text || '';
+    if (text.trim()) {
+      userTextInput = text.trim();
+      newContent.push({
+        type: 'text',
+        content: text.trim(),
+        sender: senderName,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
+      log('💬', `Follow-up text (extended) from ...${shortId}: "${text.substring(0, 50)}..."`);
+    }
+  }
+  else if (messageType === 'imageMessage') {
+    try {
+      const buffer = await downloadMediaWithRetry(msg, 5);
+      const caption = content.imageMessage.caption || '';
+
+      newContent.push({
+        type: 'image',
+        data: buffer.toString('base64'),
+        mimeType: content.imageMessage.mimetype || 'image/jpeg',
+        caption: caption,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
+      if (caption) userTextInput = caption;
+      log('📷', `Follow-up image from ...${shortId}`);
+    } catch (error) {
+      log('❌', `Image error: ${error.message}`);
+    }
+  }
+  else if (messageType === 'videoMessage') {
+    try {
+      const buffer = await downloadMediaWithRetry(msg, 5);
+      const caption = content.videoMessage.caption || '';
+
+      newContent.push({
+        type: 'video',
+        data: buffer.toString('base64'),
+        mimeType: content.videoMessage.mimetype || 'video/mp4',
+        caption: caption,
+        duration: content.videoMessage.seconds || 0,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
+      if (caption) userTextInput = caption;
+      log('🎬', `Follow-up video from ...${shortId}`);
+    } catch (error) {
+      log('❌', `Video error: ${error.message}`);
+    }
+  }
+  else if (messageType === 'audioMessage') {
+    try {
+      const buffer = await downloadMediaWithRetry(msg, 5);
+      const isVoice = content.audioMessage.ptt === true;
+
+      newContent.push({
+        type: isVoice ? 'voice' : 'audio',
+        data: buffer.toString('base64'),
+        mimeType: content.audioMessage.mimetype || 'audio/ogg',
+        duration: content.audioMessage.seconds || 0,
+        timestamp: Date.now(),
+        isFollowUp: true
+      });
+      log(isVoice ? '🎤' : '🎵', `Follow-up audio from ...${shortId}`);
+    } catch (error) {
+      log('❌', `Audio error: ${error.message}`);
+    }
+  }
+  else if (messageType === 'documentMessage') {
+    const docMime = content.documentMessage.mimetype || '';
+    const fileName = content.documentMessage.fileName || 'document';
+    const caption = content.documentMessage.caption || '';
+
+    const fileType = getFileType(docMime, fileName);
+
+    if (fileType === 'pdf') {
+      try {
+        const buffer = await downloadMediaWithRetry(msg, 5);
+
+        newContent.push({
+          type: 'pdf',
+          data: buffer.toString('base64'),
+          mimeType: 'application/pdf',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now(),
+          isFollowUp: true
+        });
+        if (caption) userTextInput = caption;
+        log('📄', `Follow-up PDF from ...${shortId}`);
+      } catch (error) {
+        log('❌', `PDF error: ${error.message}`);
+      }
+    }
+    else if (fileType === 'audio') {
+      try {
+        const buffer = await downloadMediaWithRetry(msg, 5);
+
+        newContent.push({
+          type: 'audio',
+          data: buffer.toString('base64'),
+          mimeType: docMime || 'audio/mpeg',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now(),
+          isFollowUp: true
+        });
+        if (caption) userTextInput = caption;
+        log('🎵', `Follow-up audio file from ...${shortId}`);
+      } catch (error) {
+        log('❌', `Audio file error: ${error.message}`);
+      }
+    }
+    else if (fileType === 'video') {
+      try {
+        const buffer = await downloadMediaWithRetry(msg, 5);
+
+        newContent.push({
+          type: 'video',
+          data: buffer.toString('base64'),
+          mimeType: docMime || 'video/mp4',
+          fileName: fileName,
+          caption: caption,
+          timestamp: Date.now(),
+          isFollowUp: true
+        });
+        if (caption) userTextInput = caption;
+        log('🎬', `Follow-up video file from ...${shortId}`);
+      } catch (error) {
+        log('❌', `Video file error: ${error.message}`);
+      }
+    }
+  }
+
+  if (newContent.length === 0) {
+    await sock.sendMessage(chatId, {
+      text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
+      mentions: [senderId]
+    });
+    return;
+  }
+
+  const isUserQuestion = isQuestion(userTextInput);
+
+  const combinedMedia = [...storedContext.mediaFiles, ...newContent];
+
+  log('🔄', `Regenerating for ...${shortId}: ${storedContext.mediaFiles.length} original + ${newContent.length} new (isQuestion: ${isUserQuestion})`);
+
+  await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
+}
+
+// 🟢 MODIFIED: Fallback Model Chain Logic
+async function generateGeminiContent(requestContent, systemInstruction) {
+  const keys = CONFIG.API_KEYS;
+  if (keys.length === 0) {
+    throw new Error('No API keys configured!');
+  }
+
+  let lastErrorMsg = '';
+
+  const safetySettings = [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+  ];
+
+  const tryModel = async (modelName, useThinking) => {
+    for (let i = 0; i < keys.length; i++) {
+      try {
+        if (i > 0) {
+          log('⚠️', `Waiting 2s before retrying with Backup Key #${i + 1} (${modelName})...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+
+        const genAI = new GoogleGenerativeAI(keys[i]);
+        const modelConfig = {
+          model: modelName,
+          safetySettings: safetySettings
+        };
+        if (systemInstruction) {
+          modelConfig.systemInstruction = systemInstruction;
+        }
+        if (useThinking) {
+          modelConfig.generationConfig = {
+            thinkingConfig: { thinkingLevel: 'HIGH' }
+          };
+        }
+
+        const model = genAI.getGenerativeModel(modelConfig);
+        const result = await model.generateContent(requestContent);
+        const responseText = result.response.text();
+
+        if (!responseText) {
+          const feedback = JSON.stringify(result.response.promptFeedback || {});
+          throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
+        }
+
+        return responseText;
+
+      } catch (error) {
+        lastErrorMsg = error.message;
+        log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
+      }
+    }
+    return null; 
+  };
+
+  // 1. Loop through keys using Primary Model (gemini-3.6-flash)
+  let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
+  }
+
+  log('⚠️', `All keys failed for primary model. Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_1}...`);
+
+  // 2. Loop through keys using Fallback 1 Model (gemini-3.5-flash)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_1, false);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
+  }
+
+  log('⚠️', `All keys failed for fallback 1. Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_2}...`);
+
+  // 3. Loop through keys using Fallback 2 Model (gemini-3-flash-preview)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_2, false);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
+  }
+
+  log('⚠️', `All keys failed for fallback 2. Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_3} with HIGH thinking...`);
+
+  // 4. Loop through keys using Fallback 3 Model (gemini-3.5-flash-lite)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_3, true);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
+  }
+
+  // 5. All models failed across all keys
+  throw new Error(`All ${keys.length} API keys failed for all models. Last error: ${lastErrorMsg}`);
+}
+
+async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
+  const shortId = getShortSenderId(senderId);
+  const destinationChatId = targetChatId || chatId;
+  const isDestinationGroup = destinationChatId.endsWith('@g.us');
+
+  try {
+    const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, followUps: 0 };
+    const textContents = [];
+    const captions = [];
+    const binaryMedia = [];
+    const followUpTexts = [];
+
+    // === VIDEO PRE-PROCESSING START ===
+    const processedMedia = [];
+
+    for (const m of mediaFiles) {
+      if (m.type === 'video') {
+        log('🎬', `Processing video for ...${shortId} (Target FPS: ${targetFps})`);
+        try {
+          const videoBuffer = Buffer.from(m.data, 'base64');
+          const frames = await extractFramesFromVideo(videoBuffer, targetFps);
+          log('📸', `Extracted ${frames.length} smart frames from video`);
+
+          frames.forEach(frameData => {
+            processedMedia.push({
+              type: 'image',
+              data: frameData,
+              mimeType: 'image/jpeg',
+              caption: m.caption ? `[Frame from video] ${m.caption}` : '[Frame from video]',
+              timestamp: m.timestamp,
+              isFollowUp: m.isFollowUp
+            });
+          });
+        } catch (err) {
+          log('❌', `Video extraction failed: ${err.message}. processing as standard video.`);
+          processedMedia.push(m);
+        }
+      } else {
+        processedMedia.push(m);
+      }
+    }
+    // === VIDEO PRE-PROCESSING END ===
+
+    processedMedia.forEach(m => {
+      if (m.isFollowUp) counts.followUps++;
+
+      if (m.type === 'image') {
+        counts.images++;
+        binaryMedia.push(m);
+        if (m.caption) {
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional image caption]: ${m.caption}`);
+          } else {
+            captions.push(`[Image caption]: ${m.caption}`);
+          }
+        }
+      }
+      else if (m.type === 'pdf') {
+        counts.pdfs++;
+        binaryMedia.push(m);
+        if (m.caption) {
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional PDF caption]: ${m.caption}`);
+          } else {
+            captions.push(`[PDF caption]: ${m.caption}`);
+          }
+        }
+      }
+      else if (m.type === 'audio' || m.type === 'voice') {
+        counts.audio++;
+        binaryMedia.push(m);
+        if (m.caption) {
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional audio caption]: ${m.caption}`);
+          } else {
+            captions.push(`[Audio caption]: ${m.caption}`);
+          }
+        }
+      }
+      else if (m.type === 'video') {
+        counts.video++;
+        binaryMedia.push(m);
+        if (m.caption) {
+          if (m.isFollowUp) {
+            followUpTexts.push(`[Additional video caption]: ${m.caption}`);
+          } else {
+            captions.push(`[Video caption]: ${m.caption}`);
+          }
+        }
+      }
+      else if (m.type === 'text') {
+        counts.texts++;
+        if (m.isFollowUp) {
+          followUpTexts.push(`[User follow-up from ${m.sender}]: ${m.content}`);
+        } else {
+          textContents.push(`[Text note from ${m.sender}]: ${m.content}`);
+        }
+      }
+    });
+
+    if (isFollowUp) {
+      log('🤖', `Processing follow-up for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
+    } else {
+      log('🤖', `Processing for ...${shortId}: ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
+    }
+
+    const contentParts = [];
+    binaryMedia.forEach(media => {
+      contentParts.push({
+        inlineData: {
+          data: media.data,
+          mimeType: media.mimeType
+        }
+      });
+    });
+
+    let promptParts = [];
+    if (counts.images > 0) promptParts.push(`${counts.images} image(s)`);
+    if (counts.pdfs > 0) promptParts.push(`${counts.pdfs} PDF document(s)`);
+    if (counts.audio > 0) promptParts.push(`${counts.audio} audio/voice recording(s)`);
+    if (counts.video > 0) promptParts.push(`${counts.video} video file(s)`);
+
+    const allOriginalText = [...captions, ...textContents];
+    let promptText = '';
+
+    if (isFollowUp && previousResponse) {
+      const isUserQuestion = userTextInput ? isQuestion(userTextInput) : false;
+
+      if (isUserQuestion) {
+        promptText = `The user is replying to a previously generated Clinical Profile with a QUESTION or request for clarification.
+
+=== PREVIOUS CLINICAL PROFILE ===
+${previousResponse}
+=== END PREVIOUS CLINICAL PROFILE ===
+
+=== ORIGINAL MEDICAL CONTENT CONTEXT ===
+${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original medical files are attached for reference)'}
+=== END ORIGINAL CONTEXT ===
+
+=== USER'S QUESTION/REQUEST ===
+${followUpTexts.join('\n\n')}
+=== END USER'S QUESTION ===
+
+Please answer the user's question directly and helpfully based on the Clinical Profile and original medical content.
+- Provide clear, understandable explanations
+- If appropriate, explain medical terms in simple language
+- Be informative and thorough
+- If they ask about specific findings, explain what those findings typically mean
+- Remind them this is AI analysis for informational purposes only and not a substitute for professional medical advice
+
+DO NOT regenerate the Clinical Profile unless specifically asked. Just answer their question.`;
+      } else {
+        promptText = `The user is replying to a previously generated Clinical Profile with ADDITIONAL CONTEXT, CORRECTIONS, or NEW INFORMATION.
+
+=== PREVIOUS CLINICAL PROFILE ===
+${previousResponse}
+=== END PREVIOUS CLINICAL PROFILE ===
+
+=== ORIGINAL CONTEXT ===
+${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original files are attached below)'}
+=== END ORIGINAL CONTEXT ===
+
+=== NEW ADDITIONAL INFORMATION FROM USER ===
+${followUpTexts.join('\n\n')}
+=== END NEW INFORMATION ===
+
+Please analyze ALL the content (original files + original text + NEW additional information) and generate an UPDATED Clinical Profile that incorporates the new information. Follow the standard Clinical Profile format:
+- Single paragraph starting with "Clinical Profile:"
+- Wrapped in single asterisks
+- Chronological order for dated scans
+- Exclude patient name, age, gender
+- Include the <<JSON>> block after the profile`;
+      }
+
+    } else if (binaryMedia.length > 0 && allOriginalText.length > 0) {
+      promptText = `Analyze these ${promptParts.join(', ')} along with the following additional text notes/context, and generate the Clinical Profile.
+
+=== ADDITIONAL TEXT NOTES ===
+${allOriginalText.join('\n\n')}
+=== END OF TEXT NOTES ===
+
+For audio files, transcribe the content first, then extract medical information.
+For video files (or video frames provided as images), analyze visual content and extract text.`;
+    }
+    else if (binaryMedia.length > 0) {
+      promptText = `Analyze these ${promptParts.join(', ')} containing medical information and generate the Clinical Profile. For audio files, transcribe the content first. For video files (or video frames provided as images), analyze visual content and extract text.`;
+    }
+else if (allOriginalText.length > 0) {
+      promptText = `Analyze the following text notes containing medical information and generate the Clinical Profile.
+
+=== TEXT NOTES ===
+${allOriginalText.join('\n\n')}
+=== END OF TEXT NOTES ===`;
+    }
+
+    // ======================================================================
+    // 🟢 ADDED: DYNAMIC DATE ANCHOR TO PREVENT YEAR HALLUCINATIONS
+    // ======================================================================
+    const currentDate = new Date().toLocaleDateString('en-GB', { 
+      day: 'numeric', month: 'long', year: 'numeric' 
+    });
+    
+    promptText += `\n\n⚠️ CRITICAL INSTRUCTION REGARDING DATES: 
+Today's current date is ${currentDate}. Please pay extremely close attention to the dates printed or handwritten on the medical reports. You MUST extract and transcribe the year EXACTLY as it appears in the images/documents. Do NOT let your training biases replace the current year with past years.`;
+    // ======================================================================
+
+    let requestContent;
+    if (binaryMedia.length > 0) {
+      requestContent = [promptText, ...contentParts];
+    } else {
+      requestContent = [promptText];
+    }
+
+    // 🔗 STORE SOURCE MEDIA FOR VIEWER
+    const viewerId = storeMediaForViewer(mediaFiles);
+    const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
+
+    // --- STEP 1: Generate Primary Clinical Profile ---
+    log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
+    const rawPrimaryResponse = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
+
+    // Parse JSON from response
+    const jsonData = parseJsonFromResponse(rawPrimaryResponse);
+    const primaryResponseText = stripJsonFromResponse(rawPrimaryResponse);
+
+    if (isSecondaryMode && !isFollowUp) {
+      // Build mentions array for this message
+      const step1Mentions = [senderId];
+      let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
+      if (jsonData) {
+        step1Text += formatJsonBlock(jsonData);
+      }
+      if (viewerUrl) {
+        step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+      }
+      // Add sender contact for auto-group routing using @mention
+      if (targetChatId) {
+        const senderContact = formatSenderContact(senderId, senderName);
+        step1Text += senderContact.text;
+        if (senderContact.mentionId && !step1Mentions.includes(senderContact.mentionId)) {
+          step1Mentions.push(senderContact.mentionId);
+        }
+      }
+      // Add footer to all chats
+step1Text += GROUP_REPLY_FOOTER;
+
+      await sock.sendMessage(destinationChatId, {
+        text: step1Text,
+        mentions: step1Mentions
+      });
+      log('📤', `Sent Primary (Step 1) to ...${shortId}`);
+
+      // --- STEP 2: Generate Secondary Analysis ---
+      log('🔄', `Generating Secondary Analysis...`);
+
+      const secondaryPrompt = `${SECONDARY_TRIGGER_PROMPT}
+
+=== CLINICAL PROFILE ===
+${primaryResponseText}
+=== END PROFILE ===`;
+
+      const secondaryRequestContent = [secondaryPrompt];
+      const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
+
+      // Build mentions array for secondary message
+      const step2Mentions = [senderId];
+      let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
+      if (viewerUrl) {
+        finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+      }
+      if (targetChatId) {
+        const senderContact = formatSenderContact(senderId, senderName);
+        finalSecondaryText += senderContact.text;
+        if (senderContact.mentionId && !step2Mentions.includes(senderContact.mentionId)) {
+          step2Mentions.push(senderContact.mentionId);
+        }
+      }
+      // Add footer to all chats
+finalSecondaryText += GROUP_REPLY_FOOTER;
+
+      processedCount++;
+
+      console.log('\n' + '═'.repeat(60));
+      console.log(`👤 User: ${senderName} (...${shortId})`);
+      console.log(`📊 CHAINED ANALYSIS COMPLETE`);
+      console.log(`⏰ ${new Date().toLocaleString()}`);
+      console.log('═'.repeat(60));
+      console.log(finalSecondaryText);
+      console.log('═'.repeat(60) + '\n');
+
+      await sock.sendPresenceUpdate('composing', destinationChatId);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      await sock.sendPresenceUpdate('paused', destinationChatId);
+
+      const sentMessage = await sock.sendMessage(destinationChatId, {
+        text: finalSecondaryText,
+        mentions: step2Mentions
+      });
+
+      if (sentMessage?.key?.id) {
+        const messageId = sentMessage.key.id;
+        trackBotMessage(destinationChatId, messageId);
+        storeContext(destinationChatId, messageId, mediaFiles, secondaryResponseText, senderId);
+        log('💾', `Secondary Context stored for ...${shortId}`);
+      }
+      log('📤', `Sent Secondary (Step 2) to target!`);
+      return;
+    }
+
+    // --- NORMAL PRIMARY MODE or FOLLOW-UP HANDLING ---
+
+    if (!primaryResponseText || primaryResponseText.trim() === '') {
+      throw new Error('Received empty response from AI');
+    }
+
+    log('✅', `Done for ...${shortId}!`);
+    processedCount++;
+
+    console.log('\n' + '═'.repeat(60));
+    console.log(`👤 User: ${senderName} (...${shortId})`);
+    if (isFollowUp) console.log(`🔄 FOLLOW-UP RESPONSE`);
+    console.log(`📊 ${counts.images} img, ${counts.pdfs} PDF, ${counts.audio} audio, ${counts.video} video, ${counts.texts} text`);
+    console.log(`⏰ ${new Date().toLocaleString()}`);
+    console.log('═'.repeat(60));
+    console.log(primaryResponseText);
+    if (jsonData) console.log(`JSON: ${JSON.stringify(jsonData)}`);
+    console.log('═'.repeat(60) + '\n');
+
+    await sock.sendPresenceUpdate('composing', destinationChatId);
+    const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
+    await new Promise(resolve => setTimeout(resolve, delay));
+    await sock.sendPresenceUpdate('paused', destinationChatId);
+
+    let finalResponseText = primaryResponseText.length <= 60000
+      ? primaryResponseText
+      : primaryResponseText.substring(0, 60000) + '\n\n_(truncated)_';
+
+    if (targetChatId && allOriginalText.length > 0) {
+      const captionHeader = allOriginalText.map(t => t.replace(/^\[.*?\]:\s*/, '')).join('\n');
+      if (captionHeader.trim().length > 0) {
+        finalResponseText = `${captionHeader}\n\n${finalResponseText}`;
+      }
+    }
+
+    // Append JSON block
+    if (jsonData) {
+      finalResponseText += formatJsonBlock(jsonData);
+    }
+
+    // 🔗 Append viewer URL to response
+    if (viewerUrl) {
+      finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+    }
+
+    // Build mentions array
+    const finalMentions = [senderId];
+
+    // 👤 Append sender contact for auto-group routing using @mention
+    if (targetChatId) {
+      const senderContact = formatSenderContact(senderId, senderName);
+      finalResponseText += senderContact.text;
+      if (senderContact.mentionId && !finalMentions.includes(senderContact.mentionId)) {
+        finalMentions.push(senderContact.mentionId);
+      }
+    }
+
+    // 💬 Append footer to all chats
+finalResponseText += GROUP_REPLY_FOOTER;
+
+    const sentMessage = await sock.sendMessage(destinationChatId, {
+      text: finalResponseText,
+      mentions: finalMentions
+    });
+
+    if (sentMessage?.key?.id) {
+      const messageId = sentMessage.key.id;
+      trackBotMessage(destinationChatId, messageId);
+      storeContext(destinationChatId, messageId, mediaFiles, primaryResponseText, senderId);
+      log('💾', `Context stored for ...${shortId}`);
+    }
+
+    log('📤', `Sent to target/chat!`);
+
+  } catch (error) {
+    log('❌', `Error for ...${shortId}: ${error.message}`);
+    console.error(error);
+
+    if (retryAttempt === 0) {
+      log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
+
+      await sock.sendPresenceUpdate('composing', destinationChatId);
+      await new Promise(r => setTimeout(r, 1000));
+
+      await sock.sendMessage(destinationChatId, {
+        text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
+        mentions: [senderId]
+      });
+
+      setTimeout(() => {
+        log('🔄', `Executing 5-minute retry for ...${shortId}`);
+        processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
+      }, 300000);
+
+      return;
+    }
+
+    await sock.sendPresenceUpdate('composing', destinationChatId);
+    await new Promise(r => setTimeout(r, 1500));
+
+    await sock.sendMessage(destinationChatId, {
+      text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
+      mentions: [senderId]
+    });
+  }
+}
+
+
+
+
+
+console.log('\n╔══════════════════════════════════════════════════════════╗');
+console.log('║         WhatsApp Clinical Profile Bot v3.4              ║');
+console.log('║                                                        ║');
+console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
+console.log('║                                                        ║');
+console.log('║  🌍 UNIVERSAL MODE: Works in any chat (Group or Private)║');
+console.log('║  🔄 AUTO-GROUPS: Monitors Source/Target -> Sends to Target (60s)║');
+console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║');
+console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
+console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
+console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
+console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
+console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
+console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
+console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
+console.log('║  👤 SENDER CONTACT: @mention tag for source sender     ║');
+console.log('║  🔄 EMPTY MSG RETRY: Auto-retry empty source group msgs║');
+console.log('║                                                        ║');
+console.log('║  ✨ Per-User Buffers - Each user processed separately  ║');
+console.log('║  ↩️ Reply to ask questions OR add context               ║');
+console.log('║  🗄 MongoDB Persistent Sessions                        ║');
+console.log('║  🔑 Multi-Key Rotation (2hrs) + Failover Active        ║');
+console.log('╚══════════════════════════════════════════════════════════╝\n');
+
+log('🏁', 'Starting...');
+
+if (CONFIG.API_KEYS.length === 0) {
+  log('❌', 'No API Keys found! Set GEMINI_API_KEYS environment variable.');
+} else {
+  log('🔑', `Loaded ${CONFIG.API_KEYS.length} Gemini API Key(s)`);
+}
+
+(async () => {
+  try {
+    await connectMongoDB();
+    await startBot();
+  } catch (error) {
+    log('💥', `Startup error: ${error.message}`);
+    console.error(error);
+    process.exit(1);
+  }
+})();
