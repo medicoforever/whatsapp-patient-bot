@@ -390,14 +390,17 @@ const pendingMediaSchema = new mongoose.Schema({
   messageId: { type: String },
   type: String,
   data: String,
+  content: String,
   mimeType: String,
   caption: String,
   fileName: String,
+  status: { type: String, enum: ['pending', 'processing', 'completed', 'failed'], default: 'pending' },
   processed: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 }, { collection: 'whatsapp_pending_media' });
 
 pendingMediaSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86400 * 7 });
+pendingMediaSchema.index({ chatId: 1, senderId: 1, processed: 1, status: 1 });
 
 let PendingMediaModel;
 function getPendingMediaModel() {
@@ -574,22 +577,24 @@ let authState = null;
 let makeWASocket, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion;
 
 
-async function downloadMediaWithRetry(msg, maxRetries = 5) {
+async function downloadMediaWithRetry(msg, maxRetries = 5, backoffBaseMs = 1500) {
   let attempt = 0;
   while (attempt < maxRetries) {
     try {
       const buffer = await downloadMediaMessage(
         msg,
         'buffer',
-        {},
+        { options: { timeout: 30000 }, timeout: 30000 },
         { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
       );
       if (buffer && buffer.length > 0) return buffer;
+      throw new Error('Downloaded empty media buffer');
     } catch (err) {
       attempt++;
       log('⚠️', `Media download attempt ${attempt}/${maxRetries} failed: ${err.message}`);
       if (attempt >= maxRetries) throw err;
-      await new Promise(res => setTimeout(res, 1500 * Math.pow(2, attempt)));
+      const delay = backoffBaseMs * Math.pow(2, attempt);
+      await new Promise(res => setTimeout(res, delay));
     }
   }
   return null;
@@ -629,12 +634,15 @@ async function addToUserBuffer(chatId, senderId, mediaItem, msgId = null, sender
         chatId,
         senderId,
         senderName,
-        messageId: msgId || require('crypto').randomBytes(8).toString('hex'),
+        messageId: msgId || crypto.randomBytes(8).toString('hex'),
         type: mediaItem.type,
         data: mediaItem.data,
+        content: mediaItem.content || '',
         mimeType: mediaItem.mimeType,
         caption: mediaItem.caption || '',
-        fileName: mediaItem.fileName || ''
+        fileName: mediaItem.fileName || '',
+        status: 'pending',
+        processed: false
       });
       const count = await model.countDocuments({ chatId, senderId, processed: false });
       return count;
@@ -660,16 +668,20 @@ async function clearUserBuffer(chatId, senderId) {
     try {
       const docs = await model.find({ chatId, senderId, processed: false }).sort({ createdAt: 1 });
       if (docs.length > 0) {
-        await model.updateMany({ chatId, senderId, processed: false }, { processed: true });
+        await model.updateMany({ chatId, senderId, processed: false }, { status: 'processing' });
         mongoItems = docs.map(d => ({
+          _id: d._id,
           type: d.type,
           data: d.data,
+          content: d.content || '',
           mimeType: d.mimeType,
           caption: d.caption,
           fileName: d.fileName
         }));
       }
-    } catch (err) {}
+    } catch (err) {
+      log('⚠️', 'MongoDB clearUserBuffer error: ' + err.message);
+    }
   }
 
   // RAM Fallback
@@ -682,6 +694,28 @@ async function clearUserBuffer(chatId, senderId) {
     }
   }
   return [...mongoItems, ...ramItems];
+}
+
+async function markUserBufferCompleted(chatId, senderId) {
+  const model = getPendingMediaModel();
+  if (model) {
+    try {
+      await model.updateMany({ chatId, senderId, status: 'processing' }, { processed: true, status: 'completed' });
+    } catch (err) {
+      log('⚠️', 'Error marking user buffer completed: ' + err.message);
+    }
+  }
+}
+
+async function markUserBufferFailed(chatId, senderId) {
+  const model = getPendingMediaModel();
+  if (model) {
+    try {
+      await model.updateMany({ chatId, senderId, status: 'processing' }, { processed: true, status: 'failed' });
+    } catch (err) {
+      log('⚠️', 'Error marking user buffer failed: ' + err.message);
+    }
+  }
 }
 
 async function getUserBufferCount(chatId, senderId) {
@@ -912,7 +946,24 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
     const inputPath = join(tempDir, `input_${tempId}.mp4`);
     const outputPattern = join(tempDir, `frame_${tempId}_%03d.jpg`);
 
-    fs.writeFileSync(inputPath, videoBuffer);
+    const cleanup = () => {
+      try {
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+      } catch (e) {}
+      try {
+        const files = fs.readdirSync(tempDir).filter(f => f.startsWith(`frame_${tempId}_`));
+        for (const file of files) {
+          try { fs.unlinkSync(join(tempDir, file)); } catch (e) {}
+        }
+      } catch (e) {}
+    };
+
+    try {
+      fs.writeFileSync(inputPath, videoBuffer);
+    } catch (err) {
+      cleanup();
+      return reject(err);
+    }
 
     const batchSize = 3;
     const inputFps = targetFps * batchSize;
@@ -937,18 +988,18 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
           const frames = files.map(file => {
             const path = join(tempDir, file);
             const buffer = fs.readFileSync(path);
-            fs.unlinkSync(path);
             return buffer.toString('base64');
           });
 
-          fs.unlinkSync(inputPath);
+          cleanup();
           resolve(frames);
         } catch (err) {
+          cleanup();
           reject(err);
         }
       })
       .on('error', (err) => {
-        try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch(e){}
+        cleanup();
         reject(err);
       })
       .run();
@@ -1535,24 +1586,7 @@ async function connectMongoDB() {
 
     // 🔥 Startup Recovery: Process any pending media that was abandoned during a restart
     setTimeout(async () => {
-      const pendingModel = getPendingMediaModel();
-      if (pendingModel) {
-        try {
-          const abandoned = await pendingModel.distinct('chatId', { processed: false });
-          if (abandoned.length > 0) {
-            log('🔄', `Found ${abandoned.length} chats with unprocessed media. Waking up queues...`);
-            for (const chatId of abandoned) {
-              const users = await pendingModel.distinct('senderId', { chatId, processed: false });
-              for (const senderId of users) {
-                const count = await getUserBufferCount(chatId, senderId);
-                log('🔄', `Recovered ${count} pending items for ${senderId} in ${chatId}`);
-              }
-            }
-          }
-        } catch(e) {
-          log('⚠️', 'Error during startup recovery: ' + e.message);
-        }
-      }
+      await runStartupRecovery();
     }, 5000);
     return true;
   } catch (error) {
@@ -2516,8 +2550,17 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   await processMedia(sock, chatId, combinedMedia, true, storedContext.response, senderId, senderName, userTextInput);
 }
 
+let generateGeminiContentMock = null;
+
+function setGenerateGeminiContentMock(mockFn) {
+  generateGeminiContentMock = mockFn;
+}
+
 // 🟢 MODIFIED: Fallback Model Chain Logic
 async function generateGeminiContent(requestContent, systemInstruction) {
+  if (generateGeminiContentMock) {
+    return await generateGeminiContentMock(requestContent, systemInstruction);
+  }
   const keys = CONFIG.API_KEYS;
   if (keys.length === 0) {
     throw new Error('No API keys configured!');
@@ -2607,10 +2650,51 @@ async function generateGeminiContent(requestContent, systemInstruction) {
   throw new Error(`All ${keys.length} API keys failed for all models. Last error: ${lastErrorMsg}`);
 }
 
-async function processMedia(sock, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
+async function runStartupRecovery() {
+  const pendingModel = getPendingMediaModel();
+  if (pendingModel) {
+    try {
+      const abandoned = await pendingModel.distinct('chatId', { processed: false });
+      if (abandoned.length > 0) {
+        log('🔄', `Found ${abandoned.length} chats with unprocessed media. Waking up queues...`);
+        for (const chatId of abandoned) {
+          const users = await pendingModel.distinct('senderId', { chatId, processed: false });
+          for (const senderId of users) {
+            const count = await getUserBufferCount(chatId, senderId);
+            log('🔄', `Recovered ${count} pending items for ${senderId} in ${chatId}`);
+            const mediaFiles = await clearUserBuffer(chatId, senderId);
+            if (mediaFiles.length > 0) {
+              const batches = groupMediaSmartly(mediaFiles);
+              for (let i = 0; i < batches.length; i++) {
+                const batch = batches[i];
+                if (batch.length === 0) continue;
+                await processMedia(sock, chatId, batch, false, null, senderId, senderId.split('@')[0]);
+              }
+            }
+          }
+        }
+      }
+    } catch(e) {
+      log('⚠️', 'Error during startup recovery: ' + e.message);
+    }
+  }
+}
+
+const activeProcessingUsers = new Set();
+
+async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
+  const currentSock = sockParam || sock;
   const shortId = getShortSenderId(senderId);
   const destinationChatId = targetChatId || chatId;
   const isDestinationGroup = destinationChatId.endsWith('@g.us');
+  const userLockKey = `${chatId}:${senderId}`;
+
+  if (activeProcessingUsers.has(userLockKey)) {
+    log('⚠️', `Concurrent processMedia execution blocked for ...${shortId} in ${chatId}`);
+    return;
+  }
+
+  activeProcessingUsers.add(userLockKey);
 
   try {
     const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, followUps: 0 };
@@ -2748,11 +2832,6 @@ ${allOriginalText.length > 0 ? allOriginalText.join('\n\n') : '(Original medical
 
 === USER'S QUESTION/REQUEST ===
 ${followUpTexts.join('\n\n')}
-=== END USER'S QUESTION ===
-
-Please answer the user's question directly and helpfully based on the Clinical Profile and original medical content.
-- Provide clear, understandable explanations
-- If appropriate, explain medical terms in simple language
 - Be informative and thorough
 - If they ask about specific findings, explain what those findings typically mean
 - Remind them this is AI analysis for informational purposes only and not a substitute for professional medical advice
@@ -2989,6 +3068,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
     }
 
     log('📤', `Sent to target/chat!`);
+    await markUserBufferCompleted(chatId, senderId);
 
   } catch (error) {
     log('❌', `Error for ...${shortId}: ${error.message}`);
@@ -2997,29 +3077,33 @@ finalResponseText += GROUP_REPLY_FOOTER;
     if (retryAttempt === 0) {
       log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
 
-      await sock.sendPresenceUpdate('composing', destinationChatId);
+      await currentSock?.sendPresenceUpdate?.('composing', destinationChatId);
       await new Promise(r => setTimeout(r, 1000));
 
-      await sock.sendMessage(destinationChatId, {
+      await currentSock?.sendMessage?.(destinationChatId, {
         text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
         mentions: [senderId]
       });
 
       setTimeout(() => {
         log('🔄', `Executing 5-minute retry for ...${shortId}`);
-        processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
+        processMedia(currentSock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
       }, 300000);
 
       return;
     }
 
-    await sock.sendPresenceUpdate('composing', destinationChatId);
+    await markUserBufferFailed(chatId, senderId);
+
+    await currentSock?.sendPresenceUpdate?.('composing', destinationChatId);
     await new Promise(r => setTimeout(r, 1500));
 
-    await sock.sendMessage(destinationChatId, {
+    await currentSock?.sendMessage?.(destinationChatId, {
       text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
       mentions: [senderId]
     });
+  } finally {
+    activeProcessingUsers.delete(userLockKey);
   }
 }
 
@@ -3059,13 +3143,43 @@ if (CONFIG.API_KEYS.length === 0) {
   log('🔑', `Loaded ${CONFIG.API_KEYS.length} Gemini API Key(s)`);
 }
 
-(async () => {
-  try {
-    await connectMongoDB();
-    await startBot();
-  } catch (error) {
-    log('💥', `Startup error: ${error.message}`);
-    console.error(error);
-    process.exit(1);
-  }
-})();
+function setMockSock(mock) {
+  sock = mock;
+}
+
+function setDownloadMediaMessageMock(mockFn) {
+  downloadMediaMessage = mockFn;
+}
+
+export {
+  CONFIG,
+  pendingMediaSchema,
+  getPendingMediaModel,
+  addToUserBuffer,
+  clearUserBuffer,
+  getUserBufferCount,
+  markUserBufferCompleted,
+  markUserBufferFailed,
+  runStartupRecovery,
+  downloadMediaWithRetry,
+  extractFramesFromVideo,
+  processMedia,
+  connectMongoDB,
+  activeProcessingUsers,
+  setMockSock,
+  setDownloadMediaMessageMock,
+  setGenerateGeminiContentMock
+};
+
+if (process.env.NODE_ENV !== 'test' && (!process.argv[1] || process.argv[1].endsWith('index.js'))) {
+  (async () => {
+    try {
+      await connectMongoDB();
+      await startBot();
+    } catch (error) {
+      log('💥', `Startup error: ${error.message}`);
+      console.error(error);
+      process.exit(1);
+    }
+  })();
+}
