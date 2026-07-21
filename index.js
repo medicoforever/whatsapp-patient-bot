@@ -1815,6 +1815,12 @@ async function startBot() {
           continue;
         }
 
+        // ✅ If the message was previously marked empty but arrived successfully now, stop its retry loop
+        if (msgId && pendingEmptyMessages.has(msgId)) {
+          pendingEmptyMessages.delete(msgId);
+          log('✅', `Empty message ${msgId.substring(0, 8)}... was successfully decrypted in a later event!`);
+        }
+
         try {
           await handleMessage(sock, msg);
         } catch (error) {
