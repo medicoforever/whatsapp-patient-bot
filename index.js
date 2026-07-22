@@ -77,8 +77,8 @@ const CONFIG = {
   DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
-  EMPTY_MSG_RETRY_DELAY_MS: 3000, // Wait 3 seconds before retry
-  EMPTY_MSG_MAX_RETRIES: 3, // Max retries for empty messages
+  EMPTY_MSG_RETRY_DELAY_MS: 2000, // Wait 2 seconds before first retry
+  EMPTY_MSG_MAX_RETRIES: 8, // Max retries for empty messages (increased from 3 — gives ~30s total window)
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -1689,8 +1689,17 @@ async function startBot() {
       browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
       markOnlineOnConnect: false,
       syncFullHistory: false,
-      retryRequestDelayMs: 2000,
+      retryRequestDelayMs: 1500,
       getMessage: async (key) => {
+        // 🔑 CRITICAL: Return stored pending message content if available.
+        // This enables Baileys' Signal protocol retry to actually work.
+        // When Baileys sends a retry receipt to the sender's device,
+        // the sender re-encrypts and re-sends. Baileys then calls getMessage
+        // to compare/merge. Returning empty {} made this mechanism useless.
+        if (key.id && pendingEmptyMessages.has(key.id)) {
+          const pending = pendingEmptyMessages.get(key.id);
+          if (pending.msg?.message) return pending.msg.message;
+        }
         return { conversation: '' };
       }
     });
@@ -1879,7 +1888,8 @@ function scheduleEmptyMessageRetry(msgId) {
   const pending = pendingEmptyMessages.get(msgId);
   if (!pending) return;
 
-  const retryDelay = CONFIG.EMPTY_MSG_RETRY_DELAY_MS * (pending.retryCount + 1); // Progressive delay
+  // Progressive backoff: 2s, 3s, 4s, 5s, 5s, 5s, 5s, 5s (~34s total window)
+  const retryDelay = Math.min(CONFIG.EMPTY_MSG_RETRY_DELAY_MS + (pending.retryCount * 1000), 5000);
 
   setTimeout(async () => {
     const stillPending = pendingEmptyMessages.get(msgId);
@@ -1887,15 +1897,28 @@ function scheduleEmptyMessageRetry(msgId) {
 
     stillPending.retryCount++;
 
-    // Try to load the message from the store/socket
     try {
-      // Attempt to use sock.loadMessage if available, or just check if message arrived via update
-      // The main mechanism is messages.update event, but we also check here
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
         log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (auto group: ${stillPending.chatId})`);
         pendingEmptyMessages.delete(msgId);
         return;
       }
+
+      // 🔑 ACTIVE RETRY: Send a retry receipt to the sender's device
+      // This asks the sender's phone to re-encrypt and re-send the message
+      try {
+        if (sock && stillPending.msg?.key) {
+          await sock.sendMessageAck({
+            tag: 'receipt',
+            attrs: {
+              id: msgId,
+              to: stillPending.chatId,
+              type: 'retry',
+              participant: stillPending.msg.key.participant || stillPending.msg.key.remoteJid
+            }
+          }).catch(() => {}); // Non-fatal if sendMessageAck is unavailable
+        }
+      } catch (_) { /* sendMessageAck may not be available in all Baileys versions */ }
 
       log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from auto group`);
 
