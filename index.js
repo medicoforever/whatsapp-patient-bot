@@ -700,7 +700,9 @@ async function markUserBufferCompleted(chatId, senderId) {
   const model = getPendingMediaModel();
   if (model) {
     try {
-      await model.updateMany({ chatId, senderId, status: 'processing' }, { processed: true, status: 'completed' });
+      // Instantly delete successful media from MongoDB to save space
+      const result = await model.deleteMany({ chatId, senderId, status: 'processing' });
+      log('🗑️', `Deleted ${result.deletedCount} processed media items for ${senderId} from MongoDB`);
     } catch (err) {
       log('⚠️', 'Error marking user buffer completed: ' + err.message);
     }
