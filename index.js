@@ -2101,7 +2101,14 @@ async function handleMessage(sock, msg) {
     return;
   }
 
-  const messageType = Object.keys(content)[0];
+  let messageType = Object.keys(content)[0];
+  const targetTypes = ['imageMessage', 'videoMessage', 'documentMessage', 'audioMessage', 'conversation', 'extendedTextMessage', 'stickerMessage'];
+  for (const t of targetTypes) {
+    if (content[t]) {
+      messageType = t;
+      break;
+    }
+  }
 
   let quotedMessageId = null;
   let contextInfo = null;
