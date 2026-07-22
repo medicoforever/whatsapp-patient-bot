@@ -2169,10 +2169,11 @@ async function handleMessage(sock, msg) {
 
     if (!text) return;
 
-    // 🔇 SOURCE GROUP: Ignore ALL text messages — bot should never reply in source groups
+    // 📝 SOURCE GROUP: We ALLOW text messages here so that patient names (e.g. "Paruvatham")
+    // sent as separate messages or replies are buffered alongside their images!
     if (isSourceGroup) {
-      log('🔇', `Ignoring text "${text.substring(0, 20)}" in source group from ${senderName} (...${shortId})`);
-      return;
+      log('📝', `Buffering text "${text.substring(0, 20)}..." in source group from ${senderName} (...${shortId})`);
+      // We do NOT return here. We let it fall through to be added to the buffer.
     }
 
     // 🔇 TARGET GROUP: Ignore plain text to avoid processing random chatter, but allow commands
