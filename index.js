@@ -1904,22 +1904,6 @@ function scheduleEmptyMessageRetry(msgId) {
         return;
       }
 
-      // 🔑 ACTIVE RETRY: Send a retry receipt to the sender's device
-      // This asks the sender's phone to re-encrypt and re-send the message
-      try {
-        if (sock && stillPending.msg?.key) {
-          await sock.sendMessageAck({
-            tag: 'receipt',
-            attrs: {
-              id: msgId,
-              to: stillPending.chatId,
-              type: 'retry',
-              participant: stillPending.msg.key.participant || stillPending.msg.key.remoteJid
-            }
-          }).catch(() => {}); // Non-fatal if sendMessageAck is unavailable
-        }
-      } catch (_) { /* sendMessageAck may not be available in all Baileys versions */ }
-
       log('🔄', `Retry ${stillPending.retryCount}/${CONFIG.EMPTY_MSG_MAX_RETRIES} for empty message ${msgId.substring(0, 8)}... from auto group`);
 
       // Schedule next retry
