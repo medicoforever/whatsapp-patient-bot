@@ -2837,6 +2837,13 @@ async function runStartupRecovery() {
               
               const isCTGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.CT_TARGET;
               const isMRIGroup = chatId === CONFIG.GROUPS.MRI_SOURCE || chatId === CONFIG.GROUPS.MRI_TARGET;
+              
+              if (!isCTGroup && !isMRIGroup && chatId.endsWith('@g.us')) {
+                log('🗑️', `Nuking ghost media from unauthorized group ${chatId} during startup recovery`);
+                try { await pendingModel.deleteMany({ chatId }); } catch(e) {}
+                continue;
+              }
+
               let targetChatId = null;
               if (isCTGroup) targetChatId = CONFIG.GROUPS.CT_TARGET;
               else if (isMRIGroup) targetChatId = CONFIG.GROUPS.MRI_TARGET;
