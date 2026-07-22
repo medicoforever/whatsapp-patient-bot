@@ -106,6 +106,13 @@ class MockPendingMediaModel {
     }
     return Array.from(values);
   }
+
+  async deleteMany(filter = {}) {
+    const initialCount = this.docs.length;
+    this.docs = this.docs.filter(d => !this.matchFilter(d, filter));
+    const deletedCount = initialCount - this.docs.length;
+    return { deletedCount };
+  }
 }
 
 import mongoose from 'mongoose';

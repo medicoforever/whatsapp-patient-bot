@@ -700,9 +700,7 @@ async function markUserBufferCompleted(chatId, senderId) {
   const model = getPendingMediaModel();
   if (model) {
     try {
-      // Instantly delete successful media from MongoDB to save space
-      const result = await model.deleteMany({ chatId, senderId, status: 'processing' });
-      log('🗑️', `Deleted ${result.deletedCount} processed media items for ${senderId} from MongoDB`);
+      await model.updateMany({ chatId, senderId, status: 'processing' }, { processed: true, status: 'completed' });
     } catch (err) {
       log('⚠️', 'Error marking user buffer completed: ' + err.message);
     }
@@ -1826,6 +1824,8 @@ async function startBot() {
 
         // ✅ If the message was previously marked empty but arrived successfully now, stop its retry loop
         if (msgId && pendingEmptyMessages.has(msgId)) {
+          const pending = pendingEmptyMessages.get(msgId);
+          if (pending?.timerId) clearTimeout(pending.timerId);
           pendingEmptyMessages.delete(msgId);
           log('✅', `Empty message ${msgId.substring(0, 8)}... was successfully decrypted in a later event!`);
         }
@@ -1847,6 +1847,7 @@ async function startBot() {
         // Check if this was a pending empty message that now has content
         if (pendingEmptyMessages.has(msgId) && update.update?.message) {
           const pending = pendingEmptyMessages.get(msgId);
+          if (pending?.timerId) clearTimeout(pending.timerId);
           log('✅', `Message update received for pending empty msg ${msgId.substring(0, 8)}... — now has content!`);
 
           // Reconstruct the message with the updated content
@@ -1888,10 +1889,15 @@ function scheduleEmptyMessageRetry(msgId) {
   const pending = pendingEmptyMessages.get(msgId);
   if (!pending) return;
 
-  // Progressive backoff: 2s, 3s, 4s, 5s, 5s, 5s, 5s, 5s (~34s total window)
-  const retryDelay = Math.min(CONFIG.EMPTY_MSG_RETRY_DELAY_MS + (pending.retryCount * 1000), 5000);
+  if (pending.timerId) {
+    clearTimeout(pending.timerId);
+  }
 
-  setTimeout(async () => {
+  // Progressive backoff: 2s, 3s, 4s, 5s, 5s, 5s, 5s, 5s (~34s total window)
+  const retryStep = CONFIG.EMPTY_MSG_RETRY_STEP_MS !== undefined ? CONFIG.EMPTY_MSG_RETRY_STEP_MS : 1000;
+  const retryDelay = Math.min(CONFIG.EMPTY_MSG_RETRY_DELAY_MS + (pending.retryCount * retryStep), 5000);
+
+  pending.timerId = setTimeout(async () => {
     const stillPending = pendingEmptyMessages.get(msgId);
     if (!stillPending) return; // Already resolved via messages.update
 
@@ -1900,6 +1906,7 @@ function scheduleEmptyMessageRetry(msgId) {
     try {
       if (stillPending.retryCount >= CONFIG.EMPTY_MSG_MAX_RETRIES) {
         log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (auto group: ${stillPending.chatId})`);
+        if (stillPending.timerId) clearTimeout(stillPending.timerId);
         pendingEmptyMessages.delete(msgId);
         return;
       }
@@ -1911,6 +1918,7 @@ function scheduleEmptyMessageRetry(msgId) {
 
     } catch (error) {
       log('❌', `Retry error for ${msgId.substring(0, 8)}...: ${error.message}`);
+      if (stillPending.timerId) clearTimeout(stillPending.timerId);
       pendingEmptyMessages.delete(msgId);
     }
   }, retryDelay);
@@ -1922,6 +1930,7 @@ setInterval(() => {
   let cleaned = 0;
   for (const [msgId, pending] of pendingEmptyMessages) {
     if (now - pending.timestamp > 120000) { // 2 minutes
+      if (pending.timerId) clearTimeout(pending.timerId);
       pendingEmptyMessages.delete(msgId);
       cleaned++;
     }
@@ -1932,13 +1941,138 @@ setInterval(() => {
 }, 60000);
 // ======================================================================
 
-// 🟢 FIX: Helper to unwrap nested messages (ViewOnce, Ephemeral, etc.)
-const unwrapMessage = (m) => {
-  if (!m) return null;
-  if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
-  if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
-  if (m.ephemeralMessage?.message) return unwrapMessage(m.ephemeralMessage.message);
-  if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
+/**
+ * 🟢 FIX (R1): Proactively, recursively, and robustly unwrap nested Baileys message wrappers
+ * until reaching core content (imageMessage, videoMessage, audioMessage, documentMessage,
+ * stickerMessage, conversation, extendedTextMessage, etc.).
+ */
+const unwrapMessage = (m, depth = 0, visited = new WeakSet()) => {
+  if (!m || typeof m !== 'object') return null;
+  if (depth > 15) return m; // Safety circuit breaker for extreme nesting
+  if (visited.has(m)) return m; // Cycle detection
+  visited.add(m);
+
+  // 1. Known direct .message wrapper keys (FutureProof, containers, device sync, edits, etc.)
+  const directWrapperKeys = [
+    'viewOnceMessage',
+    'viewOnceMessageV2',
+    'viewOnceMessageV2Extension',
+    'viewOnceMessageV3',
+    'ephemeralMessage',
+    'documentWithCaptionMessage',
+    'editedMessage',
+    'deviceSentMessage',
+    'botInvokeMessage',
+    'albumMessage',
+    'groupMentionedMessage',
+    'statusMentionMessage',
+    'groupStatusMentionMessage',
+    'lottieStickerMessage',
+    'eventCoverImage',
+    'associatedChildMessage',
+    'pollCreationOptionImageMessage',
+    'pollCreationMessageV4',
+    'pollCreationMessageV5',
+    'statusAddYours',
+    'limitSharingMessage',
+    'botTaskMessage',
+    'questionMessage',
+    'commentMessage',
+    'encCommentMessage'
+  ];
+
+  for (const key of directWrapperKeys) {
+    if (m[key]?.message) {
+      return unwrapMessage(m[key].message, depth + 1, visited);
+    }
+  }
+
+  // 2. Protocol message edit wrapper
+  if (m.protocolMessage?.editedMessage) {
+    return unwrapMessage(m.protocolMessage.editedMessage, depth + 1, visited);
+  }
+
+  // 3. Push-To-Video / Video Note (ptvMessage)
+  if (m.ptvMessage) {
+    if (m.ptvMessage.message) {
+      return unwrapMessage(m.ptvMessage.message, depth + 1, visited);
+    }
+    if (m.ptvMessage.videoMessage) {
+      return unwrapMessage({ videoMessage: m.ptvMessage.videoMessage }, depth + 1, visited);
+    }
+    // Normalize ptvMessage structure to standard videoMessage
+    return { videoMessage: m.ptvMessage };
+  }
+
+  // 4. Template message wrappers
+  if (m.templateMessage) {
+    const tm = m.templateMessage;
+    const template = tm.hydratedFourRowTemplate || tm.hydratedTemplate || tm.fourRowTemplate;
+    if (template) {
+      if (template.imageMessage) return unwrapMessage({ imageMessage: template.imageMessage }, depth + 1, visited);
+      if (template.videoMessage) return unwrapMessage({ videoMessage: template.videoMessage }, depth + 1, visited);
+      if (template.documentMessage) return unwrapMessage({ documentMessage: template.documentMessage }, depth + 1, visited);
+      if (template.locationMessage) return unwrapMessage({ locationMessage: template.locationMessage }, depth + 1, visited);
+      const text = template.hydratedContentText || template.contentText || '';
+      if (text) return { conversation: text };
+    }
+    if (tm.interactiveMessageTemplate) {
+      return unwrapMessage({ interactiveMessage: tm.interactiveMessageTemplate }, depth + 1, visited);
+    }
+  }
+
+  // 5. Interactive message wrappers
+  if (m.interactiveMessage) {
+    const im = m.interactiveMessage;
+    if (im.header) {
+      if (im.header.imageMessage) return unwrapMessage({ imageMessage: im.header.imageMessage }, depth + 1, visited);
+      if (im.header.videoMessage) return unwrapMessage({ videoMessage: im.header.videoMessage }, depth + 1, visited);
+      if (im.header.documentMessage) return unwrapMessage({ documentMessage: im.header.documentMessage }, depth + 1, visited);
+      if (im.header.locationMessage) return unwrapMessage({ locationMessage: im.header.locationMessage }, depth + 1, visited);
+    }
+    if (im.body?.text) {
+      return { conversation: im.body.text };
+    }
+    if (im.carouselMessage?.cards?.[0]) {
+      return unwrapMessage(im.carouselMessage.cards[0], depth + 1, visited);
+    }
+  }
+
+  // 6. Buttons message wrappers
+  if (m.buttonsMessage) {
+    const bm = m.buttonsMessage;
+    if (bm.imageMessage) return unwrapMessage({ imageMessage: bm.imageMessage }, depth + 1, visited);
+    if (bm.videoMessage) return unwrapMessage({ videoMessage: bm.videoMessage }, depth + 1, visited);
+    if (bm.documentMessage) return unwrapMessage({ documentMessage: bm.documentMessage }, depth + 1, visited);
+    if (bm.locationMessage) return unwrapMessage({ locationMessage: bm.locationMessage }, depth + 1, visited);
+    const text = bm.contentText || bm.text || '';
+    if (text) return { conversation: text };
+  }
+
+  // 7. List message wrappers
+  if (m.listMessage) {
+    const lm = m.listMessage;
+    const text = lm.description || lm.title || '';
+    if (text) return { conversation: text };
+  }
+
+  // 8. Button / List response wrappers
+  if (m.templateButtonReplyMessage?.selectedDisplayText) {
+    return { conversation: m.templateButtonReplyMessage.selectedDisplayText };
+  }
+  if (m.buttonsResponseMessage?.selectedButtonId || m.buttonsResponseMessage?.selectedDisplayText) {
+    return { conversation: m.buttonsResponseMessage.selectedDisplayText || m.buttonsResponseMessage.selectedButtonId };
+  }
+  if (m.listResponseMessage?.title || m.listResponseMessage?.singleSelectReply?.selectedRowId) {
+    return { conversation: m.listResponseMessage.title || m.listResponseMessage.singleSelectReply?.selectedRowId };
+  }
+
+  // 9. Generic single-key wrapper fallback
+  const keys = Object.keys(m);
+  if (keys.length === 1 && m[keys[0]] && typeof m[keys[0]] === 'object' && m[keys[0]].message) {
+    return unwrapMessage(m[keys[0]].message, depth + 1, visited);
+  }
+
   return m;
 };
 
@@ -3173,6 +3307,9 @@ function setDownloadMediaMessageMock(mockFn) {
 
 export {
   CONFIG,
+  unwrapMessage,
+  pendingEmptyMessages,
+  scheduleEmptyMessageRetry,
   pendingMediaSchema,
   getPendingMediaModel,
   addToUserBuffer,
