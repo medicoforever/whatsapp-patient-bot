@@ -3170,10 +3170,14 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     if (jsonData) console.log(`JSON: ${JSON.stringify(jsonData)}`);
     console.log('═'.repeat(60) + '\n');
 
-    await sock.sendPresenceUpdate('composing', destinationChatId);
-    const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
-    await new Promise(resolve => setTimeout(resolve, delay));
-    await sock.sendPresenceUpdate('paused', destinationChatId);
+    try {
+      await sock.sendPresenceUpdate('composing', destinationChatId);
+      const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
+      await new Promise(resolve => setTimeout(resolve, delay));
+      await sock.sendPresenceUpdate('paused', destinationChatId);
+    } catch (presenceErr) {
+      log('⚠️', `Could not send typing indicator (ignoring): ${presenceErr.message}`);
+    }
 
     let finalResponseText = primaryResponseText.length <= 60000
       ? primaryResponseText
