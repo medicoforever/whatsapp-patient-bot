@@ -2828,10 +2828,17 @@ async function runStartupRecovery() {
             const mediaFiles = await clearUserBuffer(chatId, senderId);
             if (mediaFiles.length > 0) {
               const batches = groupMediaSmartly(mediaFiles);
+              
+              const isCTGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.CT_TARGET;
+              const isMRIGroup = chatId === CONFIG.GROUPS.MRI_SOURCE || chatId === CONFIG.GROUPS.MRI_TARGET;
+              let targetChatId = null;
+              if (isCTGroup) targetChatId = CONFIG.GROUPS.CT_TARGET;
+              else if (isMRIGroup) targetChatId = CONFIG.GROUPS.MRI_TARGET;
+              
               for (let i = 0; i < batches.length; i++) {
                 const batch = batches[i];
                 if (batch.length === 0) continue;
-                await processMedia(sock, chatId, batch, false, null, senderId, senderId.split('@')[0]);
+                await processMedia(sock, chatId, batch, false, null, senderId, senderId.split('@')[0], null, 3, false, targetChatId);
               }
             }
           }
