@@ -2092,6 +2092,12 @@ async function handleMessage(sock, msg) {
   const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
   
   if (isGroup) {
+    // 🚫 Completely ignore messages from unauthorized groups
+    if (!isSourceGroup && !isTargetGroup) {
+      // We don't even log it to prevent spam
+      return; 
+    }
+    
     log('📋', `Message from group: ${chatId} (Allowed: ALL)${isSourceGroup ? ' [SOURCE GROUP - silent mode]' : ''}${isTargetGroup ? ' [TARGET GROUP]' : ''}`);
   }
 
