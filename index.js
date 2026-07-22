@@ -3190,14 +3190,8 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     if (jsonData) console.log(`JSON: ${JSON.stringify(jsonData)}`);
     console.log('═'.repeat(60) + '\n');
 
-    try {
-      await sock.sendPresenceUpdate('composing', destinationChatId);
-      const delay = Math.floor(Math.random() * (CONFIG.TYPING_DELAY_MAX - CONFIG.TYPING_DELAY_MIN)) + CONFIG.TYPING_DELAY_MIN;
-      await new Promise(resolve => setTimeout(resolve, delay));
-      await sock.sendPresenceUpdate('paused', destinationChatId);
-    } catch (presenceErr) {
-      log('⚠️', `Could not send typing indicator (ignoring): ${presenceErr.message}`);
-    }
+    // 🚫 Typing indicators removed: Baileys sendPresenceUpdate causes infinite hangs 
+    // and crashes if the network is unstable or socket is reconnecting.
 
     let finalResponseText = primaryResponseText.length <= 60000
       ? primaryResponseText
@@ -3235,7 +3229,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     // 💬 Append footer to all chats
 finalResponseText += GROUP_REPLY_FOOTER;
 
-    const sentMessage = await sock.sendMessage(destinationChatId, {
+    const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
       text: finalResponseText,
       mentions: finalMentions
     });
@@ -3255,15 +3249,16 @@ finalResponseText += GROUP_REPLY_FOOTER;
     console.error(error);
 
     if (retryAttempt === 0) {
-      log('⏳', `Generation failed. Scheduling retry in 5 mins for ...${shortId}`);
+      log('⏳', `Generation/Send failed. Scheduling retry in 5 mins for ...${shortId}`);
 
-      await currentSock?.sendPresenceUpdate?.('composing', destinationChatId);
-      await new Promise(r => setTimeout(r, 1000));
-
-      await currentSock?.sendMessage?.(destinationChatId, {
-        text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
-        mentions: [senderId]
-      });
+      try {
+        await currentSock?.sendMessage?.(destinationChatId, {
+          text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
+          mentions: [senderId]
+        });
+      } catch (alertErr) {
+        log('⚠️', `Could not send High Traffic alert (socket offline): ${alertErr.message}`);
+      }
 
       setTimeout(() => {
         log('🔄', `Executing 5-minute retry for ...${shortId}`);
@@ -3275,13 +3270,14 @@ finalResponseText += GROUP_REPLY_FOOTER;
 
     await markUserBufferFailed(chatId, senderId);
 
-    await currentSock?.sendPresenceUpdate?.('composing', destinationChatId);
-    await new Promise(r => setTimeout(r, 1500));
-
-    await currentSock?.sendMessage?.(destinationChatId, {
-      text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-      mentions: [senderId]
-    });
+    try {
+      await currentSock?.sendMessage?.(destinationChatId, {
+        text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
+        mentions: [senderId]
+      });
+    } catch (finalErr) {
+      log('⚠️', `Could not send final error message (socket offline): ${finalErr.message}`);
+    }
   } finally {
     activeProcessingUsers.delete(userLockKey);
   }
