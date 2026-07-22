@@ -2287,6 +2287,10 @@ async function handleMessage(sock, msg) {
       resetUserTimeout(chatId, senderId, senderName);
     }
   }
+  else {
+    // Log unhandled message types to debug "missed" images (e.g. albums, new WhatsApp features)
+    log('❓', `Unhandled messageType "${messageType}" from ${senderName} (...${shortId}). Full message: ${JSON.stringify(Object.keys(content))}`);
+  }
 }
 
 async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, senderName, messageType, content) {
