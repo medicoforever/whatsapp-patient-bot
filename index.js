@@ -78,7 +78,7 @@ const CONFIG = {
   DECRYPT_FAIL_WINDOW_MS: 60000,
   // 🔄 Retry settings for empty source group messages
   EMPTY_MSG_RETRY_DELAY_MS: 2000, // Wait 2 seconds before first retry
-  EMPTY_MSG_MAX_RETRIES: 8, // Max retries for empty messages (increased from 3 — gives ~30s total window)
+  EMPTY_MSG_MAX_RETRIES: 20, // Max retries for empty messages (increased — gives ~90s total window for Baileys re-decryption)
   SYSTEM_INSTRUCTION: `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
 
 **MODE 1: CLINICAL PROFILE GENERATION**
@@ -544,6 +544,11 @@ const botMessageIds = new Map();
 const processedMessageIds = new Set();
 const MAX_PROCESSED_IDS = 5000;
 
+// 🔧 FIX: Track messages that exhausted empty-message retries.
+// If Baileys re-dispatches them later WITH content, we accept them.
+const failedEmptyMessageIds = new Set();
+const MAX_FAILED_EMPTY_IDS = 2000;
+
 function isMessageAlreadyProcessed(msgId) {
   if (!msgId) return false;
   if (processedMessageIds.has(msgId)) {
@@ -834,17 +839,24 @@ function resetUserTimeout(chatId, senderId, senderName) {
             log('🔀', `Detected ${batches.length} distinct patient contexts. Processing separately.`);
           }
 
+          let allBatchesSucceeded = true;
           for (let i = 0; i < batches.length; i++) {
             const batch = batches[i];
             if (batch.length === 0) continue;
 
             log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
 
-            await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
+            const batchOk = await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId, 0, true);
+            if (!batchOk) allBatchesSucceeded = false;
 
             if (i < batches.length - 1) {
               await new Promise(r => setTimeout(r, 2000));
             }
+          }
+          if (allBatchesSucceeded) {
+            await markUserBufferCompleted(chatId, senderId);
+          } else {
+            log('⚠️', `Not all batches succeeded for ...${getShortSenderId(senderId)}. Buffer cleanup deferred for retry.`);
           }
 
         } else {
@@ -1788,8 +1800,17 @@ async function startBot() {
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
 
-        // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
         const msgId = msg.key.id;
+
+        // 🔧 FIX: If this was a previously-failed empty message that now has content,
+        // accept it — this is Baileys re-dispatching after successful re-decryption.
+        if (msgId && msg.message && failedEmptyMessageIds.has(msgId)) {
+          log('🔄', `Late decryption SUCCESS for previously-failed empty message ${msgId.substring(0, 8)}... — accepting!`);
+          failedEmptyMessageIds.delete(msgId);
+          processedMessageIds.delete(msgId); // Ensure dedup won't block it
+        }
+
+        // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
         if (msgId && isMessageAlreadyProcessed(msgId)) {
           log('🔁', `Skipping duplicate message ${msgId.substring(0, 8)}...`);
           continue;
@@ -1910,6 +1931,14 @@ function scheduleEmptyMessageRetry(msgId) {
         log('⚠️', `Empty message ${msgId.substring(0, 8)}... failed after ${CONFIG.EMPTY_MSG_MAX_RETRIES} retries — giving up (auto group: ${stillPending.chatId})`);
         if (stillPending.timerId) clearTimeout(stillPending.timerId);
         pendingEmptyMessages.delete(msgId);
+        // 🔧 CRITICAL FIX: Remove from processedMessageIds so Baileys re-dispatches are accepted
+        processedMessageIds.delete(msgId);
+        // Track it so we explicitly accept late decryptions in messages.upsert
+        failedEmptyMessageIds.add(msgId);
+        if (failedEmptyMessageIds.size > MAX_FAILED_EMPTY_IDS) {
+          const arr = Array.from(failedEmptyMessageIds);
+          arr.slice(0, Math.floor(MAX_FAILED_EMPTY_IDS / 2)).forEach(id => failedEmptyMessageIds.delete(id));
+        }
         return;
       }
 
@@ -1922,6 +1951,9 @@ function scheduleEmptyMessageRetry(msgId) {
       log('❌', `Retry error for ${msgId.substring(0, 8)}...: ${error.message}`);
       if (stillPending.timerId) clearTimeout(stillPending.timerId);
       pendingEmptyMessages.delete(msgId);
+      // 🔧 FIX: Same safety — allow late re-dispatches
+      processedMessageIds.delete(msgId);
+      failedEmptyMessageIds.add(msgId);
     }
   }, retryDelay);
 }
@@ -1934,6 +1966,9 @@ setInterval(() => {
     if (now - pending.timestamp > 120000) { // 2 minutes
       if (pending.timerId) clearTimeout(pending.timerId);
       pendingEmptyMessages.delete(msgId);
+      // 🔧 FIX: Allow late Baileys re-dispatches even after cleanup
+      processedMessageIds.delete(msgId);
+      failedEmptyMessageIds.add(msgId);
       cleaned++;
     }
   }
@@ -1941,6 +1976,17 @@ setInterval(() => {
     log('🧹', `Cleaned ${cleaned} stale pending empty message(s)`);
   }
 }, 60000);
+
+// Periodic cleanup for stale failedEmptyMessageIds (older than 10 minutes)
+setInterval(() => {
+  if (failedEmptyMessageIds.size > 100) {
+    // Only trim if it's getting large — keep the set small
+    const excess = failedEmptyMessageIds.size - 100;
+    const arr = Array.from(failedEmptyMessageIds);
+    arr.slice(0, excess).forEach(id => failedEmptyMessageIds.delete(id));
+    log('🧹', `Trimmed ${excess} old failedEmptyMessageIds (kept 100 most recent)`);
+  }
+}, 600000); // Every 10 minutes
 // ======================================================================
 
 /**
@@ -2848,10 +2894,15 @@ async function runStartupRecovery() {
               if (isCTGroup) targetChatId = CONFIG.GROUPS.CT_TARGET;
               else if (isMRIGroup) targetChatId = CONFIG.GROUPS.MRI_TARGET;
               
+              let recoveryAllOk = true;
               for (let i = 0; i < batches.length; i++) {
                 const batch = batches[i];
                 if (batch.length === 0) continue;
-                await processMedia(sock, chatId, batch, false, null, senderId, senderId.split('@')[0], null, 3, false, targetChatId);
+                const ok = await processMedia(sock, chatId, batch, false, null, senderId, senderId.split('@')[0], null, 3, false, targetChatId, 0, true);
+                if (!ok) recoveryAllOk = false;
+              }
+              if (recoveryAllOk) {
+                await markUserBufferCompleted(chatId, senderId);
               }
             }
           }
@@ -2865,7 +2916,7 @@ async function runStartupRecovery() {
 
 const activeProcessingUsers = new Set();
 
-async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
+async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0, skipBufferCleanup = false) {
   const currentSock = sockParam || sock;
   const shortId = getShortSenderId(senderId);
   const destinationChatId = targetChatId || chatId;
@@ -2874,7 +2925,14 @@ async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, p
 
   if (activeProcessingUsers.has(userLockKey)) {
     log('⚠️', `Concurrent processMedia execution blocked for ...${shortId} in ${chatId}`);
-    return;
+    // 🔧 FIX: Re-queue items back to buffer instead of silently dropping them
+    log('🔄', `Re-queuing ${mediaFiles.length} item(s) back to buffer for ...${shortId}`);
+    for (const item of mediaFiles) {
+      await addToUserBuffer(chatId, senderId, item, null, senderName);
+    }
+    // Reset timeout so items are re-processed after current batch finishes
+    resetUserTimeout(chatId, senderId, senderName);
+    return false;
   }
 
   activeProcessingUsers.add(userLockKey);
@@ -3249,7 +3307,10 @@ finalResponseText += GROUP_REPLY_FOOTER;
     }
 
     log('📤', `Sent to target/chat!`);
-    await markUserBufferCompleted(chatId, senderId);
+    if (!skipBufferCleanup) {
+      await markUserBufferCompleted(chatId, senderId);
+    }
+    return true;
 
   } catch (error) {
     log('❌', `Error for ...${shortId}: ${error.message}`);
@@ -3267,15 +3328,40 @@ finalResponseText += GROUP_REPLY_FOOTER;
         log('⚠️', `Could not send High Traffic alert (socket offline): ${alertErr.message}`);
       }
 
-      setTimeout(() => {
+      setTimeout(async () => {
         log('🔄', `Executing 5-minute retry for ...${shortId}`);
-        processMedia(currentSock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
+        // 🔧 FIX: Wait for connection before retrying (up to 60s)
+        let waited = 0;
+        while (!isConnected && waited < 60000) {
+          await new Promise(r => setTimeout(r, 5000));
+          waited += 5000;
+          log('⏳', `Waiting for connection before retry... (${waited / 1000}s)`);
+        }
+        if (!isConnected) {
+          log('⚠️', `5-minute retry: still not connected after 60s. Scheduling another retry for ...${shortId}`);
+          setTimeout(async () => {
+            log('🔄', `Executing extended retry for ...${shortId}`);
+            let w2 = 0;
+            while (!isConnected && w2 < 60000) { await new Promise(r => setTimeout(r, 5000)); w2 += 5000; }
+            if (isConnected) {
+              await processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1, skipBufferCleanup);
+            } else {
+              log('❌', `Extended retry failed — connection still down for ...${shortId}. Items remain in buffer.`);
+              if (!skipBufferCleanup) await markUserBufferFailed(chatId, senderId);
+            }
+          }, 300000);
+          return;
+        }
+        // 🔧 FIX: Use global 'sock' not stale 'currentSock' — connection may have been re-established
+        await processMedia(sock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1, skipBufferCleanup);
       }, 300000);
 
-      return;
+      return false;
     }
 
-    await markUserBufferFailed(chatId, senderId);
+    if (!skipBufferCleanup) {
+      await markUserBufferFailed(chatId, senderId);
+    }
 
     try {
       await currentSock?.sendMessage?.(destinationChatId, {
@@ -3285,6 +3371,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
     } catch (finalErr) {
       log('⚠️', `Could not send final error message (socket offline): ${finalErr.message}`);
     }
+    return false;
   } finally {
     activeProcessingUsers.delete(userLockKey);
   }
@@ -3338,6 +3425,7 @@ export {
   CONFIG,
   unwrapMessage,
   pendingEmptyMessages,
+  failedEmptyMessageIds,
   scheduleEmptyMessageRetry,
   pendingMediaSchema,
   getPendingMediaModel,
