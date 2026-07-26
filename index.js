@@ -2101,11 +2101,10 @@ async function handleMessage(sock, msg) {
   
   if (isGroup) {
     // 🚫 Completely ignore messages from unauthorized groups
-    // TEMPORARILY DISABLED FOR TESTING
-    // if (!isSourceGroup && !isTargetGroup) {
-    //   // We don't even log it to prevent spam
-    //   return; 
-    // }
+    if (!isSourceGroup && !isTargetGroup) {
+      // We don't even log it to prevent spam
+      return; 
+    }
     
     log('📋', `Message from group: ${chatId} (Allowed: ALL)${isSourceGroup ? ' [SOURCE GROUP - silent mode]' : ''}${isTargetGroup ? ' [TARGET GROUP]' : ''}`);
   } else if (isDM) {
@@ -2355,14 +2354,14 @@ async function handleMessage(sock, msg) {
       log('🔔', `Trigger command "${text}" from ${senderName} (...${shortId})`);
 
       // 🚫 NEW: Reject trigger commands in groups
-      // if (isGroup) {
-      //   log('🔇', `Rejecting trigger command in group from ${senderName} (...${shortId})`);
-      //   await sock.sendMessage(chatId, {
-      //     text: `ℹ️ @${senderId.split('@')[0]}, the *${text}* command only works in my Direct Messages. Please message me privately to generate clinical profiles!`,
-      //     mentions: [senderId]
-      //   });
-      //   return;
-      // }
+      if (isGroup) {
+        log('🔇', `Rejecting trigger command in group from ${senderName} (...${shortId})`);
+        await sock.sendMessage(chatId, {
+          text: `ℹ️ @${senderId.split('@')[0]}, the *${text}* command only works in my Direct Messages. Please message me privately to generate clinical profiles!`,
+          mentions: [senderId]
+        });
+        return;
+      }
 
       await new Promise(r => setTimeout(r, 1000));
 
