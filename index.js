@@ -2435,7 +2435,13 @@ async function handleMessage(sock, msg) {
       }
     }
     else if (text.toLowerCase() === 'ping') {
-      await sock.sendMessage(chatId, { text: 'pong' }, { quoted: msg });
+      log('🟢', `Ping received from ...${shortId}`);
+      try {
+        await sock.sendMessage(chatId, { text: 'pong' }, { quoted: msg });
+        log('🟢', `Pong sent successfully to ...${shortId}`);
+      } catch (err) {
+        log('❌', `Pong failed: ${err.message}`);
+      }
       return;
     }
     else if (text.toLowerCase() === 'status') {
