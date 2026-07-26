@@ -2434,6 +2434,16 @@ async function handleMessage(sock, msg) {
         });
       }
     }
+    else if (text.toLowerCase() === 'ping') {
+      try {
+        await sock.sendPresenceUpdate('composing', chatId);
+        await new Promise(r => setTimeout(r, 1000));
+        await sock.sendPresenceUpdate('paused', chatId);
+      } catch(e) {}
+      
+      await sock.sendMessage(chatId, { text: 'pong' });
+      return;
+    }
     else if (text.toLowerCase() === 'status') {
       const stats = await getTotalBufferStats(chatId);
       const userCount = await getUserBufferCount(chatId, senderId);
@@ -3265,8 +3275,10 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       }
     }
 
-    // 💬 Append footer to all chats
-finalResponseText += GROUP_REPLY_FOOTER;
+    // 💬 Append footer to all group chats (SKIP for DMs to bypass spam filters)
+    if (destinationChatId.endsWith('@g.us')) {
+      finalResponseText += GROUP_REPLY_FOOTER;
+    }
 
     try {
       if (currentSock?.sendPresenceUpdate) {
