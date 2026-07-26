@@ -2432,6 +2432,20 @@ async function handleMessage(sock, msg) {
         });
       }
     }
+    else if (text.toLowerCase() === '/nuke') {
+      if (mongoConnected && SessionModel) {
+        try {
+          await SessionModel.deleteMany({});
+          log('💥', `User ${senderName} triggered /nuke. All sessions deleted!`);
+          await sock.sendMessage(chatId, { text: '💥 Nuked all WhatsApp sessions in MongoDB! The bot will now log out. Please check your Render console for a new QR code to scan.' });
+        } catch (err) {
+          log('❌', `Failed to nuke sessions: ${err.message}`);
+        }
+        setTimeout(() => process.exit(1), 1000);
+      } else {
+        await sock.sendMessage(chatId, { text: 'MongoDB not connected.' });
+      }
+    }
     else if (text.toLowerCase() === 'status') {
       const stats = await getTotalBufferStats(chatId);
       const userCount = await getUserBufferCount(chatId, senderId);
