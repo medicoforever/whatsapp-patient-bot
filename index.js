@@ -2435,12 +2435,6 @@ async function handleMessage(sock, msg) {
       }
     }
     else if (text.toLowerCase() === 'ping') {
-      try {
-        await sock.sendPresenceUpdate('composing', chatId);
-        await new Promise(r => setTimeout(r, 1000));
-        await sock.sendPresenceUpdate('paused', chatId);
-      } catch(e) {}
-      
       await sock.sendMessage(chatId, { text: 'pong' }, { quoted: msg });
       return;
     }
@@ -2532,14 +2526,10 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       : [userQuestion];
 
     try {
-      await sock.sendPresenceUpdate('composing', chatId);
-
       log('🔄', `Group reply (NO system instruction): Sending ${contentParts.length} source doc(s) + question to model for ...${shortId}`);
 
       // Call Gemini with NO system instruction (null)
       const responseText = await generateGeminiContent(requestContent, null);
-
-      await sock.sendPresenceUpdate('paused', chatId);
 
       let finalText = responseText.length <= 60000
         ? responseText
@@ -3145,14 +3135,6 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
       // Add footer to all chats
 step1Text += GROUP_REPLY_FOOTER;
 
-      try {
-        if (sock.sendPresenceUpdate) {
-          await Promise.race([sock.sendPresenceUpdate('composing', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
-          await new Promise(r => setTimeout(r, 500));
-          await Promise.race([sock.sendPresenceUpdate('paused', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
-        }
-      } catch (e) { /* ignore */ }
-
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
         mentions: step1Mentions.length ? step1Mentions : undefined
@@ -3196,14 +3178,6 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       console.log('═'.repeat(60));
       console.log(finalSecondaryText);
       console.log('═'.repeat(60) + '\n');
-
-      try {
-        if (sock.sendPresenceUpdate) {
-          await Promise.race([sock.sendPresenceUpdate('composing', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
-          await new Promise(r => setTimeout(r, 500));
-          await Promise.race([sock.sendPresenceUpdate('paused', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
-        }
-      } catch (e) { /* ignore */ }
 
       const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
@@ -3279,14 +3253,6 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     if (destinationChatId.endsWith('@g.us')) {
       finalResponseText += GROUP_REPLY_FOOTER;
     }
-
-    try {
-      if (currentSock?.sendPresenceUpdate) {
-        await Promise.race([currentSock.sendPresenceUpdate('composing', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
-        await new Promise(r => setTimeout(r, 500));
-        await Promise.race([currentSock.sendPresenceUpdate('paused', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
-      }
-    } catch (e) { /* ignore */ }
 
     const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
       text: finalResponseText,
