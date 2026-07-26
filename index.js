@@ -2388,7 +2388,7 @@ async function handleMessage(sock, msg) {
           const modeLabel = isSecondaryTrigger ? 'SECONDARY/CHAINED' : 'PRIMARY';
           log('🤖', `Processing Batch ${i+1}/${batches.length} (${batch.length} items) with FPS=${targetFps}. Mode: ${modeLabel}`);
 
-          await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger);
+          await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger, null, 0, msg);
 
           if (i < batches.length - 1) {
             await new Promise(r => setTimeout(r, 2000));
@@ -2883,7 +2883,7 @@ async function runStartupRecovery() {
 
 const activeProcessingUsers = new Set();
 
-async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
+async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0, triggerMsg = null) {
   const currentSock = sockParam || sock;
   const shortId = getShortSenderId(senderId);
   const destinationChatId = targetChatId || chatId;
@@ -3136,7 +3136,7 @@ step1Text += GROUP_REPLY_FOOTER;
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
         mentions: step1Mentions
-      });
+      }, triggerMsg ? { quoted: triggerMsg } : undefined);
       log('📤', `Sent Primary (Step 1) to ...${shortId}`);
 
       // --- STEP 2: Generate Secondary Analysis ---
@@ -3184,7 +3184,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
         mentions: step2Mentions
-      });
+      }, triggerMsg ? { quoted: triggerMsg } : undefined);
 
       if (sentMessage?.key?.id) {
         const messageId = sentMessage.key.id;
@@ -3257,7 +3257,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
     const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
       text: finalResponseText,
       mentions: finalMentions
-    });
+    }, triggerMsg ? { quoted: triggerMsg } : undefined);
 
     if (sentMessage?.key?.id) {
       const messageId = sentMessage.key.id;
