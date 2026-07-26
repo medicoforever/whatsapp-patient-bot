@@ -2088,6 +2088,7 @@ async function handleMessage(sock, msg) {
   const shortId = getShortSenderId(senderId);
 
   const isGroup = chatId.endsWith('@g.us');
+  const isDM = !isGroup && chatId !== 'status@broadcast';
   const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
   const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
   
@@ -2099,6 +2100,8 @@ async function handleMessage(sock, msg) {
     }
     
     log('📋', `Message from group: ${chatId} (Allowed: ALL)${isSourceGroup ? ' [SOURCE GROUP - silent mode]' : ''}${isTargetGroup ? ' [TARGET GROUP]' : ''}`);
+  } else if (isDM) {
+    log('👤', `Message from personal DM: ${chatId} - ${senderName} (...${shortId})`);
   }
 
   const content = unwrapMessage(msg.message);
@@ -2342,6 +2345,16 @@ async function handleMessage(sock, msg) {
 
     if (isPrimaryTrigger || isSecondaryTrigger) {
       log('🔔', `Trigger command "${text}" from ${senderName} (...${shortId})`);
+
+      // 🚫 NEW: Reject trigger commands in groups
+      if (isGroup) {
+        log('🔇', `Rejecting trigger command in group from ${senderName} (...${shortId})`);
+        await sock.sendMessage(chatId, {
+          text: `ℹ️ @${senderId.split('@')[0]}, the *${text}* command only works in my Direct Messages. Please message me privately to generate clinical profiles!`,
+          mentions: [senderId]
+        });
+        return;
+      }
 
       await new Promise(r => setTimeout(r, 1000));
 
