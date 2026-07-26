@@ -3133,6 +3133,14 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
       // Add footer to all chats
 step1Text += GROUP_REPLY_FOOTER;
 
+      try {
+        if (sock.sendPresenceUpdate) {
+          await Promise.race([sock.sendPresenceUpdate('composing', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
+          await new Promise(r => setTimeout(r, 500));
+          await Promise.race([sock.sendPresenceUpdate('paused', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
+        }
+      } catch (e) { /* ignore */ }
+
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
         mentions: step1Mentions.length ? step1Mentions : undefined
@@ -3177,9 +3185,13 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       console.log(finalSecondaryText);
       console.log('═'.repeat(60) + '\n');
 
-      await sock.sendPresenceUpdate('composing', destinationChatId);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      await sock.sendPresenceUpdate('paused', destinationChatId);
+      try {
+        if (sock.sendPresenceUpdate) {
+          await Promise.race([sock.sendPresenceUpdate('composing', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
+          await new Promise(r => setTimeout(r, 500));
+          await Promise.race([sock.sendPresenceUpdate('paused', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
+        }
+      } catch (e) { /* ignore */ }
 
       const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
@@ -3253,6 +3265,14 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
 
     // 💬 Append footer to all chats
 finalResponseText += GROUP_REPLY_FOOTER;
+
+    try {
+      if (currentSock?.sendPresenceUpdate) {
+        await Promise.race([currentSock.sendPresenceUpdate('composing', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
+        await new Promise(r => setTimeout(r, 500));
+        await Promise.race([currentSock.sendPresenceUpdate('paused', destinationChatId), new Promise(r => setTimeout(r, 1000))]);
+      }
+    } catch (e) { /* ignore */ }
 
     const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
       text: finalResponseText,
