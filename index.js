@@ -623,6 +623,10 @@ function getShortSenderId(senderId) {
   return phone;
 }
 
+function getValidMentions(id) {
+  return (id && !id.endsWith('@lid')) ? [id] : [];
+}
+
 // ======================================================================
 // 📥 PERSISTENT USER MEDIA BUFFER MANAGEMENT
 // ======================================================================
@@ -758,35 +762,36 @@ async function getTotalBufferStats(chatId) {
 // 🧠 HELPER: Smart Grouping by Caption
 // ======================================================================
 function groupMediaSmartly(mediaFiles) {
-  const distinctCaptions = new Set();
+  const distinctIdentifiers = new Set();
   mediaFiles.forEach(f => {
-    if (f.caption && f.caption.trim()) {
-      distinctCaptions.add(f.caption.trim());
+    const textIdentifier = (f.caption || (f.type === 'text' ? f.content : '')).trim();
+    if (textIdentifier) {
+      distinctIdentifiers.add(textIdentifier);
     }
   });
 
-  if (distinctCaptions.size <= 1) {
+  if (distinctIdentifiers.size <= 1) {
     return [mediaFiles];
   }
 
   const batches = [];
   let currentBatch = [];
-  let activeCaption = null;
+  let activeIdentifier = null;
 
   for (const file of mediaFiles) {
-    const fileCaption = (file.caption || '').trim();
+    const fileIdentifier = (file.caption || (file.type === 'text' ? file.content : '')).trim();
 
-    if (fileCaption && fileCaption !== activeCaption) {
+    if (fileIdentifier && fileIdentifier !== activeIdentifier) {
       if (currentBatch.length > 0) {
         batches.push(currentBatch);
       }
       currentBatch = [file];
-      activeCaption = fileCaption;
+      activeIdentifier = fileIdentifier;
     } else {
       currentBatch.push(file);
 
-      if (!activeCaption && fileCaption) {
-        activeCaption = fileCaption;
+      if (!activeIdentifier && fileIdentifier) {
+        activeIdentifier = fileIdentifier;
       }
     }
   }
@@ -2351,7 +2356,7 @@ async function handleMessage(sock, msg) {
         log('🔇', `Rejecting trigger command in group from ${senderName} (...${shortId})`);
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, the *${text}* command only works in my Direct Messages. Please message me privately to generate clinical profiles!`,
-          mentions: [senderId]
+          mentions: getValidMentions(senderId)
         });
         return;
       }
@@ -2393,7 +2398,7 @@ async function handleMessage(sock, msg) {
       } else {
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
-          mentions: [senderId]
+          mentions: getValidMentions(senderId)
         });
       }
     }
@@ -2418,12 +2423,12 @@ async function handleMessage(sock, msg) {
 
         await sock.sendMessage(chatId, {
           text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
-          mentions: [senderId]
+          mentions: getValidMentions(senderId)
         });
       } else {
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
-          mentions: [senderId]
+          mentions: getValidMentions(senderId)
         });
       }
     }
@@ -2466,7 +2471,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     log('⚠️', `Context expired for ...${shortId}`);
     await sock.sendMessage(chatId, {
       text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
-      mentions: [senderId]
+      mentions: getValidMentions(senderId)
     });
     return;
   }
@@ -2487,7 +2492,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     if (!userQuestion) {
       await sock.sendMessage(chatId, {
         text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
-        mentions: [senderId]
+        mentions: getValidMentions(senderId)
       });
       return;
     }
@@ -2533,7 +2538,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
       const sentMessage = await sock.sendMessage(chatId, {
         text: finalText,
-        mentions: [senderId]
+        mentions: getValidMentions(senderId)
       });
 
       if (sentMessage?.key?.id) {
@@ -2551,7 +2556,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
       await sock.sendMessage(chatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: [senderId]
+        mentions: getValidMentions(senderId)
       });
     }
 
@@ -3109,7 +3114,7 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
 
     if (isSecondaryMode && !isFollowUp) {
       // Build mentions array for this message
-      const step1Mentions = [senderId];
+      const step1Mentions = getValidMentions(senderId);
       let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
       if (jsonData) {
         step1Text += formatJsonBlock(jsonData);
@@ -3147,7 +3152,7 @@ ${primaryResponseText}
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
 
       // Build mentions array for secondary message
-      const step2Mentions = [senderId];
+      const step2Mentions = getValidMentions(senderId);
       let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
       if (viewerUrl) {
         finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
@@ -3235,7 +3240,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     }
 
     // Build mentions array
-    const finalMentions = [senderId];
+    const finalMentions = getValidMentions(senderId);
 
     // 👤 Append sender contact for auto-group routing using @mention
     if (targetChatId) {
@@ -3274,7 +3279,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
       try {
         await currentSock?.sendMessage?.(destinationChatId, {
           text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
-          mentions: [senderId]
+          mentions: getValidMentions(senderId)
         });
       } catch (alertErr) {
         log('⚠️', `Could not send High Traffic alert (socket offline): ${alertErr.message}`);
@@ -3293,7 +3298,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
     try {
       await currentSock?.sendMessage?.(destinationChatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: [senderId]
+        mentions: getValidMentions(senderId)
       });
     } catch (finalErr) {
       log('⚠️', `Could not send final error message (socket offline): ${finalErr.message}`);
