@@ -616,6 +616,7 @@ function getSenderName(msg) {
 }
 
 function getShortSenderId(senderId) {
+  if (!senderId) return 'unknown';
   const phone = senderId.split('@')[0];
   if (phone.length > 6) {
     return phone.slice(-4);
@@ -623,6 +624,9 @@ function getShortSenderId(senderId) {
   return phone;
 }
 
+function getValidMentions(id) {
+  return (id && !id.endsWith('@lid')) ? [id] : [];
+}
 
 
 // ======================================================================
@@ -3112,7 +3116,7 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
 
     if (isSecondaryMode && !isFollowUp) {
       // Build mentions array for this message
-      const step1Mentions = [senderId];
+      const step1Mentions = getValidMentions(senderId);
       let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
       if (jsonData) {
         step1Text += formatJsonBlock(jsonData);
@@ -3141,7 +3145,7 @@ step1Text += GROUP_REPLY_FOOTER;
 
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
-        mentions: step1Mentions
+        mentions: step1Mentions.length ? step1Mentions : undefined
       });
       log('📤', `Sent Primary (Step 1) to ...${shortId}`);
 
@@ -3158,9 +3162,9 @@ ${primaryResponseText}
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
 
       // Build mentions array for secondary message
-      const step2Mentions = [senderId];
+      const step2Mentions = getValidMentions(senderId);
       let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
-      if (viewerUrl) {
+      if (viewerUrl && destinationChatId.endsWith('@g.us')) {
         finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
       }
       if (targetChatId) {
@@ -3193,7 +3197,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
 
       const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
-        mentions: step2Mentions
+        mentions: step2Mentions.length ? step2Mentions : undefined
       });
 
       if (sentMessage?.key?.id) {
@@ -3244,13 +3248,13 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       finalResponseText += formatJsonBlock(jsonData);
     }
 
-    // 🔗 Append viewer URL to response
-    if (viewerUrl) {
+    // 🔗 Append viewer URL to response (SKIP for DMs to bypass spam filters)
+    if (viewerUrl && destinationChatId.endsWith('@g.us')) {
       finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
     }
 
     // Build mentions array
-    const finalMentions = [senderId];
+    const finalMentions = getValidMentions(senderId);
 
     // 👤 Append sender contact for auto-group routing using @mention
     if (targetChatId) {
@@ -3274,7 +3278,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
 
     const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
       text: finalResponseText,
-      mentions: finalMentions
+      mentions: finalMentions.length ? finalMentions : undefined
     });
 
     if (sentMessage?.key?.id) {
@@ -3297,7 +3301,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
       try {
         await currentSock?.sendMessage?.(destinationChatId, {
           text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
-          mentions: [senderId]
+          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
       } catch (alertErr) {
         log('⚠️', `Could not send High Traffic alert (socket offline): ${alertErr.message}`);
@@ -3316,7 +3320,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
     try {
       await currentSock?.sendMessage?.(destinationChatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: [senderId]
+        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
       });
     } catch (finalErr) {
       log('⚠️', `Could not send final error message (socket offline): ${finalErr.message}`);
