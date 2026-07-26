@@ -3140,8 +3140,10 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
           step1Mentions.push(senderContact.mentionId);
         }
       }
-      // Add footer to all chats
-step1Text += GROUP_REPLY_FOOTER;
+      // Add footer to groups only to avoid DM spam filters
+      if (destinationChatId.endsWith('@g.us')) {
+        step1Text += GROUP_REPLY_FOOTER;
+      }
 
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
