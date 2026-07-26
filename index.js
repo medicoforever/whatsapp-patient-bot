@@ -2356,7 +2356,7 @@ async function handleMessage(sock, msg) {
         log('🔇', `Rejecting trigger command in group from ${senderName} (...${shortId})`);
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, the *${text}* command only works in my Direct Messages. Please message me privately to generate clinical profiles!`,
-          mentions: getValidMentions(senderId)
+          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
         return;
       }
@@ -2398,7 +2398,7 @@ async function handleMessage(sock, msg) {
       } else {
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
-          mentions: getValidMentions(senderId)
+          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
       }
     }
@@ -2423,12 +2423,12 @@ async function handleMessage(sock, msg) {
 
         await sock.sendMessage(chatId, {
           text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
-          mentions: getValidMentions(senderId)
+          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
       } else {
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
-          mentions: getValidMentions(senderId)
+          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
       }
     }
@@ -2471,7 +2471,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     log('⚠️', `Context expired for ...${shortId}`);
     await sock.sendMessage(chatId, {
       text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
-      mentions: getValidMentions(senderId)
+      mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
     });
     return;
   }
@@ -2492,7 +2492,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     if (!userQuestion) {
       await sock.sendMessage(chatId, {
         text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
-        mentions: getValidMentions(senderId)
+        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
       });
       return;
     }
@@ -2538,7 +2538,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
       const sentMessage = await sock.sendMessage(chatId, {
         text: finalText,
-        mentions: getValidMentions(senderId)
+        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
       });
 
       if (sentMessage?.key?.id) {
@@ -2556,7 +2556,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
       await sock.sendMessage(chatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: getValidMentions(senderId)
+        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
       });
     }
 
@@ -2723,7 +2723,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   if (newContent.length === 0) {
     await sock.sendMessage(chatId, {
       text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
-      mentions: [senderId]
+      mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
     });
     return;
   }
@@ -3135,7 +3135,7 @@ step1Text += GROUP_REPLY_FOOTER;
 
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
-        mentions: step1Mentions
+        mentions: step1Mentions.length ? step1Mentions : undefined
       }, triggerMsg ? { quoted: triggerMsg } : undefined);
       log('📤', `Sent Primary (Step 1) to ...${shortId}`);
 
@@ -3183,7 +3183,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
 
       const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
-        mentions: step2Mentions
+        mentions: step2Mentions.length ? step2Mentions : undefined
       }, triggerMsg ? { quoted: triggerMsg } : undefined);
 
       if (sentMessage?.key?.id) {
@@ -3256,7 +3256,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
 
     const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
       text: finalResponseText,
-      mentions: finalMentions
+      mentions: finalMentions.length ? finalMentions : undefined
     }, triggerMsg ? { quoted: triggerMsg } : undefined);
 
     if (sentMessage?.key?.id) {
@@ -3279,7 +3279,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
       try {
         await currentSock?.sendMessage?.(destinationChatId, {
           text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
-          mentions: getValidMentions(senderId)
+          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
       } catch (alertErr) {
         log('⚠️', `Could not send High Traffic alert (socket offline): ${alertErr.message}`);
@@ -3298,7 +3298,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
     try {
       await currentSock?.sendMessage?.(destinationChatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: getValidMentions(senderId)
+        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
       });
     } catch (finalErr) {
       log('⚠️', `Could not send final error message (socket offline): ${finalErr.message}`);
