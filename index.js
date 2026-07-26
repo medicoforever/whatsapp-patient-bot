@@ -623,9 +623,7 @@ function getShortSenderId(senderId) {
   return phone;
 }
 
-function getValidMentions(id) {
-  return (id && !id.endsWith('@lid')) ? [id] : [];
-}
+
 
 // ======================================================================
 // 📥 PERSISTENT USER MEDIA BUFFER MANAGEMENT
@@ -2356,7 +2354,7 @@ async function handleMessage(sock, msg) {
         log('🔇', `Rejecting trigger command in group from ${senderName} (...${shortId})`);
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, the *${text}* command only works in my Direct Messages. Please message me privately to generate clinical profiles!`,
-          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+          mentions: [senderId]
         });
         return;
       }
@@ -2388,7 +2386,7 @@ async function handleMessage(sock, msg) {
           const modeLabel = isSecondaryTrigger ? 'SECONDARY/CHAINED' : 'PRIMARY';
           log('🤖', `Processing Batch ${i+1}/${batches.length} (${batch.length} items) with FPS=${targetFps}. Mode: ${modeLabel}`);
 
-          await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger, null, 0, msg);
+          await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, targetFps, isSecondaryTrigger);
 
           if (i < batches.length - 1) {
             await new Promise(r => setTimeout(r, 2000));
@@ -2398,7 +2396,7 @@ async function handleMessage(sock, msg) {
       } else {
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
-          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+          mentions: [senderId]
         });
       }
     }
@@ -2423,12 +2421,12 @@ async function handleMessage(sock, msg) {
 
         await sock.sendMessage(chatId, {
           text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
-          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+          mentions: [senderId]
         });
       } else {
         await sock.sendMessage(chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
-          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+          mentions: [senderId]
         });
       }
     }
@@ -2471,7 +2469,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     log('⚠️', `Context expired for ...${shortId}`);
     await sock.sendMessage(chatId, {
       text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
-      mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+      mentions: [senderId]
     });
     return;
   }
@@ -2492,7 +2490,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     if (!userQuestion) {
       await sock.sendMessage(chatId, {
         text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
-        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+        mentions: [senderId]
       });
       return;
     }
@@ -2538,7 +2536,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
       const sentMessage = await sock.sendMessage(chatId, {
         text: finalText,
-        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+        mentions: [senderId]
       });
 
       if (sentMessage?.key?.id) {
@@ -2556,7 +2554,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
       await sock.sendMessage(chatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+        mentions: [senderId]
       });
     }
 
@@ -2723,7 +2721,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   if (newContent.length === 0) {
     await sock.sendMessage(chatId, {
       text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
-      mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+      mentions: [senderId]
     });
     return;
   }
@@ -2883,7 +2881,7 @@ async function runStartupRecovery() {
 
 const activeProcessingUsers = new Set();
 
-async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0, triggerMsg = null) {
+async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, previousResponse = null, senderId, senderName, userTextInput = null, targetFps = 3, isSecondaryMode = false, targetChatId = null, retryAttempt = 0) {
   const currentSock = sockParam || sock;
   const shortId = getShortSenderId(senderId);
   const destinationChatId = targetChatId || chatId;
@@ -3114,7 +3112,7 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
 
     if (isSecondaryMode && !isFollowUp) {
       // Build mentions array for this message
-      const step1Mentions = getValidMentions(senderId);
+      const step1Mentions = [senderId];
       let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
       if (jsonData) {
         step1Text += formatJsonBlock(jsonData);
@@ -3143,8 +3141,8 @@ step1Text += GROUP_REPLY_FOOTER;
 
       await sock.sendMessage(destinationChatId, {
         text: step1Text,
-        mentions: step1Mentions.length ? step1Mentions : undefined
-      }, triggerMsg ? { quoted: triggerMsg } : undefined);
+        mentions: step1Mentions
+      });
       log('📤', `Sent Primary (Step 1) to ...${shortId}`);
 
       // --- STEP 2: Generate Secondary Analysis ---
@@ -3160,7 +3158,7 @@ ${primaryResponseText}
       const secondaryResponseText = await generateGeminiContent(secondaryRequestContent, SECONDARY_SYSTEM_INSTRUCTION);
 
       // Build mentions array for secondary message
-      const step2Mentions = getValidMentions(senderId);
+      const step2Mentions = [senderId];
       let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
       if (viewerUrl) {
         finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
@@ -3195,8 +3193,8 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
 
       const sentMessage = await sock.sendMessage(destinationChatId, {
         text: finalSecondaryText,
-        mentions: step2Mentions.length ? step2Mentions : undefined
-      }, triggerMsg ? { quoted: triggerMsg } : undefined);
+        mentions: step2Mentions
+      });
 
       if (sentMessage?.key?.id) {
         const messageId = sentMessage.key.id;
@@ -3252,7 +3250,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     }
 
     // Build mentions array
-    const finalMentions = getValidMentions(senderId);
+    const finalMentions = [senderId];
 
     // 👤 Append sender contact for auto-group routing using @mention
     if (targetChatId) {
@@ -3276,8 +3274,8 @@ finalResponseText += GROUP_REPLY_FOOTER;
 
     const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
       text: finalResponseText,
-      mentions: finalMentions.length ? finalMentions : undefined
-    }, triggerMsg ? { quoted: triggerMsg } : undefined);
+      mentions: finalMentions
+    });
 
     if (sentMessage?.key?.id) {
       const messageId = sentMessage.key.id;
@@ -3299,7 +3297,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
       try {
         await currentSock?.sendMessage?.(destinationChatId, {
           text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
-          mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+          mentions: [senderId]
         });
       } catch (alertErr) {
         log('⚠️', `Could not send High Traffic alert (socket offline): ${alertErr.message}`);
@@ -3318,7 +3316,7 @@ finalResponseText += GROUP_REPLY_FOOTER;
     try {
       await currentSock?.sendMessage?.(destinationChatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
-        mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
+        mentions: [senderId]
       });
     } catch (finalErr) {
       log('⚠️', `Could not send final error message (socket offline): ${finalErr.message}`);
