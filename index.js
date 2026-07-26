@@ -2441,7 +2441,7 @@ async function handleMessage(sock, msg) {
         await sock.sendPresenceUpdate('paused', chatId);
       } catch(e) {}
       
-      await sock.sendMessage(chatId, { text: 'pong' });
+      await sock.sendMessage(chatId, { text: 'pong' }, { quoted: msg });
       return;
     }
     else if (text.toLowerCase() === 'status') {
