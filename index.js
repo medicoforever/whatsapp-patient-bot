@@ -2436,6 +2436,8 @@ async function handleMessage(sock, msg) {
     }
     else if (text.toLowerCase() === 'ping') {
       log('🟢', `Ping received from ...${shortId}`);
+      console.log("PING MSG KEY:", JSON.stringify(msg.key, null, 2));
+      console.log("PING MSG SENDER INFO:", msg.pushName, senderId, chatId);
       try {
         await sock.sendMessage(chatId, { text: 'pong' }, { quoted: msg });
         log('🟢', `Pong sent successfully to ...${shortId}`);
