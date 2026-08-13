@@ -2,6 +2,7 @@ import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/ge
 import pino from 'pino';
 import QRCode from 'qrcode';
 import express from 'express';
+import compression from 'compression';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -630,9 +631,17 @@ function getValidMentions(id) {
 
 
 // ======================================================================
-// 📥 PERSISTENT USER MEDIA BUFFER MANAGEMENT
+// 📥 ZERO-EGRESS RAM-FIRST USER MEDIA BUFFER MANAGEMENT
 // ======================================================================
 async function addToUserBuffer(chatId, senderId, mediaItem, msgId = null, senderName = '') {
+  // RAM buffer for instant, lossless media handling with zero network egress
+  if (!chatMediaBuffers.has(chatId)) chatMediaBuffers.set(chatId, new Map());
+  const chatBuf = chatMediaBuffers.get(chatId);
+  if (!chatBuf.has(senderId)) chatBuf.set(senderId, []);
+  const buf = chatBuf.get(senderId);
+  buf.push(mediaItem);
+
+  // Store lightweight metadata in MongoDB for tracking without duplicate multi-MB binary upload
   const model = getPendingMediaModel();
   if (model) {
     try {
@@ -642,7 +651,7 @@ async function addToUserBuffer(chatId, senderId, mediaItem, msgId = null, sender
         senderName,
         messageId: msgId || crypto.randomBytes(8).toString('hex'),
         type: mediaItem.type,
-        data: mediaItem.data,
+        data: (mediaItem.type === 'text') ? (mediaItem.data || '') : '',
         content: mediaItem.content || '',
         mimeType: mediaItem.mimeType,
         caption: mediaItem.caption || '',
@@ -650,47 +659,15 @@ async function addToUserBuffer(chatId, senderId, mediaItem, msgId = null, sender
         status: 'pending',
         processed: false
       });
-      const count = await model.countDocuments({ chatId, senderId, processed: false });
-      return count;
     } catch (err) {
-      log('⚠️', 'MongoDB buffer save error: ' + err.message + '. Falling back to RAM.');
+      // Non-blocking metadata logging
     }
   }
 
-  // RAM Fallback
-  if (!chatMediaBuffers.has(chatId)) chatMediaBuffers.set(chatId, new Map());
-  const chatBuf = chatMediaBuffers.get(chatId);
-  if (!chatBuf.has(senderId)) chatBuf.set(senderId, []);
-  const buf = chatBuf.get(senderId);
-  buf.push(mediaItem);
   return buf.length;
 }
 
 async function clearUserBuffer(chatId, senderId) {
-  const model = getPendingMediaModel();
-  let mongoItems = [];
-
-  if (model) {
-    try {
-      const docs = await model.find({ chatId, senderId, processed: false }).sort({ createdAt: 1 });
-      if (docs.length > 0) {
-        await model.updateMany({ chatId, senderId, processed: false }, { status: 'processing' });
-        mongoItems = docs.map(d => ({
-          _id: d._id,
-          type: d.type,
-          data: d.data,
-          content: d.content || '',
-          mimeType: d.mimeType,
-          caption: d.caption,
-          fileName: d.fileName
-        }));
-      }
-    } catch (err) {
-      log('⚠️', 'MongoDB clearUserBuffer error: ' + err.message);
-    }
-  }
-
-  // RAM Fallback
   let ramItems = [];
   if (chatMediaBuffers.has(chatId)) {
     const chatBuf = chatMediaBuffers.get(chatId);
@@ -699,16 +676,24 @@ async function clearUserBuffer(chatId, senderId) {
       chatBuf.delete(senderId);
     }
   }
-  return [...mongoItems, ...ramItems];
+
+  const model = getPendingMediaModel();
+  if (model) {
+    try {
+      await model.deleteMany({ chatId, senderId });
+    } catch (err) {
+      log('⚠️', 'MongoDB clearUserBuffer cleanup error: ' + err.message);
+    }
+  }
+
+  return ramItems;
 }
 
 async function markUserBufferCompleted(chatId, senderId) {
   const model = getPendingMediaModel();
   if (model) {
     try {
-      // Instantly delete successful media from MongoDB to save space
-      const result = await model.deleteMany({ chatId, senderId, status: 'processing' });
-      log('🗑️', `Deleted ${result.deletedCount} processed media items for ${senderId} from MongoDB`);
+      await model.deleteMany({ chatId, senderId });
     } catch (err) {
       log('⚠️', 'Error marking user buffer completed: ' + err.message);
     }
@@ -719,7 +704,7 @@ async function markUserBufferFailed(chatId, senderId) {
   const model = getPendingMediaModel();
   if (model) {
     try {
-      await model.updateMany({ chatId, senderId, status: 'processing' }, { processed: true, status: 'failed' });
+      await model.deleteMany({ chatId, senderId });
     } catch (err) {
       log('⚠️', 'Error marking user buffer failed: ' + err.message);
     }
@@ -727,26 +712,19 @@ async function markUserBufferFailed(chatId, senderId) {
 }
 
 async function getUserBufferCount(chatId, senderId) {
-  const model = getPendingMediaModel();
-  let count = 0;
-  if (model) {
-    try { count = await model.countDocuments({ chatId, senderId, processed: false }); } catch (err) {}
-  }
   if (chatMediaBuffers.has(chatId) && chatMediaBuffers.get(chatId).has(senderId)) {
-    count += chatMediaBuffers.get(chatId).get(senderId).length;
+    return chatMediaBuffers.get(chatId).get(senderId).length;
   }
-  return count;
+  return 0;
 }
 
 async function getTotalBufferStats(chatId) {
   const stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
-  const model = getPendingMediaModel();
-  if (model) {
-    try {
-      const docs = await model.find({ chatId, processed: false });
-      const uniqueUsers = new Set();
-      for (const d of docs) {
-        uniqueUsers.add(d.senderId);
+  if (chatMediaBuffers.has(chatId)) {
+    const chatBuf = chatMediaBuffers.get(chatId);
+    stats.users = chatBuf.size;
+    for (const [_, items] of chatBuf) {
+      for (const d of items) {
         if (d.type === 'image') stats.images++;
         else if (d.type === 'pdf') stats.pdfs++;
         else if (d.type === 'audio' || d.type === 'voice') stats.audio++;
@@ -754,8 +732,7 @@ async function getTotalBufferStats(chatId) {
         else if (d.type === 'text') stats.texts++;
         stats.total++;
       }
-      stats.users = uniqueUsers.size;
-    } catch(e) {}
+    }
   }
   return stats;
 }
@@ -992,8 +969,6 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
         try {
           const files = fs.readdirSync(tempDir)
             .filter(f => f.startsWith(`frame_${tempId}_`) && f.endsWith('.jpg'))
-            .sort();
-
           const frames = files.map(file => {
             const path = join(tempDir, file);
             const buffer = fs.readFileSync(path);
@@ -1017,14 +992,33 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 // ===================================
 
 const app = express();
+app.use(compression());
 const PORT = process.env.PORT || 3000;
 
 // ======================================================================
-// 🔗 MEDIA VIEWER ROUTE
+// 🔗 MEDIA VIEWER ROUTE (Lazy-Loaded Streaming & Crawler-Protected)
 // ======================================================================
 app.get('/view/:viewerId', (req, res) => {
+  const userAgent = (req.headers['user-agent'] || '').toLowerCase();
+  const isCrawler = /facebookexternalhit|whatsapp|twitterbot|telegrambot|applebot|bingbot|googlebot|crawler|spider|curl|wget/i.test(userAgent);
+
   const { viewerId } = req.params;
   const entry = mediaViewerStore.get(viewerId);
+
+  // Return lightweight OpenGraph metadata to crawlers/link previews to save bandwidth
+  if (isCrawler) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Source Media Viewer</title>
+  <meta property="og:title" content="Source Media Viewer">
+  <meta property="og:description" content="View clinical source media for patient case">
+  <meta name="robots" content="noindex, nofollow">
+</head>
+<body><p>Source Media Viewer</p></body>
+</html>`);
+  }
 
   if (!entry) {
     return res.status(404).send(`
@@ -1033,6 +1027,7 @@ app.get('/view/:viewerId', (req, res) => {
     <head>
         <title>Link Expired</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="robots" content="noindex, nofollow">
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
             .container { text-align: center; padding: 40px; }
@@ -1059,6 +1054,7 @@ app.get('/view/:viewerId', (req, res) => {
     <head>
         <title>Link Expired</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="robots" content="noindex, nofollow">
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
             .container { text-align: center; padding: 40px; }
@@ -1086,35 +1082,36 @@ app.get('/view/:viewerId', (req, res) => {
   media.forEach((m, index) => {
     const caption = m.caption ? `<div class="caption">${m.caption.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
     const fileName = m.fileName ? `<div class="filename">${m.fileName.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+    const mediaUrl = `/media/${viewerId}/${index}`;
 
     if (m.type === 'image') {
       mediaHtml += `
         <div class="media-item">
             <div class="media-index">#${index + 1} — Image</div>
             ${caption}${fileName}
-            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+            <img src="${mediaUrl}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
         </div>`;
     } else if (m.type === 'pdf') {
       mediaHtml += `
         <div class="media-item">
             <div class="media-index">#${index + 1} — PDF</div>
             ${caption}${fileName}
-            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
-            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+            <iframe src="${mediaUrl}" class="pdf-frame" loading="lazy"></iframe>
+            <a href="${mediaUrl}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
         </div>`;
     } else if (m.type === 'audio' || m.type === 'voice') {
       mediaHtml += `
         <div class="media-item">
             <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
             ${caption}${fileName}
-            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+            <audio controls preload="none" src="${mediaUrl}" style="width:100%;"></audio>
         </div>`;
     } else if (m.type === 'video') {
       mediaHtml += `
         <div class="media-item">
             <div class="media-index">#${index + 1} — Video</div>
             ${caption}${fileName}
-            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+            <video controls preload="metadata" src="${mediaUrl}" style="width:100%; max-height:500px;"></video>
         </div>`;
     }
   });
@@ -1125,6 +1122,7 @@ app.get('/view/:viewerId', (req, res) => {
     <head>
         <title>Source Media Viewer</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="robots" content="noindex, nofollow">
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body {
@@ -1163,7 +1161,6 @@ app.get('/view/:viewerId', (req, res) => {
                 cursor: pointer;
                 transition: opacity 0.2s;
             }
-            .media-item img:hover { opacity: 0.9; }
             .media-index {
                 padding: 8px 12px;
                 font-size: 11px;
@@ -1171,23 +1168,23 @@ app.get('/view/:viewerId', (req, res) => {
                 color: #25D366;
                 background: #0f0f1a;
                 border-bottom: 1px solid #2a2a4a;
-                transition: opacity 0.2s;
             }
             .caption {
-                padding: 6px 12px;
-                font-size: 12px;
-                color: #ccc;
-                background: #16213e;
-                font-style: italic;
+                padding: 8px 12px;
+                font-size: 13px;
+                color: #ddd;
+                background: #16162a;
+                border-bottom: 1px solid #22223a;
             }
             .filename {
                 padding: 4px 12px;
                 font-size: 11px;
                 color: #888;
+                background: #16162a;
             }
             .pdf-frame {
                 width: 100%;
-                height: 500px;
+                height: 400px;
                 border: none;
             }
             .download-btn {
@@ -1195,18 +1192,17 @@ app.get('/view/:viewerId', (req, res) => {
                 text-align: center;
                 padding: 10px;
                 background: #25D366;
-                color: #000;
+                color: white;
                 text-decoration: none;
                 font-weight: 600;
                 font-size: 13px;
+                transition: background 0.2s;
             }
-            .download-btn:hover { background: #1da851; }
-
+            .download-btn:hover { background: #1eb854; }
             .fullscreen-overlay {
                 display: none;
                 position: fixed;
-                top: 0; left: 0;
-                width: 100vw; height: 100vh;
+                top: 0; left: 0; width: 100%; height: 100%;
                 background: rgba(0,0,0,0.95);
                 z-index: 9999;
                 justify-content: center;
@@ -1215,9 +1211,17 @@ app.get('/view/:viewerId', (req, res) => {
             }
             .fullscreen-overlay.active { display: flex; }
             .fullscreen-overlay img {
-                max-width: 95vw;
-                max-height: 95vh;
+                max-width: 95%;
+                max-height: 95%;
                 object-fit: contain;
+            }
+            .close-btn {
+                position: absolute;
+                top: 15px; right: 20px;
+                color: white;
+                font-size: 30px;
+                cursor: pointer;
+                z-index: 10000;
             }
 
             @media (max-width: 600px) {
@@ -1228,9 +1232,9 @@ app.get('/view/:viewerId', (req, res) => {
     </head>
     <body>
         <div class="header">
-            <h1>🔍 Source Media Viewer</h1>
-            <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
-            <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
+            <h1>📋 Source Medical Media</h1>
+            <div class="meta">${media.length} file(s) attached to this case</div>
+            <div class="expiry">⏳ Link expires in ${remainingHours}h ${remainingMins}m</div>
         </div>
 
         <div class="media-grid">
@@ -1238,15 +1242,14 @@ app.get('/view/:viewerId', (req, res) => {
         </div>
 
         <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
-            <img id="fsImage" src="" alt="Fullscreen">
+            <span class="close-btn">&times;</span>
+            <img id="fsImage" src="" alt="Fullscreen View">
         </div>
 
         <script>
             function openFullscreen(img) {
-                const overlay = document.getElementById('fsOverlay');
-                const fsImg = document.getElementById('fsImage');
-                fsImg.src = img.src;
-                overlay.classList.add('active');
+                document.getElementById('fsImage').src = img.src;
+                document.getElementById('fsOverlay').classList.add('active');
             }
             function closeFullscreen() {
                 document.getElementById('fsOverlay').classList.remove('active');
@@ -1274,8 +1277,10 @@ app.get('/media/:viewerId/:index', (req, res) => {
 
   const m = entry.media[idx];
   const buffer = Buffer.from(m.data, 'base64');
-  res.setHeader('Content-Type', m.mimeType);
+  res.setHeader('Content-Type', m.mimeType || 'application/octet-stream');
   res.setHeader('Content-Length', buffer.length);
+  res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+  res.setHeader('Content-Disposition', 'inline');
   res.send(buffer);
 });
 // ======================================================================
