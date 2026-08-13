@@ -37,11 +37,12 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
-  // 🔴 Model Chain Configuration (High Quota Primary)
-  GEMINI_MODEL: 'gemini-3.5-flash',
-  GEMINI_MODEL_FALLBACK_1: 'gemini-3-flash-preview',
-  GEMINI_MODEL_FALLBACK_2: 'gemini-3.5-flash-lite',
-  GEMINI_MODEL_FALLBACK_3: 'gemini-3.6-flash',
+  // 🔴 Model Chain Configuration
+  GEMINI_MODEL: 'gemini-3.7-flash',
+  GEMINI_MODEL_FALLBACK_1: 'gemini-3.5-flash',
+  GEMINI_MODEL_FALLBACK_2: 'gemini-3.6-flash',
+  GEMINI_MODEL_FALLBACK_3: 'gemini-3-flash-preview',
+  GEMINI_MODEL_FALLBACK_4: 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -2818,13 +2819,13 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     return null; 
   };
 
-  // 1. Loop through keys using Primary Model (gemini-3.6-flash)
+  // 1. Loop through keys using Primary Model (gemini-3.7-flash)
   let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
   if (responseText) {
     return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
   }
 
-  log('⚠️', `All keys failed for primary model. Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_1}...`);
+  log('⚠️', `All keys failed for primary model (${CONFIG.GEMINI_MODEL}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_1}...`);
 
   // 2. Loop through keys using Fallback 1 Model (gemini-3.5-flash)
   responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_1, false);
@@ -2832,23 +2833,31 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
   }
 
-  log('⚠️', `All keys failed for fallback 1. Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_2}...`);
+  log('⚠️', `All keys failed for fallback 1 (${CONFIG.GEMINI_MODEL_FALLBACK_1}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_2}...`);
 
-  // 3. Loop through keys using Fallback 2 Model (gemini-3-flash-preview)
+  // 3. Loop through keys using Fallback 2 Model (gemini-3.6-flash)
   responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_2, false);
   if (responseText) {
     return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
   }
 
-  log('⚠️', `All keys failed for fallback 2. Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_3} with HIGH thinking...`);
+  log('⚠️', `All keys failed for fallback 2 (${CONFIG.GEMINI_MODEL_FALLBACK_2}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_3}...`);
 
-  // 4. Loop through keys using Fallback 3 Model (gemini-3.5-flash-lite)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_3, true);
+  // 4. Loop through keys using Fallback 3 Model (gemini-3-flash-preview)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_3, false);
   if (responseText) {
     return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
   }
 
-  // 5. All models failed across all keys
+  log('⚠️', `All keys failed for fallback 3 (${CONFIG.GEMINI_MODEL_FALLBACK_3}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_4} with HIGH thinking...`);
+
+  // 5. Loop through keys using Fallback 4 Model (gemini-3.5-flash-lite)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_4, true);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_4}}_`;
+  }
+
+  // 6. All models failed across all keys
   throw new Error(`All ${keys.length} API keys failed for all models. Last error: ${lastErrorMsg}`);
 }
 
