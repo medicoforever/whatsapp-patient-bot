@@ -56,7 +56,7 @@ const CONFIG = {
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
   AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
 
-  // 🔧 FIX #1: Changed from 30 minutes to 12 hours to match media viewer expiry
+  // 🔧 Context retention: 12 hours
   CONTEXT_RETENTION_MS: 12 * 60 * 60 * 1000, // 12 hours
   MAX_STORED_CONTEXTS: 20,
   COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', '?', 'clear', 'status'],
@@ -73,8 +73,6 @@ const CONFIG = {
     'video/quicktime', 'video/x-matroska', 'video/mkv', 'video/3gpp', 'video/3gp'
   ],
   SUPPORTED_VIDEO_EXTENSIONS: ['.mp4', '.mpeg', '.mpg', '.webm', '.avi', '.mov', '.mkv', '.3gp'],
-  // 🔗 Media Viewer URL expiry: 12 hours
-  MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000,
   // 🔧 Decryption failure auto-heal settings
   DECRYPT_FAIL_THRESHOLD: 8,
   DECRYPT_FAIL_WINDOW_MS: 60000,
@@ -157,60 +155,91 @@ IMPORTANT: Always identify whether the user is asking a question or providing ad
 };
 
 // ======================================================================
-// 🔗 MEDIA VIEWER STORE (In-Memory with 12hr Expiry)
+// 📥 DETERMINISTIC INPUT MEDIA SUMMARY (Code-Generated, Zero-Hallucination)
 // ======================================================================
-const mediaViewerStore = new Map();
-
-function storeMediaForViewer(mediaFiles) {
-  const viewerId = crypto.randomBytes(16).toString('hex');
-  const expiresAt = Date.now() + CONFIG.MEDIA_VIEWER_EXPIRY_MS;
-
-  const viewableMedia = [];
-  for (const m of mediaFiles) {
-    if (m.type === 'image' || m.type === 'pdf' || m.type === 'audio' || m.type === 'voice' || m.type === 'video') {
-      viewableMedia.push({
-        type: m.type,
-        data: m.data,
-        mimeType: m.mimeType,
-        caption: m.caption || '',
-        fileName: m.fileName || ''
-      });
-    }
+function formatInputMediaSummary(counts) {
+  const parts = [];
+  if (counts.images > 0) {
+    parts.push(counts.images === 1 ? '1 Image' : `${counts.images} Images`);
   }
-
-  if (viewableMedia.length === 0) return null;
-
-  mediaViewerStore.set(viewerId, {
-    media: viewableMedia,
-    expiresAt: expiresAt,
-    createdAt: Date.now()
-  });
-
-  log('🔗', `Media viewer created: ${viewerId} (${viewableMedia.length} files, expires in 12h)`);
-
-  setTimeout(() => {
-    if (mediaViewerStore.has(viewerId)) {
-      mediaViewerStore.delete(viewerId);
-      log('🧹', `Media viewer expired and cleaned: ${viewerId}`);
-    }
-  }, CONFIG.MEDIA_VIEWER_EXPIRY_MS);
-
-  return viewerId;
+  if (counts.pdfs > 0) {
+    parts.push(counts.pdfs === 1 ? '1 PDF' : `${counts.pdfs} PDFs`);
+  }
+  if (counts.audio > 0) {
+    parts.push(counts.audio === 1 ? '1 Audio Note' : `${counts.audio} Audio Notes`);
+  }
+  if (counts.video > 0) {
+    parts.push(counts.video === 1 ? '1 Video' : `${counts.video} Videos`);
+  }
+  if (counts.texts > 0) {
+    parts.push(counts.texts === 1 ? '1 Text Note' : `${counts.texts} Text Notes`);
+  }
+  if (parts.length === 0) {
+    return '📥 *Input Media:* None';
+  }
+  return `📥 *Input Media:* ${parts.join(', ')}`;
 }
 
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [id, entry] of mediaViewerStore) {
-    if (now >= entry.expiresAt) {
-      mediaViewerStore.delete(id);
-      cleaned++;
+// ======================================================================
+// 🗜️ IN-MEMORY IMAGE COMPRESSION (Reduces Egress Bandwidth by 90%+)
+// ======================================================================
+async function optimizeImageForAi(base64Data, mimeType) {
+  // If not image or already very small (< 250KB base64), skip compression
+  if (!mimeType?.startsWith('image/') || !base64Data || base64Data.length < 350000) {
+    return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
+  }
+
+  return new Promise((resolve) => {
+    const tempId = Math.random().toString(36).substring(7);
+    const tempDir = os.tmpdir();
+    const inputExt = mimeType.includes('png') ? '.png' : '.jpg';
+    const inputPath = join(tempDir, `opt_in_${tempId}${inputExt}`);
+    const outputPath = join(tempDir, `opt_out_${tempId}.jpg`);
+
+    const cleanup = () => {
+      try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (e) {}
+      try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (e) {}
+    };
+
+    try {
+      const buffer = Buffer.from(base64Data, 'base64');
+      fs.writeFileSync(inputPath, buffer);
+
+      ffmpeg(inputPath)
+        .outputOptions([
+          "-vf scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease",
+          '-q:v 3'
+        ])
+        .output(outputPath)
+        .on('end', () => {
+          try {
+            if (fs.existsSync(outputPath)) {
+              const optBuffer = fs.readFileSync(outputPath);
+              cleanup();
+              if (optBuffer.length < buffer.length) {
+                log('🗜️', `Image optimized: ${(buffer.length / 1024).toFixed(0)}KB ➔ ${(optBuffer.length / 1024).toFixed(0)}KB (${(((buffer.length - optBuffer.length) / buffer.length) * 100).toFixed(0)}% bandwidth saved)`);
+                return resolve({ data: optBuffer.toString('base64'), mimeType: 'image/jpeg' });
+              }
+            }
+            cleanup();
+            resolve({ data: base64Data, mimeType });
+          } catch (readErr) {
+            cleanup();
+            resolve({ data: base64Data, mimeType });
+          }
+        })
+        .on('error', (err) => {
+          cleanup();
+          log('⚠️', `Image optimization skipped (fallback to original): ${err.message}`);
+          resolve({ data: base64Data, mimeType });
+        })
+        .run();
+    } catch (err) {
+      cleanup();
+      resolve({ data: base64Data, mimeType });
     }
-  }
-  if (cleaned > 0) {
-    log('🧹', `Periodic cleanup: removed ${cleaned} expired media viewer(s)`);
-  }
-}, 60 * 60 * 1000);
+  });
+}
 
 // ======================================================================
 // 🔧 DECRYPTION FAILURE TRACKER (Auto-Heal)
@@ -996,296 +1025,6 @@ const app = express();
 app.use(compression());
 const PORT = process.env.PORT || 3000;
 
-// ======================================================================
-// 🔗 MEDIA VIEWER ROUTE (Lazy-Loaded Streaming & Crawler-Protected)
-// ======================================================================
-app.get('/view/:viewerId', (req, res) => {
-  const userAgent = (req.headers['user-agent'] || '').toLowerCase();
-  const isCrawler = /facebookexternalhit|whatsapp|twitterbot|telegrambot|applebot|bingbot|googlebot|crawler|spider|curl|wget/i.test(userAgent);
-
-  const { viewerId } = req.params;
-  const entry = mediaViewerStore.get(viewerId);
-
-  // Return lightweight OpenGraph metadata to crawlers/link previews to save bandwidth
-  if (isCrawler) {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <title>Source Media Viewer</title>
-  <meta property="og:title" content="Source Media Viewer">
-  <meta property="og:description" content="View clinical source media for patient case">
-  <meta name="robots" content="noindex, nofollow">
-</head>
-<body><p>Source Media Viewer</p></body>
-</html>`);
-  }
-
-  if (!entry) {
-    return res.status(404).send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Link Expired</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta name="robots" content="noindex, nofollow">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
-            .container { text-align: center; padding: 40px; }
-            .icon { font-size: 64px; margin-bottom: 20px; }
-            h1 { color: #e94560; }
-            p { color: #aaa; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="icon">⏰</div>
-            <h1>Link Expired or Invalid</h1>
-            <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
-        </div>
-    </body>
-    </html>`);
-  }
-
-  if (Date.now() >= entry.expiresAt) {
-    mediaViewerStore.delete(viewerId);
-    return res.status(410).send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Link Expired</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta name="robots" content="noindex, nofollow">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
-            .container { text-align: center; padding: 40px; }
-            .icon { font-size: 64px; margin-bottom: 20px; }
-            h1 { color: #e94560; }
-            p { color: #aaa; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="icon">⏰</div>
-            <h1>Link Expired</h1>
-            <p>This media viewer link has expired (12 hour limit).</p>
-        </div>
-    </body>
-    </html>`);
-  }
-
-  const media = entry.media;
-  const remainingMs = entry.expiresAt - Date.now();
-  const remainingHours = Math.floor(remainingMs / 3600000);
-  const remainingMins = Math.floor((remainingMs % 3600000) / 60000);
-
-  let mediaHtml = '';
-  media.forEach((m, index) => {
-    const caption = m.caption ? `<div class="caption">${m.caption.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
-    const fileName = m.fileName ? `<div class="filename">${m.fileName.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
-    const mediaUrl = `/media/${viewerId}/${index}`;
-
-    if (m.type === 'image') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — Image</div>
-            ${caption}${fileName}
-            <img src="${mediaUrl}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
-        </div>`;
-    } else if (m.type === 'pdf') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — PDF</div>
-            ${caption}${fileName}
-            <iframe src="${mediaUrl}" class="pdf-frame" loading="lazy"></iframe>
-            <a href="${mediaUrl}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
-        </div>`;
-    } else if (m.type === 'audio' || m.type === 'voice') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
-            ${caption}${fileName}
-            <audio controls preload="none" src="${mediaUrl}" style="width:100%;"></audio>
-        </div>`;
-    } else if (m.type === 'video') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — Video</div>
-            ${caption}${fileName}
-            <video controls preload="metadata" src="${mediaUrl}" style="width:100%; max-height:500px;"></video>
-        </div>`;
-    }
-  });
-
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Source Media Viewer</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta name="robots" content="noindex, nofollow">
-        <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: #0f0f1a;
-                color: #e0e0e0;
-                padding: 10px;
-            }
-            .header {
-                text-align: center;
-                padding: 20px 10px;
-                background: linear-gradient(135deg, #1a1a2e, #16213e);
-                border-radius: 12px;
-                margin-bottom: 15px;
-                border: 1px solid #333;
-            }
-            .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
-            .header .meta { font-size: 12px; color: #888; }
-            .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
-            .media-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-                gap: 12px;
-            }
-            .media-item {
-                background: #1a1a2e;
-                border-radius: 10px;
-                overflow: hidden;
-                border: 1px solid #2a2a4a;
-                transition: transform 0.2s;
-            }
-            .media-item:hover { transform: scale(1.01); border-color: #25D366; }
-            .media-item img {
-                width: 100%;
-                display: block;
-                cursor: pointer;
-                transition: opacity 0.2s;
-            }
-            .media-index {
-                padding: 8px 12px;
-                font-size: 11px;
-                font-weight: 600;
-                color: #25D366;
-                background: #0f0f1a;
-                border-bottom: 1px solid #2a2a4a;
-            }
-            .caption {
-                padding: 8px 12px;
-                font-size: 13px;
-                color: #ddd;
-                background: #16162a;
-                border-bottom: 1px solid #22223a;
-            }
-            .filename {
-                padding: 4px 12px;
-                font-size: 11px;
-                color: #888;
-                background: #16162a;
-            }
-            .pdf-frame {
-                width: 100%;
-                height: 400px;
-                border: none;
-            }
-            .download-btn {
-                display: block;
-                text-align: center;
-                padding: 10px;
-                background: #25D366;
-                color: white;
-                text-decoration: none;
-                font-weight: 600;
-                font-size: 13px;
-                transition: background 0.2s;
-            }
-            .download-btn:hover { background: #1eb854; }
-            .fullscreen-overlay {
-                display: none;
-                position: fixed;
-                top: 0; left: 0; width: 100%; height: 100%;
-                background: rgba(0,0,0,0.95);
-                z-index: 9999;
-                justify-content: center;
-                align-items: center;
-                cursor: zoom-out;
-            }
-            .fullscreen-overlay.active { display: flex; }
-            .fullscreen-overlay img {
-                max-width: 95%;
-                max-height: 95%;
-                object-fit: contain;
-            }
-            .close-btn {
-                position: absolute;
-                top: 15px; right: 20px;
-                color: white;
-                font-size: 30px;
-                cursor: pointer;
-                z-index: 10000;
-            }
-
-            @media (max-width: 600px) {
-                .media-grid { grid-template-columns: 1fr; }
-                body { padding: 5px; }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>📋 Source Medical Media</h1>
-            <div class="meta">${media.length} file(s) attached to this case</div>
-            <div class="expiry">⏳ Link expires in ${remainingHours}h ${remainingMins}m</div>
-        </div>
-
-        <div class="media-grid">
-            ${mediaHtml}
-        </div>
-
-        <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
-            <span class="close-btn">&times;</span>
-            <img id="fsImage" src="" alt="Fullscreen View">
-        </div>
-
-        <script>
-            function openFullscreen(img) {
-                document.getElementById('fsImage').src = img.src;
-                document.getElementById('fsOverlay').classList.add('active');
-            }
-            function closeFullscreen() {
-                document.getElementById('fsOverlay').classList.remove('active');
-            }
-            document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') closeFullscreen();
-            });
-        </script>
-    </body>
-    </html>`);
-});
-
-app.get('/media/:viewerId/:index', (req, res) => {
-  const { viewerId, index } = req.params;
-  const idx = parseInt(index);
-  const entry = mediaViewerStore.get(viewerId);
-
-  if (!entry || Date.now() >= entry.expiresAt) {
-    return res.status(404).send('Not found or expired');
-  }
-
-  if (isNaN(idx) || idx < 0 || idx >= entry.media.length) {
-    return res.status(404).send('Invalid index');
-  }
-
-  const m = entry.media[idx];
-  const buffer = Buffer.from(m.data, 'base64');
-  res.setHeader('Content-Type', m.mimeType || 'application/octet-stream');
-  res.setHeader('Content-Length', buffer.length);
-  res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-  res.setHeader('Content-Disposition', 'inline');
-  res.send(buffer);
-});
-// ======================================================================
-
 app.get('/', async (req, res) => {
   let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
   for (const [chatId, _] of chatMediaBuffers) {
@@ -1305,7 +1044,6 @@ app.get('/', async (req, res) => {
     <head>
         <title>WhatsApp Patient Bot</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta http-equiv="refresh" content="5">
         <style>
             * { box-sizing: border-box; }
             body {
@@ -1409,7 +1147,6 @@ app.get('/', async (req, res) => {
                 <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
                 <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
                 <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
-                <div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div>
             </div>
             <div class="info-box">
                 <h3>✨ Features:</h3>
@@ -1422,7 +1159,7 @@ app.get('/', async (req, res) => {
                     - Send <strong>.1</strong> for Smart 1 FPS<br>
                     <strong>🧠 Secondary Analysis:</strong><br>
                     - Send <strong>..</strong> (double dot) for Chained Analysis<br>
-                    <strong>🔗 Source Viewer:</strong> Each response includes a link to view source media (12h expiry)<br>
+                    <strong>📥 Input Media Summary:</strong> Code-verified input count included in each report<br>
                     <strong>🔧 Auto-Heal:</strong> Signal session key auto-repair active<br>
                     <strong>↩️ Reply:</strong> Reply to bot to ask questions.
                 </p>
@@ -1456,7 +1193,6 @@ app.get('/health', (req, res) => {
     mode: 'universal',
     processedCount,
     activeKeys: CONFIG.API_KEYS.length,
-    activeViewers: mediaViewerStore.size,
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
@@ -1467,17 +1203,6 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
   log('🌐', `Web server running on port ${PORT}`);
 });
-
-// ======================================================================
-// 🔗 HELPER: Get the base URL for viewer links
-// ======================================================================
-function getBaseUrl() {
-  if (process.env.RENDER_EXTERNAL_URL) {
-    return process.env.RENDER_EXTERNAL_URL;
-  }
-  return `http://localhost:${PORT}`;
-}
-// ======================================================================
 
 // ======================================================================
 // 🔗 HELPER: Parse JSON block from AI response
@@ -2412,7 +2137,7 @@ async function handleMessage(sock, msg) {
     }
     else if (text.toLowerCase() === 'help' || text === '?') {
       await sock.sendMessage(chatId, {
-        text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*🔗 Source Viewer:*\nEach response includes a link to view source media (valid 12h)`
+        text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*📥 Input Media Summary:*\nEach generated report confirms the exact count and type of media received.`
       });
     }
     else if (text.toLowerCase() === 'clear') {
@@ -2458,7 +2183,7 @@ async function handleMessage(sock, msg) {
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
       await sock.sendMessage(chatId, {
-        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔗 Active Viewers: ${mediaViewerStore.size}\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
+        text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
       });
     }
     else {
@@ -2525,12 +2250,22 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
     for (const media of sourceMedia) {
       if (media.data && media.mimeType && (media.type === 'image' || media.type === 'pdf' || media.type === 'audio' || media.type === 'voice' || media.type === 'video')) {
-        contentParts.push({
-          inlineData: {
-            data: media.data,
-            mimeType: media.mimeType
-          }
-        });
+        if (media.type === 'image') {
+          const opt = await optimizeImageForAi(media.data, media.mimeType);
+          contentParts.push({
+            inlineData: {
+              data: opt.data,
+              mimeType: opt.mimeType
+            }
+          });
+        } else {
+          contentParts.push({
+            inlineData: {
+              data: media.data,
+              mimeType: media.mimeType
+            }
+          });
+        }
       }
     }
 
@@ -3023,14 +2758,24 @@ async function processMedia(sockParam, chatId, mediaFiles, isFollowUp = false, p
     }
 
     const contentParts = [];
-    binaryMedia.forEach(media => {
-      contentParts.push({
-        inlineData: {
-          data: media.data,
-          mimeType: media.mimeType
-        }
-      });
-    });
+    for (const media of binaryMedia) {
+      if (media.type === 'image') {
+        const opt = await optimizeImageForAi(media.data, media.mimeType);
+        contentParts.push({
+          inlineData: {
+            data: opt.data,
+            mimeType: opt.mimeType
+          }
+        });
+      } else {
+        contentParts.push({
+          inlineData: {
+            data: media.data,
+            mimeType: media.mimeType
+          }
+        });
+      }
+    }
 
     let promptParts = [];
     if (counts.images > 0) promptParts.push(`${counts.images} image(s)`);
@@ -3124,9 +2869,8 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
       requestContent = [promptText];
     }
 
-    // 🔗 STORE SOURCE MEDIA FOR VIEWER
-    const viewerId = storeMediaForViewer(mediaFiles);
-    const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
+    // 📥 Compute deterministic Input Media Summary (Zero AI Hallucination)
+    const mediaSummary = formatInputMediaSummary(counts);
 
     // --- STEP 1: Generate Primary Clinical Profile ---
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
@@ -3143,9 +2887,7 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
       if (jsonData) {
         step1Text += formatJsonBlock(jsonData);
       }
-      if (viewerUrl) {
-        step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`;
-      }
+      step1Text += `\n\n${mediaSummary}`;
       // Add sender contact for auto-group routing using @mention
       if (targetChatId) {
         const senderContact = formatSenderContact(senderId, senderName);
@@ -3180,9 +2922,7 @@ ${primaryResponseText}
       // Build mentions array for secondary message
       const step2Mentions = getValidMentions(senderId);
       let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
-      if (viewerUrl && destinationChatId.endsWith('@g.us')) {
-        finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
-      }
+      finalSecondaryText += `\n\n${mediaSummary}`;
       if (targetChatId) {
         const senderContact = formatSenderContact(senderId, senderName);
         finalSecondaryText += senderContact.text;
@@ -3256,10 +2996,8 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       finalResponseText += formatJsonBlock(jsonData);
     }
 
-    // 🔗 Append viewer URL to response (SKIP for DMs to bypass spam filters)
-    if (viewerUrl && destinationChatId.endsWith('@g.us')) {
-      finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
-    }
+    // 📥 Append deterministic Input Media Summary
+    finalResponseText += `\n\n${mediaSummary}`;
 
     // Build mentions array
     const finalMentions = getValidMentions(senderId);
@@ -3337,7 +3075,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
 
 
 console.log('\n╔══════════════════════════════════════════════════════════╗');
-console.log('║         WhatsApp Clinical Profile Bot v3.4              ║');
+console.log('║         WhatsApp Clinical Profile Bot v3.5              ║');
 console.log('║                                                        ║');
 console.log('║  📷 Images 📄 PDFs 🎤 Voice 🎵 Audio 🎬 Video 💬 Text ║');
 console.log('║                                                        ║');
@@ -3347,7 +3085,8 @@ console.log('║  🔀 SMART BATCHING: Splits distinct patients automatically║
 console.log('║  🎥 SMART VIDEO: Oversamples & Picks Sharpest Frames   ║');
 console.log('║      Use: . (3fps), .2 (2fps), .1 (1fps)               ║');
 console.log('║  🧠 SECONDARY ANALYSIS: Use .. (double dot) for Chain  ║');
-console.log('║  🔗 SOURCE VIEWER: Each response has a 12h media link  ║');
+console.log('║  📥 INPUT SUMMARY: Code-verified media count in report ║');
+console.log('║  🗜️ EGRESS SAVER: In-memory image compression active   ║');
 console.log('║  🔧 AUTO-HEAL: Signal session key auto-repair + 428 fix║');
 console.log('║  🆔 DEDUPLICATION: Prevents duplicate message processing║');
 console.log('║  📋 JSON SUMMARY: Age/Sex/Study/Brief in every response║');
@@ -3391,6 +3130,8 @@ export {
   runStartupRecovery,
   downloadMediaWithRetry,
   extractFramesFromVideo,
+  formatInputMediaSummary,
+  optimizeImageForAi,
   processMedia,
   connectMongoDB,
   activeProcessingUsers,
