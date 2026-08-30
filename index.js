@@ -249,9 +249,10 @@ async function optimizeImageForAi(base64Data, mimeType) {
     if (inputBuffer.length < 50000) {
       return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
     }
+    // 1280px width + 80% quality ensures 100% crisp medical text & scan details for Gemini
     const compressed = await sharp(inputBuffer)
-      .resize({ width: 1024, withoutEnlargement: true })
-      .jpeg({ quality: 70, mozjpeg: true })
+      .resize({ width: 1280, withoutEnlargement: true })
+      .jpeg({ quality: 80, mozjpeg: true })
       .toBuffer();
     // Only use compressed if it's actually smaller
     if (compressed.length < inputBuffer.length) {
