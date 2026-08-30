@@ -162,17 +162,27 @@ IMPORTANT: Always identify whether the user is asking a question or providing ad
 // ======================================================================
 const mediaViewerStore = new Map();
 
-function storeMediaForViewer(mediaFiles) {
+async function storeMediaForViewer(mediaFiles) {
   const viewerId = crypto.randomBytes(16).toString('hex');
   const expiresAt = Date.now() + (CONFIG.MEDIA_VIEWER_EXPIRY_MS || 12 * 60 * 60 * 1000);
 
   const viewableMedia = [];
   for (const m of mediaFiles) {
     if (m.type === 'image' || m.type === 'pdf' || m.type === 'audio' || m.type === 'voice' || m.type === 'video') {
+      let dataToStore = m.data;
+      let mime = m.mimeType;
+      // Store compressed image to save egress when opened in browser
+      if (m.type === 'image' && m.data) {
+        try {
+          const opt = await optimizeImageForAi(m.data, m.mimeType);
+          dataToStore = opt.data;
+          mime = opt.mimeType;
+        } catch (_) {}
+      }
       viewableMedia.push({
         type: m.type,
-        data: m.data,
-        mimeType: m.mimeType,
+        data: dataToStore,
+        mimeType: mime,
         caption: m.caption || '',
         fileName: m.fileName || ''
       });
@@ -3254,11 +3264,9 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
     // 📥 Compute deterministic Input Media Summary (Zero AI Hallucination)
     const mediaSummary = formatInputMediaSummary(counts);
 
-    // 🔗 MEDIA VIEWER DISABLED — saves massive bandwidth
-    // Original media is already in WhatsApp, no need to re-serve via HTTP
-    // const viewerId = storeMediaForViewer(mediaFiles);
-    // const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
-    const viewerUrl = null;
+    // 🔗 STORE SOURCE MEDIA FOR VIEWER (Compressed Lazy-Loading Active)
+    const viewerId = await storeMediaForViewer(mediaFiles);
+    const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
 
     // --- STEP 1: Generate Primary Clinical Profile ---
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
