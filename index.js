@@ -37,6 +37,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
+  PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
   // 🔴 Model Chain Configuration
   GEMINI_MODEL: 'gemini-3.7-flash',
   GEMINI_MODEL_FALLBACK_1: 'gemini-3.5-flash',
@@ -209,7 +210,7 @@ setInterval(() => {
   if (cleaned > 0) {
     log('🧹', `Periodic cleanup: removed ${cleaned} expired media viewer(s)`);
   }
-}, 60 * 60 * 1000);
+}, 60 * 60 * 1000).unref();
 
 // ======================================================================
 // 📥 DETERMINISTIC INPUT MEDIA SUMMARY (Code-Generated, Zero-Hallucination)
@@ -331,7 +332,7 @@ function rotateApiKeys() {
   }
 }
 
-setInterval(rotateApiKeys, 2 * 60 * 60 * 1000);
+setInterval(rotateApiKeys, 2 * 60 * 60 * 1000).unref();
 // ======================================================================
 
 function isAudioMime(mimeType) {
@@ -450,38 +451,87 @@ async function useMongoDBAuthState() {
     SessionModel = mongoose.model('Session', sessionSchema);
   }
 
+  const keyCache = new Map();
+  let pendingWrites = new Map();
+  let flushTimer = null;
+
+  const serializeData = (data) => {
+    return JSON.stringify(data, (k, v) => {
+      if (typeof v === 'bigint') return { type: 'BigInt', value: v.toString() };
+      if (v instanceof Uint8Array) return { type: 'Uint8Array', value: Array.from(v) };
+      if (Buffer.isBuffer(v)) return { type: 'Buffer', value: Array.from(v) };
+      return v;
+    });
+  };
+
+  const deserializeData = (valueStr) => {
+    if (!valueStr) return null;
+    return JSON.parse(valueStr, (k, v) => {
+      if (v && typeof v === 'object') {
+        if (v.type === 'BigInt') return BigInt(v.value);
+        if (v.type === 'Uint8Array') return new Uint8Array(v.data || v.value);
+        if (v.type === 'Buffer') return Buffer.from(v.data || v.value);
+      }
+      return v;
+    });
+  };
+
+  const flushPendingWrites = async () => {
+    if (pendingWrites.size === 0) return;
+    const batch = Array.from(pendingWrites.entries());
+    pendingWrites.clear();
+
+    const bulkOps = batch.map(([key, val]) => {
+      if (val === null) {
+        return { deleteOne: { filter: { key } } };
+      }
+      return {
+        updateOne: {
+          filter: { key },
+          update: { $set: { key, value: val, updatedAt: new Date() } },
+          upsert: true
+        }
+      };
+    });
+
+    try {
+      await SessionModel.bulkWrite(bulkOps, { ordered: false });
+    } catch (err) {
+      log('⚠️', `MongoDB bulk write error: ${err.message}`);
+    }
+  };
+
+  const scheduleFlush = () => {
+    if (!flushTimer) {
+      flushTimer = setTimeout(async () => {
+        flushTimer = null;
+        await flushPendingWrites();
+      }, 3000);
+    }
+  };
+
   const writeData = async (key, data) => {
     try {
-      const serialized = JSON.stringify(data, (k, v) => {
-        if (typeof v === 'bigint') return { type: 'BigInt', value: v.toString() };
-        if (v instanceof Uint8Array) return { type: 'Uint8Array', value: Array.from(v) };
-        if (Buffer.isBuffer(v)) return { type: 'Buffer', value: Array.from(v) };
-        return v;
-      });
-
-      await SessionModel.findOneAndUpdate(
-        { key },
-        { key, value: serialized, updatedAt: new Date() },
-        { upsert: true, new: true }
-      );
+      const serialized = serializeData(data);
+      keyCache.set(key, data);
+      pendingWrites.set(key, serialized);
+      scheduleFlush();
     } catch (error) {
-      log('❌', `MongoDB write error: ${error.message}`);
+      log('❌', `MongoDB cache error: ${error.message}`);
     }
   };
 
   const readData = async (key) => {
     try {
+      if (keyCache.has(key)) {
+        return keyCache.get(key);
+      }
       const doc = await SessionModel.findOne({ key });
       if (!doc || !doc.value) return null;
 
-      return JSON.parse(doc.value, (k, v) => {
-        if (v && typeof v === 'object') {
-          if (v.type === 'BigInt') return BigInt(v.value);
-          if (v.type === 'Uint8Array') return new Uint8Array(v.data || v.value);
-          if (v.type === 'Buffer') return Buffer.from(v.data || v.value);
-        }
-        return v;
-      });
+      const parsed = deserializeData(doc.value);
+      if (parsed) keyCache.set(key, parsed);
+      return parsed;
     } catch (error) {
       log('❌', `MongoDB read error: ${error.message}`);
       return null;
@@ -490,7 +540,9 @@ async function useMongoDBAuthState() {
 
   const removeData = async (key) => {
     try {
-      await SessionModel.deleteOne({ key });
+      keyCache.delete(key);
+      pendingWrites.set(key, null);
+      scheduleFlush();
     } catch (error) {
       log('❌', `MongoDB delete error: ${error.message}`);
     }
@@ -498,6 +550,8 @@ async function useMongoDBAuthState() {
 
   const clearAll = async () => {
     try {
+      keyCache.clear();
+      pendingWrites.clear();
       await SessionModel.deleteMany({});
       log('🗑', 'Cleared all MongoDB sessions');
     } catch (error) {
@@ -505,9 +559,14 @@ async function useMongoDBAuthState() {
     }
   };
 
-  // 🔧 NEW: Clear only signal session keys, keep auth creds
   const clearSessionKeys = async () => {
     try {
+      for (const k of Array.from(keyCache.keys())) {
+        if (k.startsWith('key_')) keyCache.delete(k);
+      }
+      for (const k of Array.from(pendingWrites.keys())) {
+        if (k.startsWith('key_')) pendingWrites.delete(k);
+      }
       const result = await SessionModel.deleteMany({
         key: { $regex: /^key_/ }
       });
@@ -522,7 +581,13 @@ async function useMongoDBAuthState() {
   if (!creds) {
     const { initAuthCreds } = await import('@whiskeysockets/baileys');
     creds = initAuthCreds();
-    await writeData('auth_creds', creds);
+    const serialized = serializeData(creds);
+    await SessionModel.findOneAndUpdate(
+      { key: 'auth_creds' },
+      { key: 'auth_creds', value: serialized, updatedAt: new Date() },
+      { upsert: true, new: true }
+    );
+    keyCache.set('auth_creds', creds);
     log('🔑', 'Created new auth credentials');
   } else {
     log('🔑', 'Loaded existing auth credentials from MongoDB');
@@ -534,33 +599,64 @@ async function useMongoDBAuthState() {
       keys: {
         get: async (type, ids) => {
           const data = {};
+          const missingIds = [];
           for (const id of ids) {
-            const value = await readData(`key_${type}_${id}`);
-            if (value) {
-              data[id] = value;
+            const key = `key_${type}_${id}`;
+            if (keyCache.has(key)) {
+              data[id] = keyCache.get(key);
+            } else {
+              missingIds.push(id);
+            }
+          }
+
+          if (missingIds.length > 0) {
+            try {
+              const keysToFind = missingIds.map(id => `key_${type}_${id}`);
+              const docs = await SessionModel.find({ key: { $in: keysToFind } });
+              for (const doc of docs) {
+                const id = doc.key.replace(`key_${type}_`, '');
+                const parsed = deserializeData(doc.value);
+                if (parsed) {
+                  data[id] = parsed;
+                  keyCache.set(doc.key, parsed);
+                }
+              }
+            } catch (err) {
+              log('⚠️', `MongoDB batch get error: ${err.message}`);
             }
           }
           return data;
         },
         set: async (data) => {
-          const tasks = [];
           for (const [type, entries] of Object.entries(data)) {
             for (const [id, value] of Object.entries(entries)) {
               const key = `key_${type}_${id}`;
               if (value) {
-                tasks.push(writeData(key, value));
+                keyCache.set(key, value);
+                pendingWrites.set(key, serializeData(value));
               } else {
-                tasks.push(removeData(key));
+                keyCache.delete(key);
+                pendingWrites.set(key, null);
               }
             }
           }
-          await Promise.all(tasks);
+          scheduleFlush();
         }
       }
     },
     saveCreds: async () => {
-      await writeData('auth_creds', creds);
-      log('💾', 'Credentials saved to MongoDB');
+      try {
+        const serialized = serializeData(creds);
+        await SessionModel.findOneAndUpdate(
+          { key: 'auth_creds' },
+          { key: 'auth_creds', value: serialized, updatedAt: new Date() },
+          { upsert: true, new: true }
+        );
+        keyCache.set('auth_creds', creds);
+        log('💾', 'Credentials saved to MongoDB');
+      } catch (e) {
+        log('❌', `Save creds error: ${e.message}`);
+      }
     },
     clearAll,
     clearSessionKeys
@@ -602,6 +698,7 @@ const pendingEmptyMessages = new Map(); // msgId -> { msg, retryCount, chatId, t
 let sock = null;
 let isConnected = false;
 let qrCodeDataURL = null;
+let pairingCode = null;
 let processedCount = 0;
 let botStatus = 'Starting...';
 let lastError = null;
@@ -1431,6 +1528,17 @@ app.get('/', async (req, res) => {
                 </p>
             </div>
     `;
+  } else if (pairingCode) {
+    html += `
+            <div class="status waiting">🔢 PAIRING CODE</div>
+            <div style="background: white; color: #128C7E; font-size: 28px; font-weight: bold; letter-spacing: 4px; padding: 15px 20px; border-radius: 12px; margin: 20px 0; display: inline-block;">
+                ${pairingCode}
+            </div>
+            <div class="info-box">
+                <h3>📋 To connect with Pairing Code:</h3>
+                <p>WhatsApp → ⋮ Menu → Linked Devices → Link a Device → Link with phone number instead → Enter code above</p>
+            </div>
+    `;
   } else if (qrCodeDataURL) {
     html += `
             <div class="status waiting">📲 SCAN QR CODE</div>
@@ -1463,6 +1571,7 @@ app.get('/health', (req, res) => {
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
+    uptime: process.uptime ? process.uptime() : 0,
     timestamp: new Date().toISOString()
   });
 });
@@ -1487,9 +1596,14 @@ function getBaseUrl() {
 }
 // ======================================================================
 
-app.listen(PORT, () => {
-  log('🌐', `Web server running on port ${PORT}`);
-});
+const isMainModule = Boolean(process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index')));
+
+let server = null;
+if (process.env.NODE_ENV !== 'test' && isMainModule) {
+  server = app.listen(PORT, () => {
+    log('🌐', `Web server running on port ${PORT}`);
+  });
+}
 
 // ======================================================================
 // 🔗 HELPER: Parse JSON block from AI response
@@ -1729,19 +1843,42 @@ async function startBot() {
       }
     });
 
+    // 📱 Mobile Phone Number Pairing Code Flow
+    const activePairingNumber = CONFIG.PAIRING_NUMBER || process.env.PAIRING_NUMBER;
+    if (activePairingNumber && !state?.creds?.registered && typeof sock.requestPairingCode === 'function') {
+      setTimeout(async () => {
+        try {
+          const cleanNumber = String(activePairingNumber).replace(/[^0-9]/g, '');
+          if (cleanNumber) {
+            log('🔢', `Requesting pairing code for phone number: ${cleanNumber}`);
+            pairingCode = await sock.requestPairingCode(cleanNumber);
+            botStatus = `Pairing Code: ${pairingCode}`;
+            log('🔢', '╔══════════════════════════════════════════╗');
+            log('🔢', `║  WHATSAPP PAIRING CODE: ${pairingCode}  ║`);
+            log('🔢', '╚══════════════════════════════════════════╝');
+          }
+        } catch (err) {
+          log('❌', `Pairing code request error: ${err.message}`);
+        }
+      }, 3000);
+    }
+
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
         try {
-          botStatus = 'QR Code ready';
           qrCodeDataURL = await QRCode.toDataURL(qr, {
             width: 300,
             margin: 2,
             color: { dark: '#128C7E', light: '#FFFFFF' }
           });
-          isConnected = false;
-          log('📱', 'QR Code generated - please scan!');
+          const hasPairing = Boolean(pairingCode || CONFIG.PAIRING_NUMBER || process.env.PAIRING_NUMBER);
+          if (!hasPairing) {
+            botStatus = 'QR Code ready';
+            isConnected = false;
+            log('📱', 'QR Code generated - please scan!');
+          }
         } catch (err) {
           log('❌', `QR generation error: ${err.message}`);
           lastError = err.message;
@@ -1751,6 +1888,7 @@ async function startBot() {
       if (connection === 'close') {
         isConnected = false;
         qrCodeDataURL = null;
+        pairingCode = null;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.output?.payload?.message || 'Unknown';
@@ -1783,6 +1921,7 @@ async function startBot() {
       } else if (connection === 'open') {
         isConnected = true;
         qrCodeDataURL = null;
+        pairingCode = null;
         botStatus = 'Connected';
 
         // 🔧 Reset decryption failure counter on successful connection
@@ -1965,7 +2104,7 @@ setInterval(() => {
   if (cleaned > 0) {
     log('🧹', `Cleaned ${cleaned} stale pending empty message(s)`);
   }
-}, 60000);
+}, 60000).unref();
 // ======================================================================
 
 /**
@@ -3417,6 +3556,32 @@ function setDownloadMediaMessageMock(mockFn) {
   downloadMediaMessage = mockFn;
 }
 
+function getPairingCode() {
+  return pairingCode;
+}
+
+function setPairingCode(code) {
+  pairingCode = code;
+}
+
+function getSock() {
+  return sock;
+}
+
+async function requestPairingCodeForNumber(phoneNumber) {
+  const targetSock = sock;
+  if (!targetSock) throw new Error('WhatsApp socket not initialized');
+  const targetNumber = String(phoneNumber || CONFIG.PAIRING_NUMBER || process.env.PAIRING_NUMBER || '').replace(/[^0-9]/g, '');
+  if (!targetNumber) throw new Error('Invalid phone number for pairing code');
+  if (typeof targetSock.requestPairingCode === 'function') {
+    pairingCode = await targetSock.requestPairingCode(targetNumber);
+    botStatus = `Pairing Code: ${pairingCode}`;
+    log('🔢', `WhatsApp Pairing Code: ${pairingCode}`);
+    return pairingCode;
+  }
+  throw new Error('requestPairingCode is not supported on socket');
+}
+
 export {
   CONFIG,
   mediaViewerStore,
@@ -3442,7 +3607,23 @@ export {
   activeProcessingUsers,
   setMockSock,
   setDownloadMediaMessageMock,
-  setGenerateGeminiContentMock
+  setGenerateGeminiContentMock,
+  requestPairingCodeForNumber,
+  getPairingCode,
+  setPairingCode,
+  getSock,
+  app,
+  server,
+  startBot,
+  generateGeminiContent,
+  parseJsonFromResponse,
+  stripJsonFromResponse,
+  formatJsonBlock,
+  isMessageAlreadyProcessed,
+  processedMessageIds,
+  groupMediaSmartly,
+  nukeSessionKeysFromMongo,
+  useMongoDBAuthState
 };
 
 if (process.env.NODE_ENV !== 'test' && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index'))) {
