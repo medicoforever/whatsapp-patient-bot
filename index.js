@@ -53,6 +53,7 @@ const CONFIG = {
     MRI_TARGET: process.env.GROUP_MRI_TARGET
   },
 
+  MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000, // 12 hours
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
   AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
 
@@ -155,6 +156,62 @@ IMPORTANT: Always identify whether the user is asking a question or providing ad
 };
 
 // ======================================================================
+// 🔗 MEDIA VIEWER STORE (In-Memory with 12hr Expiry)
+// ======================================================================
+const mediaViewerStore = new Map();
+
+function storeMediaForViewer(mediaFiles) {
+  const viewerId = crypto.randomBytes(16).toString('hex');
+  const expiresAt = Date.now() + (CONFIG.MEDIA_VIEWER_EXPIRY_MS || 12 * 60 * 60 * 1000);
+
+  const viewableMedia = [];
+  for (const m of mediaFiles) {
+    if (m.type === 'image' || m.type === 'pdf' || m.type === 'audio' || m.type === 'voice' || m.type === 'video') {
+      viewableMedia.push({
+        type: m.type,
+        data: m.data,
+        mimeType: m.mimeType,
+        caption: m.caption || '',
+        fileName: m.fileName || ''
+      });
+    }
+  }
+
+  if (viewableMedia.length === 0) return null;
+
+  mediaViewerStore.set(viewerId, {
+    media: viewableMedia,
+    expiresAt: expiresAt,
+    createdAt: Date.now()
+  });
+
+  log('🔗', `Media viewer created: ${viewerId} (${viewableMedia.length} files, expires in 12h)`);
+
+  setTimeout(() => {
+    if (mediaViewerStore.has(viewerId)) {
+      mediaViewerStore.delete(viewerId);
+      log('🧹', `Media viewer expired and cleaned: ${viewerId}`);
+    }
+  }, (CONFIG.MEDIA_VIEWER_EXPIRY_MS || 12 * 60 * 60 * 1000));
+
+  return viewerId;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [id, entry] of mediaViewerStore) {
+    if (now >= entry.expiresAt) {
+      mediaViewerStore.delete(id);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    log('🧹', `Periodic cleanup: removed ${cleaned} expired media viewer(s)`);
+  }
+}, 60 * 60 * 1000);
+
+// ======================================================================
 // 📥 DETERMINISTIC INPUT MEDIA SUMMARY (Code-Generated, Zero-Hallucination)
 // ======================================================================
 function formatInputMediaSummary(counts) {
@@ -181,64 +238,10 @@ function formatInputMediaSummary(counts) {
 }
 
 // ======================================================================
-// 🗜️ IN-MEMORY IMAGE COMPRESSION (Reduces Egress Bandwidth by 90%+)
+// 🖼️ IMAGE HANDLER (Full Quality Preserved)
 // ======================================================================
 async function optimizeImageForAi(base64Data, mimeType) {
-  // If not image or already very small (< 250KB base64), skip compression
-  if (!mimeType?.startsWith('image/') || !base64Data || base64Data.length < 350000) {
-    return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
-  }
-
-  return new Promise((resolve) => {
-    const tempId = Math.random().toString(36).substring(7);
-    const tempDir = os.tmpdir();
-    const inputExt = mimeType.includes('png') ? '.png' : '.jpg';
-    const inputPath = join(tempDir, `opt_in_${tempId}${inputExt}`);
-    const outputPath = join(tempDir, `opt_out_${tempId}.jpg`);
-
-    const cleanup = () => {
-      try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (e) {}
-      try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (e) {}
-    };
-
-    try {
-      const buffer = Buffer.from(base64Data, 'base64');
-      fs.writeFileSync(inputPath, buffer);
-
-      ffmpeg(inputPath)
-        .outputOptions([
-          "-vf scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease",
-          '-q:v 3'
-        ])
-        .output(outputPath)
-        .on('end', () => {
-          try {
-            if (fs.existsSync(outputPath)) {
-              const optBuffer = fs.readFileSync(outputPath);
-              cleanup();
-              if (optBuffer.length < buffer.length) {
-                log('🗜️', `Image optimized: ${(buffer.length / 1024).toFixed(0)}KB ➔ ${(optBuffer.length / 1024).toFixed(0)}KB (${(((buffer.length - optBuffer.length) / buffer.length) * 100).toFixed(0)}% bandwidth saved)`);
-                return resolve({ data: optBuffer.toString('base64'), mimeType: 'image/jpeg' });
-              }
-            }
-            cleanup();
-            resolve({ data: base64Data, mimeType });
-          } catch (readErr) {
-            cleanup();
-            resolve({ data: base64Data, mimeType });
-          }
-        })
-        .on('error', (err) => {
-          cleanup();
-          log('⚠️', `Image optimization skipped (fallback to original): ${err.message}`);
-          resolve({ data: base64Data, mimeType });
-        })
-        .run();
-    } catch (err) {
-      cleanup();
-      resolve({ data: base64Data, mimeType });
-    }
-  });
+  return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
 }
 
 // ======================================================================
@@ -1025,6 +1028,267 @@ const app = express();
 app.use(compression());
 const PORT = process.env.PORT || 3000;
 
+// ======================================================================
+// 🔗 MEDIA VIEWER ROUTE
+// ======================================================================
+app.get('/view/:viewerId', (req, res) => {
+  const { viewerId } = req.params;
+  const entry = mediaViewerStore.get(viewerId);
+
+  if (!entry) {
+    return res.status(404).send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Link Expired</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+            .container { text-align: center; padding: 40px; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            h1 { color: #e94560; }
+            p { color: #aaa; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="icon">⏰</div>
+            <h1>Link Expired or Invalid</h1>
+            <p>This media viewer link has expired (12 hour limit) or does not exist.</p>
+        </div>
+    </body>
+    </html>`);
+  }
+
+  if (Date.now() >= entry.expiresAt) {
+    mediaViewerStore.delete(viewerId);
+    return res.status(410).send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Link Expired</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #1a1a2e; color: white; }
+            .container { text-align: center; padding: 40px; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            h1 { color: #e94560; }
+            p { color: #aaa; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="icon">⏰</div>
+            <h1>Link Expired</h1>
+            <p>This media viewer link has expired (12 hour limit).</p>
+        </div>
+    </body>
+    </html>`);
+  }
+
+  const media = entry.media;
+  const remainingMs = entry.expiresAt - Date.now();
+  const remainingHours = Math.floor(remainingMs / 3600000);
+  const remainingMins = Math.floor((remainingMs % 3600000) / 60000);
+
+  let mediaHtml = '';
+  media.forEach((m, index) => {
+    const caption = m.caption ? `<div class="caption">${m.caption.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+    const fileName = m.fileName ? `<div class="filename">${m.fileName.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+
+    if (m.type === 'image') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Image</div>
+            ${caption}${fileName}
+            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+        </div>`;
+    } else if (m.type === 'pdf') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — PDF</div>
+            ${caption}${fileName}
+            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
+            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+        </div>`;
+    } else if (m.type === 'audio' || m.type === 'voice') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
+            ${caption}${fileName}
+            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+        </div>`;
+    } else if (m.type === 'video') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Video</div>
+            ${caption}${fileName}
+            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+        </div>`;
+    }
+  });
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Source Media Viewer</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #0f0f1a;
+                color: #e0e0e0;
+                padding: 10px;
+            }
+            .header {
+                text-align: center;
+                padding: 20px 10px;
+                background: linear-gradient(135deg, #1a1a2e, #16213e);
+                border-radius: 12px;
+                margin-bottom: 15px;
+                border: 1px solid #333;
+            }
+            .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
+            .header .meta { font-size: 12px; color: #888; }
+            .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
+            .media-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 12px;
+            }
+            .media-item {
+                background: #1a1a2e;
+                border-radius: 10px;
+                overflow: hidden;
+                border: 1px solid #2a2a4a;
+                transition: transform 0.2s;
+            }
+            .media-item:hover { transform: scale(1.01); border-color: #25D366; }
+            .media-item img {
+                width: 100%;
+                display: block;
+                cursor: pointer;
+                transition: opacity 0.2s;
+            }
+            .media-item img:hover { opacity: 0.9; }
+            .media-index {
+                padding: 8px 12px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #25D366;
+                background: #0f0f1a;
+                border-bottom: 1px solid #2a2a4a;
+                transition: opacity 0.2s;
+            }
+            .caption {
+                padding: 6px 12px;
+                font-size: 12px;
+                color: #ccc;
+                background: #16213e;
+                font-style: italic;
+            }
+            .filename {
+                padding: 4px 12px;
+                font-size: 11px;
+                color: #888;
+            }
+            .pdf-frame {
+                width: 100%;
+                height: 500px;
+                border: none;
+            }
+            .download-btn {
+                display: block;
+                text-align: center;
+                padding: 10px;
+                background: #25D366;
+                color: #000;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            .download-btn:hover { background: #1da851; }
+
+            .fullscreen-overlay {
+                display: none;
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                background: rgba(0,0,0,0.95);
+                z-index: 9999;
+                justify-content: center;
+                align-items: center;
+                cursor: zoom-out;
+            }
+            .fullscreen-overlay.active { display: flex; }
+            .fullscreen-overlay img {
+                max-width: 95vw;
+                max-height: 95vh;
+                object-fit: contain;
+            }
+
+            @media (max-width: 600px) {
+                .media-grid { grid-template-columns: 1fr; }
+                body { padding: 5px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🔍 Source Media Viewer</h1>
+            <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
+            <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
+        </div>
+
+        <div class="media-grid">
+            ${mediaHtml}
+        </div>
+
+        <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
+            <img id="fsImage" src="" alt="Fullscreen">
+        </div>
+
+        <script>
+            function openFullscreen(img) {
+                const overlay = document.getElementById('fsOverlay');
+                const fsImg = document.getElementById('fsImage');
+                fsImg.src = img.src;
+                overlay.classList.add('active');
+            }
+            function closeFullscreen() {
+                document.getElementById('fsOverlay').classList.remove('active');
+            }
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeFullscreen();
+            });
+        </script>
+    </body>
+    </html>`);
+});
+
+app.get('/media/:viewerId/:index', (req, res) => {
+  const { viewerId, index } = req.params;
+  const idx = parseInt(index);
+  const entry = mediaViewerStore.get(viewerId);
+
+  if (!entry || Date.now() >= entry.expiresAt) {
+    return res.status(404).send('Not found or expired');
+  }
+
+  if (isNaN(idx) || idx < 0 || idx >= entry.media.length) {
+    return res.status(404).send('Invalid index');
+  }
+
+  const m = entry.media[idx];
+  const buffer = Buffer.from(m.data, 'base64');
+  res.setHeader('Content-Type', m.mimeType);
+  res.setHeader('Content-Length', buffer.length);
+  res.send(buffer);
+});
+// ======================================================================
+
 app.get('/', async (req, res) => {
   let stats = { users: 0, images: 0, pdfs: 0, audio: 0, video: 0, texts: 0, total: 0 };
   for (const [chatId, _] of chatMediaBuffers) {
@@ -1147,6 +1411,7 @@ app.get('/', async (req, res) => {
                 <div class="stat"><div class="stat-value">${stats.users}</div><div class="stat-label">Active Chats</div></div>
                 <div class="stat"><div class="stat-value">${stats.total}</div><div class="stat-label">Buffered</div></div>
                 <div class="stat"><div class="stat-value">${processedCount}</div><div class="stat-label">✅ Done</div></div>
+                <div class="stat"><div class="stat-value">${mediaViewerStore.size}</div><div class="stat-label">🔗 Viewers</div></div>
             </div>
             <div class="info-box">
                 <h3>✨ Features:</h3>
@@ -1160,6 +1425,7 @@ app.get('/', async (req, res) => {
                     <strong>🧠 Secondary Analysis:</strong><br>
                     - Send <strong>..</strong> (double dot) for Chained Analysis<br>
                     <strong>📥 Input Media Summary:</strong> Code-verified input count included in each report<br>
+                    <strong>🔗 Source Viewer:</strong> Each response has a 12h media link<br>
                     <strong>🔧 Auto-Heal:</strong> Signal session key auto-repair active<br>
                     <strong>↩️ Reply:</strong> Reply to bot to ask questions.
                 </p>
@@ -1193,12 +1459,33 @@ app.get('/health', (req, res) => {
     mode: 'universal',
     processedCount,
     activeKeys: CONFIG.API_KEYS.length,
+    activeViewers: mediaViewerStore.size,
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
     timestamp: new Date().toISOString()
   });
 });
+
+// ======================================================================
+// 🔗 HELPER: Get the base URL for viewer links
+// ======================================================================
+function getBaseUrl() {
+  if (process.env.APP_URL) {
+    return process.env.APP_URL.replace(/\/$/, '');
+  }
+  if (process.env.KOYEB_PUBLIC_DOMAIN) {
+    return `https://${process.env.KOYEB_PUBLIC_DOMAIN}`;
+  }
+  if (process.env.SPACE_HOST) {
+    return `https://${process.env.SPACE_HOST}`;
+  }
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '');
+  }
+  return `http://localhost:${PORT}`;
+}
+// ======================================================================
 
 app.listen(PORT, () => {
   log('🌐', `Web server running on port ${PORT}`);
@@ -2872,6 +3159,10 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
     // 📥 Compute deterministic Input Media Summary (Zero AI Hallucination)
     const mediaSummary = formatInputMediaSummary(counts);
 
+    // 🔗 STORE SOURCE MEDIA FOR VIEWER
+    const viewerId = storeMediaForViewer(mediaFiles);
+    const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
+
     // --- STEP 1: Generate Primary Clinical Profile ---
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
     const rawPrimaryResponse = await generateGeminiContent(requestContent, CONFIG.SYSTEM_INSTRUCTION);
@@ -2888,6 +3179,9 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
         step1Text += formatJsonBlock(jsonData);
       }
       step1Text += `\n\n${mediaSummary}`;
+      if (viewerUrl) {
+        step1Text += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+      }
       // Add sender contact for auto-group routing using @mention
       if (targetChatId) {
         const senderContact = formatSenderContact(senderId, senderName);
@@ -2923,6 +3217,9 @@ ${primaryResponseText}
       const step2Mentions = getValidMentions(senderId);
       let finalSecondaryText = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
       finalSecondaryText += `\n\n${mediaSummary}`;
+      if (viewerUrl && destinationChatId.endsWith('@g.us')) {
+        finalSecondaryText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+      }
       if (targetChatId) {
         const senderContact = formatSenderContact(senderId, senderName);
         finalSecondaryText += senderContact.text;
@@ -2998,6 +3295,11 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
 
     // 📥 Append deterministic Input Media Summary
     finalResponseText += `\n\n${mediaSummary}`;
+
+    // 🔗 Append viewer URL to response (for group chats)
+    if (viewerUrl && destinationChatId.endsWith('@g.us')) {
+      finalResponseText += `\n\n🔗 *Source Media:* ${viewerUrl}`;
+    }
 
     // Build mentions array
     const finalMentions = getValidMentions(senderId);
@@ -3117,6 +3419,9 @@ function setDownloadMediaMessageMock(mockFn) {
 
 export {
   CONFIG,
+  mediaViewerStore,
+  storeMediaForViewer,
+  getBaseUrl,
   unwrapMessage,
   pendingEmptyMessages,
   scheduleEmptyMessageRetry,
