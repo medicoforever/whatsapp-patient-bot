@@ -84,7 +84,7 @@ await runAsyncTest('optimizeImageForAi skips non-image mime types', async () => 
 // 3. End-to-End processMedia output format test
 // ----------------------------------------------------------------------
 
-await runAsyncTest('processMedia includes deterministic media summary and NO viewer link', async () => {
+await runAsyncTest('processMedia includes deterministic media summary and source viewer link in group chats', async () => {
   const sentMessages = [];
   const mockSock = {
     sendMessage: async (jid, content) => {
@@ -112,9 +112,9 @@ await runAsyncTest('processMedia includes deterministic media summary and NO vie
   // Verify Media Summary is present
   assert.ok(text.includes('📥 *Input Media:* 2 Images, 1 PDF'), 'Message must contain deterministic media summary');
 
-  // Verify NO media viewer links exist
-  assert.ok(!text.includes('/view/'), 'Message must NOT contain /view/ link');
-  assert.ok(!text.includes('Source Media'), 'Message must NOT contain Source Media link');
+  // Verify Source Media viewer link exists in group
+  assert.ok(text.includes('/view/'), 'Message must contain /view/ link in group chat');
+  assert.ok(text.includes('Source Media'), 'Message must contain Source Media link in group chat');
 });
 
 console.log('\n--------------------------------------------------');
