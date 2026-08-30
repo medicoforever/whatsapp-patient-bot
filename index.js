@@ -3445,7 +3445,7 @@ export {
   setGenerateGeminiContentMock
 };
 
-if (process.env.NODE_ENV !== 'test' && (!process.argv[1] || process.argv[1].endsWith('index.js'))) {
+if (process.env.NODE_ENV !== 'test' && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index'))) {
   (async () => {
     try {
       await connectMongoDB();
