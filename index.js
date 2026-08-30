@@ -42,8 +42,9 @@ const CONFIG = {
   // 🔴 Model Chain Configuration
   GEMINI_MODEL: 'gemini-3.7-flash',
   GEMINI_MODEL_FALLBACK_1: 'gemini-3.6-flash',
-  GEMINI_MODEL_FALLBACK_2: 'gemini-2.5-flash',
-  GEMINI_MODEL_FALLBACK_3: 'gemini-3.5-flash-lite',
+  GEMINI_MODEL_FALLBACK_2: 'gemini-3.5-flash',
+  GEMINI_MODEL_FALLBACK_3: 'gemini-3-flash-preview',
+  GEMINI_MODEL_FALLBACK_4: 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -244,14 +245,14 @@ function formatInputMediaSummary(counts) {
 async function optimizeImageForAi(base64Data, mimeType) {
   try {
     const inputBuffer = Buffer.from(base64Data, 'base64');
-    // Skip tiny images (under 30KB) — not worth compressing
-    if (inputBuffer.length < 30000) {
+    // Skip tiny images (under 50KB) — not worth compressing
+    if (inputBuffer.length < 50000) {
       return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
     }
-    // 1024px width + 72% quality provides crystal-clear medical OCR with minimal bandwidth
+    // 1280px width + 82% quality delivers 100% sharp medical text & scan fidelity (~200KB-350KB)
     const compressed = await sharp(inputBuffer)
-      .resize({ width: 1024, withoutEnlargement: true })
-      .jpeg({ quality: 72, mozjpeg: true })
+      .resize({ width: 1280, withoutEnlargement: true })
+      .jpeg({ quality: 82, mozjpeg: true })
       .toBuffer();
     // Only use compressed if it's actually smaller
     if (compressed.length < inputBuffer.length) {
@@ -2895,100 +2896,86 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
   ];
 
-  const tryModel = async (modelName, useThinking) => {
-    for (let i = 0; i < keys.length; i++) {
-      try {
-        if (i > 0) {
-          log('⚠️', `Waiting 2s before retrying with Backup Key #${i + 1} (${modelName})...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-
-        const genAI = new GoogleGenerativeAI(keys[i]);
-        const modelConfig = {
-          model: modelName,
-          safetySettings: safetySettings
-        };
-        if (systemInstruction) {
-          modelConfig.systemInstruction = systemInstruction;
-        }
-        if (useThinking) {
-          modelConfig.generationConfig = {
-            thinkingConfig: { thinkingLevel: 'HIGH' }
-          };
-        }
-
-        const model = genAI.getGenerativeModel(modelConfig);
-        // Track estimated outbound bytes to Gemini
-        try {
-          const payloadEstimate = JSON.stringify(requestContent).length;
-          totalEgressBytes += payloadEstimate;
-          log('📊', `Gemini egress ~${(payloadEstimate / (1024 * 1024)).toFixed(2)} MB (total: ${(totalEgressBytes / (1024 * 1024)).toFixed(2)} MB)`);
-        } catch (_) {}
-        const result = await model.generateContent(requestContent);
-        const responseText = result.response.text();
-
-        if (!responseText) {
-          const feedback = JSON.stringify(result.response.promptFeedback || {});
-          throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
-        }
-
-        return responseText;
-
-      } catch (error) {
-        lastErrorMsg = error.message;
-        log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
-        // If the model itself is overloaded (503 Service Unavailable), don't waste egress retrying all keys
-        if (error.message && (error.message.includes('503') || error.message.includes('high demand'))) {
-          if (i >= 1) {
-            log('⚠️', `Model ${modelName} is under heavy demand. Fast-switching to next fallback model to save bandwidth...`);
-            break; // Switch to next model immediately!
-          }
-        }
+  const callModelWithKey = async (apiKey, keyIndex, modelName, useThinking) => {
+    try {
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const modelConfig = {
+        model: modelName,
+        safetySettings: safetySettings
+      };
+      if (systemInstruction) {
+        modelConfig.systemInstruction = systemInstruction;
       }
+      if (useThinking) {
+        modelConfig.generationConfig = {
+          thinkingConfig: { thinkingLevel: 'HIGH' }
+        };
+      }
+
+      const model = genAI.getGenerativeModel(modelConfig);
+      // Track estimated outbound bytes to Gemini
+      try {
+        const payloadEstimate = JSON.stringify(requestContent).length;
+        totalEgressBytes += payloadEstimate;
+        log('📊', `Gemini egress ~${(payloadEstimate / (1024 * 1024)).toFixed(2)} MB (total: ${(totalEgressBytes / (1024 * 1024)).toFixed(2)} MB)`);
+      } catch (_) {}
+
+      const result = await model.generateContent(requestContent);
+      const responseText = result.response.text();
+
+      if (!responseText) {
+        const feedback = JSON.stringify(result.response.promptFeedback || {});
+        throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
+      }
+
+      return responseText;
+    } catch (error) {
+      lastErrorMsg = error.message;
+      log('❌', `Key #${keyIndex + 1} (${modelName}) failed: ${error.message}`);
+      return null;
     }
-    return null; 
   };
 
-  // 1. Loop through keys using Primary Model (gemini-3.7-flash)
-  let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
+  // Loop through keys sequentially: on each key, try 3.7 (3x) -> 3.6 -> 3.5 -> 3-preview -> 3.5-flash-lite
+  for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
+    const activeKey = keys[keyIdx];
+    log('🔑', `Attempting with API Key #${keyIdx + 1} (...${activeKey.slice(-4)})...`);
+
+    // 1. Try 3.7 Flash up to 3 times on this key
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt > 1) {
+        log('⚠️', `Retrying ${CONFIG.GEMINI_MODEL} (Attempt ${attempt}/3) on Key #${keyIdx + 1}...`);
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      const res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL, false);
+      if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
+    }
+
+    // 2. Fallback to 3.6 Flash on this key
+    log('⚠️', `Key #${keyIdx + 1} 3.7 failed 3x. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_1} on Key #${keyIdx + 1}...`);
+    let res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_1, false);
+    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
+
+    // 3. Fallback to 3.5 Flash on this key
+    log('⚠️', `Key #${keyIdx + 1} 3.6 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_2} on Key #${keyIdx + 1}...`);
+    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_2, false);
+    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
+
+    // 4. Fallback to 3 Flash preview on this key
+    log('⚠️', `Key #${keyIdx + 1} 3.5 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_3} on Key #${keyIdx + 1}...`);
+    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_3, false);
+    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
+
+    // 5. Fallback to 3.5 Flash-lite with High Thinking on this key
+    log('⚠️', `Key #${keyIdx + 1} 3-preview failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_4} (HIGH Thinking) on Key #${keyIdx + 1}...`);
+    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_4, true);
+    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_4}}_`;
+
+    log('❌', `All models exhausted for Key #${keyIdx + 1}. Switching to next API key in pool...`);
   }
 
-  log('⚠️', `All keys failed for primary model (${CONFIG.GEMINI_MODEL}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_1}...`);
-
-  // 2. Loop through keys using Fallback 1 Model (gemini-3.5-flash)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_1, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
-  }
-
-  log('⚠️', `All keys failed for fallback 1 (${CONFIG.GEMINI_MODEL_FALLBACK_1}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_2}...`);
-
-  // 3. Loop through keys using Fallback 2 Model (gemini-3.6-flash)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_2, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
-  }
-
-  log('⚠️', `All keys failed for fallback 2 (${CONFIG.GEMINI_MODEL_FALLBACK_2}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_3}...`);
-
-  // 4. Loop through keys using Fallback 3 Model (gemini-3-flash-preview)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_3, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
-  }
-
-  log('⚠️', `All keys failed for fallback 3 (${CONFIG.GEMINI_MODEL_FALLBACK_3}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_4} with HIGH thinking...`);
-
-  // 5. Loop through keys using Fallback 4 Model (gemini-3.5-flash-lite)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_4, true);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_4}}_`;
-  }
-
-  // 6. All models failed across all keys
-  throw new Error(`All ${keys.length} API keys failed for all models. Last error: ${lastErrorMsg}`);
+  // All keys and all models failed
+  throw new Error(`All ${keys.length} API keys failed across all fallback models. Last error: ${lastErrorMsg}`);
 }
 
 async function runStartupRecovery() {
