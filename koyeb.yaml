@@ -1,0 +1,10 @@
+# Koyeb Deployment Configuration
+# Deploy via: koyeb app create whatsapp-patient-bot --git github.com/medicoforever/whatsapp-patient-bot --git-branch main --instance-type free --regions was --ports 3000:http --routes /:3000 --checks 3000:http:/health --env NODE_VERSION=20.10.0
+# Or use the Koyeb web dashboard to connect your GitHub repo
+
+name: whatsapp-patient-bot
+type: web
+env: node
+buildCommand: npm install
+startCommand: npm start
+healthCheckPath: /health

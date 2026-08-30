@@ -11,6 +11,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import os from 'os';
 import crypto from 'crypto';
+import sharp from 'sharp';
 
 // Setup FFmpeg path automatically for Render
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -239,10 +240,29 @@ function formatInputMediaSummary(counts) {
 }
 
 // ======================================================================
-// 🖼️ IMAGE HANDLER (Full Quality Preserved)
+// 🖼️ IMAGE HANDLER (Compressed for AI - Bandwidth Optimized)
 // ======================================================================
 async function optimizeImageForAi(base64Data, mimeType) {
-  return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
+  try {
+    const inputBuffer = Buffer.from(base64Data, 'base64');
+    // Skip tiny images (under 50KB) — not worth compressing
+    if (inputBuffer.length < 50000) {
+      return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
+    }
+    const compressed = await sharp(inputBuffer)
+      .resize({ width: 1024, withoutEnlargement: true })
+      .jpeg({ quality: 70, mozjpeg: true })
+      .toBuffer();
+    // Only use compressed if it's actually smaller
+    if (compressed.length < inputBuffer.length) {
+      bandwidthSaved += (inputBuffer.length - compressed.length);
+      return { data: compressed.toString('base64'), mimeType: 'image/jpeg' };
+    }
+    return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
+  } catch (err) {
+    // Fallback: return original if sharp fails (e.g., unsupported format)
+    return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
+  }
 }
 
 // ======================================================================
@@ -700,6 +720,8 @@ let isConnected = false;
 let qrCodeDataURL = null;
 let pairingCode = null;
 let processedCount = 0;
+let bandwidthSaved = 0; // bytes saved by image compression
+let totalEgressBytes = 0; // rough outbound byte counter
 let botStatus = 'Starting...';
 let lastError = null;
 let mongoConnected = false;
@@ -1001,8 +1023,19 @@ function storeContext(chatId, messageId, mediaFiles, response, senderId) {
     toRemove.forEach(([key]) => contexts.delete(key));
   }
 
+  // Strip binary data from stored context to save RAM (80-90% reduction)
+  // For follow-ups, we only need text response + metadata, not original media buffers
+  const lightMediaFiles = mediaFiles.map(m => ({
+    type: m.type,
+    mimeType: m.mimeType,
+    caption: m.caption || '',
+    fileName: m.fileName || '',
+    content: m.type === 'text' ? (m.content || '') : '',
+    // data is intentionally omitted — saves megabytes per context
+  }));
+
   contexts.set(messageId, {
-    mediaFiles: mediaFiles,
+    mediaFiles: lightMediaFiles,
     response: response,
     timestamp: Date.now(),
     senderId: senderId
@@ -1081,18 +1114,18 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
       return reject(err);
     }
 
-    const batchSize = 3;
+    const batchSize = 2;
     const inputFps = targetFps * batchSize;
 
-    const videoFilter = `fps=${inputFps},thumbnail=${batchSize}`;
+    const videoFilter = `fps=${inputFps},thumbnail=${batchSize},scale='min(1024\\,iw):-1'`;
 
-    log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize})`);
+    log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize}, MaxWidth 1024)`);
 
     ffmpeg(inputPath)
       .outputOptions([
         `-vf ${videoFilter}`,
         '-vsync 0',
-        '-q:v 2'
+        '-q:v 5'
       ])
       .output(outputPattern)
       .on('end', () => {
@@ -1126,7 +1159,7 @@ app.use(compression());
 const PORT = process.env.PORT || 3000;
 
 // ======================================================================
-// 🔗 MEDIA VIEWER ROUTE
+// 🔗 MEDIA VIEWER ROUTE (Lazy-Load — Zero Inline Base64)
 // ======================================================================
 app.get('/view/:viewerId', (req, res) => {
   const { viewerId } = req.params;
@@ -1188,43 +1221,16 @@ app.get('/view/:viewerId', (req, res) => {
   const remainingHours = Math.floor(remainingMs / 3600000);
   const remainingMins = Math.floor((remainingMs % 3600000) / 60000);
 
-  let mediaHtml = '';
-  media.forEach((m, index) => {
-    const caption = m.caption ? `<div class="caption">${m.caption.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
-    const fileName = m.fileName ? `<div class="filename">${m.fileName.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+  // Build lightweight metadata array (NO base64 data)
+  const mediaMetadata = media.map((m, index) => ({
+    index,
+    type: m.type,
+    mimeType: m.mimeType,
+    caption: (m.caption || '').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+    fileName: (m.fileName || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }));
 
-    if (m.type === 'image') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — Image</div>
-            ${caption}${fileName}
-            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
-        </div>`;
-    } else if (m.type === 'pdf') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — PDF</div>
-            ${caption}${fileName}
-            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
-            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
-        </div>`;
-    } else if (m.type === 'audio' || m.type === 'voice') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
-            ${caption}${fileName}
-            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
-        </div>`;
-    } else if (m.type === 'video') {
-      mediaHtml += `
-        <div class="media-item">
-            <div class="media-index">#${index + 1} — Video</div>
-            ${caption}${fileName}
-            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
-        </div>`;
-    }
-  });
-
+  // Lightweight HTML that lazy-loads media via /media/ endpoint
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -1233,103 +1239,26 @@ app.get('/view/:viewerId', (req, res) => {
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: #0f0f1a;
-                color: #e0e0e0;
-                padding: 10px;
-            }
-            .header {
-                text-align: center;
-                padding: 20px 10px;
-                background: linear-gradient(135deg, #1a1a2e, #16213e);
-                border-radius: 12px;
-                margin-bottom: 15px;
-                border: 1px solid #333;
-            }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 10px; }
+            .header { text-align: center; padding: 20px 10px; background: linear-gradient(135deg, #1a1a2e, #16213e); border-radius: 12px; margin-bottom: 15px; border: 1px solid #333; }
             .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
             .header .meta { font-size: 12px; color: #888; }
             .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
-            .media-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-                gap: 12px;
-            }
-            .media-item {
-                background: #1a1a2e;
-                border-radius: 10px;
-                overflow: hidden;
-                border: 1px solid #2a2a4a;
-                transition: transform 0.2s;
-            }
+            .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+            .media-item { background: #1a1a2e; border-radius: 10px; overflow: hidden; border: 1px solid #2a2a4a; transition: transform 0.2s; }
             .media-item:hover { transform: scale(1.01); border-color: #25D366; }
-            .media-item img {
-                width: 100%;
-                display: block;
-                cursor: pointer;
-                transition: opacity 0.2s;
-            }
-            .media-item img:hover { opacity: 0.9; }
-            .media-index {
-                padding: 8px 12px;
-                font-size: 11px;
-                font-weight: 600;
-                color: #25D366;
-                background: #0f0f1a;
-                border-bottom: 1px solid #2a2a4a;
-                transition: opacity 0.2s;
-            }
-            .caption {
-                padding: 6px 12px;
-                font-size: 12px;
-                color: #ccc;
-                background: #16213e;
-                font-style: italic;
-            }
-            .filename {
-                padding: 4px 12px;
-                font-size: 11px;
-                color: #888;
-            }
-            .pdf-frame {
-                width: 100%;
-                height: 500px;
-                border: none;
-            }
-            .download-btn {
-                display: block;
-                text-align: center;
-                padding: 10px;
-                background: #25D366;
-                color: #000;
-                text-decoration: none;
-                font-weight: 600;
-                font-size: 13px;
-            }
+            .media-item img { width: 100%; display: block; cursor: pointer; }
+            .media-index { padding: 8px 12px; font-size: 11px; font-weight: 600; color: #25D366; background: #0f0f1a; border-bottom: 1px solid #2a2a4a; }
+            .caption { padding: 6px 12px; font-size: 12px; color: #ccc; background: #16213e; font-style: italic; }
+            .filename { padding: 4px 12px; font-size: 11px; color: #888; }
+            .loading { padding: 40px; text-align: center; color: #888; font-size: 13px; }
+            .pdf-frame { width: 100%; height: 500px; border: none; }
+            .download-btn { display: block; text-align: center; padding: 10px; background: #25D366; color: #000; text-decoration: none; font-weight: 600; font-size: 13px; }
             .download-btn:hover { background: #1da851; }
-
-            .fullscreen-overlay {
-                display: none;
-                position: fixed;
-                top: 0; left: 0;
-                width: 100vw; height: 100vh;
-                background: rgba(0,0,0,0.95);
-                z-index: 9999;
-                justify-content: center;
-                align-items: center;
-                cursor: zoom-out;
-            }
+            .fullscreen-overlay { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.95); z-index: 9999; justify-content: center; align-items: center; cursor: zoom-out; }
             .fullscreen-overlay.active { display: flex; }
-            .fullscreen-overlay img {
-                max-width: 95vw;
-                max-height: 95vh;
-                object-fit: contain;
-            }
-
-            @media (max-width: 600px) {
-                .media-grid { grid-template-columns: 1fr; }
-                body { padding: 5px; }
-            }
+            .fullscreen-overlay img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
+            @media (max-width: 600px) { .media-grid { grid-template-columns: 1fr; } body { padding: 5px; } }
         </style>
     </head>
     <body>
@@ -1338,28 +1267,53 @@ app.get('/view/:viewerId', (req, res) => {
             <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
             <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
         </div>
-
-        <div class="media-grid">
-            ${mediaHtml}
-        </div>
-
+        <div class="media-grid" id="grid"></div>
         <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
             <img id="fsImage" src="" alt="Fullscreen">
         </div>
-
         <script>
+            const meta = ${JSON.stringify(mediaMetadata)};
+            const viewerId = '${viewerId}';
+            const grid = document.getElementById('grid');
+            meta.forEach(m => {
+                const item = document.createElement('div');
+                item.className = 'media-item';
+                const typeLabel = m.type === 'voice' ? 'Voice Note' : m.type.charAt(0).toUpperCase() + m.type.slice(1);
+                let inner = '<div class="media-index">#' + (m.index+1) + ' — ' + typeLabel + '</div>';
+                if (m.caption) inner += '<div class="caption">' + m.caption + '</div>';
+                if (m.fileName) inner += '<div class="filename">' + m.fileName + '</div>';
+                const mediaUrl = '/media/' + viewerId + '/' + m.index;
+                if (m.type === 'image') {
+                    inner += '<img data-src="' + mediaUrl + '" alt="Image ' + (m.index+1) + '" class="lazy" onclick="openFullscreen(this)">';
+                } else if (m.type === 'pdf') {
+                    inner += '<iframe data-src="' + mediaUrl + '" class="pdf-frame lazy-frame"></iframe>';
+                    inner += '<a href="' + mediaUrl + '" download class="download-btn">⬇️ Download PDF</a>';
+                } else if (m.type === 'audio' || m.type === 'voice') {
+                    inner += '<audio controls data-src="' + mediaUrl + '" class="lazy-audio" style="width:100%;"></audio>';
+                } else if (m.type === 'video') {
+                    inner += '<video controls data-src="' + mediaUrl + '" class="lazy-video" style="width:100%;max-height:500px;"></video>';
+                }
+                item.innerHTML = inner;
+                grid.appendChild(item);
+            });
+            // Intersection Observer for lazy loading
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const el = entry.target;
+                        if (el.dataset.src) { el.src = el.dataset.src; delete el.dataset.src; }
+                        observer.unobserve(el);
+                    }
+                });
+            }, { rootMargin: '200px' });
+            document.querySelectorAll('.lazy, .lazy-frame, .lazy-audio, .lazy-video').forEach(el => observer.observe(el));
             function openFullscreen(img) {
                 const overlay = document.getElementById('fsOverlay');
-                const fsImg = document.getElementById('fsImage');
-                fsImg.src = img.src;
+                document.getElementById('fsImage').src = img.src;
                 overlay.classList.add('active');
             }
-            function closeFullscreen() {
-                document.getElementById('fsOverlay').classList.remove('active');
-            }
-            document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') closeFullscreen();
-            });
+            function closeFullscreen() { document.getElementById('fsOverlay').classList.remove('active'); }
+            document.addEventListener('keydown', e => { if (e.key === 'Escape') closeFullscreen(); });
         </script>
     </body>
     </html>`);
@@ -1571,6 +1525,8 @@ app.get('/health', (req, res) => {
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
+    bandwidthSavedMB: (bandwidthSaved / (1024 * 1024)).toFixed(2),
+    totalEgressMB: (totalEgressBytes / (1024 * 1024)).toFixed(2),
     uptime: process.uptime ? process.uptime() : 0,
     timestamp: new Date().toISOString()
   });
@@ -2962,6 +2918,12 @@ async function generateGeminiContent(requestContent, systemInstruction) {
         }
 
         const model = genAI.getGenerativeModel(modelConfig);
+        // Track estimated outbound bytes to Gemini
+        try {
+          const payloadEstimate = JSON.stringify(requestContent).length;
+          totalEgressBytes += payloadEstimate;
+          log('📊', `Gemini egress ~${(payloadEstimate / (1024 * 1024)).toFixed(2)} MB (total: ${(totalEgressBytes / (1024 * 1024)).toFixed(2)} MB)`);
+        } catch (_) {}
         const result = await model.generateContent(requestContent);
         const responseText = result.response.text();
 
@@ -3298,9 +3260,11 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
     // 📥 Compute deterministic Input Media Summary (Zero AI Hallucination)
     const mediaSummary = formatInputMediaSummary(counts);
 
-    // 🔗 STORE SOURCE MEDIA FOR VIEWER
-    const viewerId = storeMediaForViewer(mediaFiles);
-    const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
+    // 🔗 MEDIA VIEWER DISABLED — saves massive bandwidth
+    // Original media is already in WhatsApp, no need to re-serve via HTTP
+    // const viewerId = storeMediaForViewer(mediaFiles);
+    // const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
+    const viewerUrl = null;
 
     // --- STEP 1: Generate Primary Clinical Profile ---
     log('🔄', `Generating Primary Response (Secondary Mode: ${isSecondaryMode})...`);
