@@ -41,10 +41,9 @@ const CONFIG = {
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
   // 🔴 Model Chain Configuration
   GEMINI_MODEL: 'gemini-3.7-flash',
-  GEMINI_MODEL_FALLBACK_1: 'gemini-3.5-flash',
-  GEMINI_MODEL_FALLBACK_2: 'gemini-3.6-flash',
-  GEMINI_MODEL_FALLBACK_3: 'gemini-3-flash-preview',
-  GEMINI_MODEL_FALLBACK_4: 'gemini-3.5-flash-lite',
+  GEMINI_MODEL_FALLBACK_1: 'gemini-3.6-flash',
+  GEMINI_MODEL_FALLBACK_2: 'gemini-2.5-flash',
+  GEMINI_MODEL_FALLBACK_3: 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -245,14 +244,14 @@ function formatInputMediaSummary(counts) {
 async function optimizeImageForAi(base64Data, mimeType) {
   try {
     const inputBuffer = Buffer.from(base64Data, 'base64');
-    // Skip tiny images (under 50KB) — not worth compressing
-    if (inputBuffer.length < 50000) {
+    // Skip tiny images (under 30KB) — not worth compressing
+    if (inputBuffer.length < 30000) {
       return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
     }
-    // 1280px width + 80% quality ensures 100% crisp medical text & scan details for Gemini
+    // 1024px width + 72% quality provides crystal-clear medical OCR with minimal bandwidth
     const compressed = await sharp(inputBuffer)
-      .resize({ width: 1280, withoutEnlargement: true })
-      .jpeg({ quality: 80, mozjpeg: true })
+      .resize({ width: 1024, withoutEnlargement: true })
+      .jpeg({ quality: 72, mozjpeg: true })
       .toBuffer();
     // Only use compressed if it's actually smaller
     if (compressed.length < inputBuffer.length) {
@@ -2938,6 +2937,13 @@ async function generateGeminiContent(requestContent, systemInstruction) {
       } catch (error) {
         lastErrorMsg = error.message;
         log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
+        // If the model itself is overloaded (503 Service Unavailable), don't waste egress retrying all keys
+        if (error.message && (error.message.includes('503') || error.message.includes('high demand'))) {
+          if (i >= 1) {
+            log('⚠️', `Model ${modelName} is under heavy demand. Fast-switching to next fallback model to save bandwidth...`);
+            break; // Switch to next model immediately!
+          }
+        }
       }
     }
     return null; 
