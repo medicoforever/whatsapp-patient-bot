@@ -1,0 +1,26 @@
+name: 24/7 Render Failover & cron-job.org Watchdog
+
+on:
+  schedule:
+    # Runs automatically every 1 hour
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allows manual 1-click trigger
+
+jobs:
+  check-and-failover:
+    name: Check Render Status & Auto-Switch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Failover Check
+        run: node render-failover-manager.js
+        env:
+          CRON_JOB_API_KEY: '3GKdFNCZXErgSKSCeHMXG2SGrBYzGN6pldcaHqBHdb8='
+          CRON_JOB_ID: '7156467'
