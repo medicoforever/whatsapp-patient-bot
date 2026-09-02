@@ -40,11 +40,12 @@ const CONFIG = {
   API_KEYS: getApiKeys(),
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
   // 🔴 Model Chain Configuration
-  GEMINI_MODEL: 'gemini-3.7-flash',
-  GEMINI_MODEL_FALLBACK_1: 'gemini-3.6-flash',
+  GEMINI_MODEL: 'gemini-3.8-flash',
+  GEMINI_MODEL_FALLBACK_1: 'gemini-3.7-flash',
   GEMINI_MODEL_FALLBACK_2: 'gemini-3.5-flash',
   GEMINI_MODEL_FALLBACK_3: 'gemini-3-flash-preview',
-  GEMINI_MODEL_FALLBACK_4: 'gemini-3.5-flash-lite',
+  GEMINI_MODEL_FALLBACK_4: 'gemini-3.6-flash',
+  GEMINI_MODEL_EMERGENCY: 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -1524,6 +1525,11 @@ app.get('/', async (req, res) => {
   res.send(html);
 });
 
+// 🏓 ULTRA-LIGHTWEIGHT PING ENDPOINT FOR CRON-JOB.ORG (Zero payload, never exceeds size limit)
+app.get('/ping', (req, res) => {
+  res.status(200).send('OK');
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'running',
@@ -2946,46 +2952,50 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     }
   };
 
-  // Loop through keys sequentially: on each key, try 3.7 (3x) -> 3.6 -> 3.5 -> 3-preview -> 3.5-flash-lite
+  // PHASE 1: Loop through all API keys sequentially
+  // For each key: try 3.8-flash -> 3.7-flash -> 3.5-flash -> 3-flash-preview -> 3.6-flash
   for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
     const activeKey = keys[keyIdx];
     log('🔑', `Attempting with API Key #${keyIdx + 1} (...${activeKey.slice(-4)})...`);
 
-    // 1. Try 3.7 Flash up to 3 times on this key
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      if (attempt > 1) {
-        log('⚠️', `Retrying ${CONFIG.GEMINI_MODEL} (Attempt ${attempt}/3) on Key #${keyIdx + 1}...`);
-        await new Promise(r => setTimeout(r, 2000));
-      }
-      const res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL, false);
-      if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
-    }
+    // 1. Try 3.8 Flash
+    let res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL, false);
+    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
 
-    // 2. Fallback to 3.6 Flash on this key
-    log('⚠️', `Key #${keyIdx + 1} 3.7 failed 3x. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_1} on Key #${keyIdx + 1}...`);
-    let res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_1, false);
+    // 2. Try 3.7 Flash
+    log('⚠️', `Key #${keyIdx + 1} 3.8 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_1} on Key #${keyIdx + 1}...`);
+    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_1, false);
     if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
 
-    // 3. Fallback to 3.5 Flash on this key
-    log('⚠️', `Key #${keyIdx + 1} 3.6 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_2} on Key #${keyIdx + 1}...`);
+    // 3. Try 3.5 Flash
+    log('⚠️', `Key #${keyIdx + 1} 3.7 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_2} on Key #${keyIdx + 1}...`);
     res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_2, false);
     if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
 
-    // 4. Fallback to 3 Flash preview on this key
+    // 4. Try 3 Flash preview
     log('⚠️', `Key #${keyIdx + 1} 3.5 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_3} on Key #${keyIdx + 1}...`);
     res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_3, false);
     if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
 
-    // 5. Fallback to 3.5 Flash-lite with High Thinking on this key
-    log('⚠️', `Key #${keyIdx + 1} 3-preview failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_4} (HIGH Thinking) on Key #${keyIdx + 1}...`);
-    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_4, true);
+    // 5. Try 3.6 Flash
+    log('⚠️', `Key #${keyIdx + 1} 3-preview failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_4} on Key #${keyIdx + 1}...`);
+    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_4, false);
     if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_4}}_`;
 
-    log('❌', `All models exhausted for Key #${keyIdx + 1}. Switching to next API key in pool...`);
+    log('❌', `All primary models failed for Key #${keyIdx + 1}. Switching to next API key in pool...`);
+  }
+
+  // PHASE 2: If ALL primary models failed across ALL keys, only then try gemini-3.5-flash-lite for each key!
+  log('🚨', `All keys and primary models failed. Initiating fallback to ${CONFIG.GEMINI_MODEL_EMERGENCY}...`);
+  for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
+    const activeKey = keys[keyIdx];
+    log('🆘', `Trying ${CONFIG.GEMINI_MODEL_EMERGENCY} (HIGH Thinking) on Key #${keyIdx + 1}...`);
+    const res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_EMERGENCY, true);
+    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_EMERGENCY}}_`;
   }
 
   // All keys and all models failed
-  throw new Error(`All ${keys.length} API keys failed across all fallback models. Last error: ${lastErrorMsg}`);
+  throw new Error(`All ${keys.length} API keys failed across all models (including ${CONFIG.GEMINI_MODEL_EMERGENCY}). Last error: ${lastErrorMsg}`);
 }
 
 async function runStartupRecovery() {
