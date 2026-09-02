@@ -72,7 +72,8 @@ async function resumeService(account) {
 
 async function updateCronJobUrl(newUrl) {
   try {
-    console.log(`[Failover] Updating cron-job.org to: ${newUrl}`);
+    const targetPingUrl = newUrl.endsWith('/ping') ? newUrl : `${newUrl.replace(/\/$/, '')}/ping`;
+    console.log(`[Failover] Updating cron-job.org to: ${targetPingUrl}`);
     const res = await fetch(`https://api.cron-job.org/jobs/${CRON_JOB_ID}`, {
       method: 'PATCH',
       headers: {
@@ -81,13 +82,14 @@ async function updateCronJobUrl(newUrl) {
       },
       body: JSON.stringify({
         job: {
-          url: newUrl,
+          url: targetPingUrl,
+          saveResponses: false,
           enabled: true
         }
       })
     });
     if (res.ok) {
-      console.log(`[Failover] ✅ cron-job.org updated successfully to ${newUrl}`);
+      console.log(`[Failover] ✅ cron-job.org updated successfully to ${targetPingUrl}`);
       return true;
     }
     throw new Error(`HTTP ${res.status}`);
@@ -141,9 +143,7 @@ async function checkAndFailover() {
   }
 }
 
-// Run check immediately if executed directly
-if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, '/')}`) {
-  checkAndFailover();
-}
+// Execute check
+checkAndFailover();
 
 export { checkAndFailover, RENDER_ACCOUNTS, updateCronJobUrl };
