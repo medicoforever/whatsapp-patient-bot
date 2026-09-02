@@ -3602,6 +3602,15 @@ export {
   useMongoDBAuthState
 };
 
+// 🛡️ CRASH PROTECTION: Prevent Baileys socket/prekey timeouts from crashing Node.js
+process.on('unhandledRejection', (reason) => {
+  log('⚠️', `Handled Unhandled Rejection: ${reason?.message || reason}`);
+});
+
+process.on('uncaughtException', (err) => {
+  log('⚠️', `Handled Uncaught Exception: ${err?.message || err}`);
+});
+
 if (process.env.NODE_ENV !== 'test' && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index'))) {
   (async () => {
     try {
