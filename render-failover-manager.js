@@ -70,6 +70,23 @@ async function resumeService(account) {
   }
 }
 
+async function suspendService(account) {
+  try {
+    console.log(`[Failover] Putting standby service ${account.serviceId} on ${account.name} into suspended state...`);
+    const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/suspend`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${account.apiKey}`,
+        'Accept': 'application/json'
+      }
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(`[Failover] Error suspending ${account.name}:`, err.message);
+    return false;
+  }
+}
+
 async function updateCronJobUrl(newUrl) {
   try {
     const targetPingUrl = newUrl.endsWith('/ping') ? newUrl : `${newUrl.replace(/\/$/, '')}/ping`;
@@ -128,6 +145,17 @@ async function checkAndFailover() {
   if (activeAccount) {
     await updateCronJobUrl(activeAccount.url);
     console.log(`[Failover] System healthy on ${activeAccount.name}`);
+
+    // If month reset un-suspended any standby accounts, put them back to sleep
+    for (const acc of RENDER_ACCOUNTS) {
+      if (acc.serviceId !== activeAccount.serviceId) {
+        const srv = await getServiceStatus(acc);
+        if (srv && srv.suspended !== 'suspended') {
+          console.log(`[Failover] 💤 Standby account ${acc.name} was un-suspended (e.g. month-reset). Suspending to preserve hours...`);
+          await suspendService(acc);
+        }
+      }
+    }
     return;
   }
 

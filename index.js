@@ -192,6 +192,16 @@ async function storeMediaForViewer(mediaFiles) {
 
   if (viewableMedia.length === 0) return null;
 
+  // 🛡️ RAM BOUND: Cap at 60 active viewers maximum to preserve Render 512MB RAM
+  const MAX_VIEWERS = 60;
+  if (mediaViewerStore.size >= MAX_VIEWERS) {
+    const oldestKey = mediaViewerStore.keys().next().value;
+    if (oldestKey) {
+      mediaViewerStore.delete(oldestKey);
+      log('🧹', `Pruned oldest viewer ${oldestKey} to stay within RAM limits`);
+    }
+  }
+
   mediaViewerStore.set(viewerId, {
     media: viewableMedia,
     expiresAt: expiresAt,
@@ -261,7 +271,9 @@ async function optimizeImageForAi(base64Data, mimeType) {
       return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
     }
     // 1280px width + 82% quality delivers 100% sharp medical text & scan fidelity (~200KB-350KB)
-    const compressed = await sharp(inputBuffer)
+    // auto-rotates phone camera scans using EXIF orientation and handles truncated/corrupt bytes gracefully
+    const compressed = await sharp(inputBuffer, { failOn: 'none' })
+      .rotate()
       .resize({ width: 1280, withoutEnlargement: true })
       .jpeg({ quality: 82, mozjpeg: true })
       .toBuffer();
@@ -446,6 +458,101 @@ const sessionSchema = new mongoose.Schema({
 sessionSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 86400 * 30 });
 
 let SessionModel;
+
+// ======================================================================
+// 👑 DISTRIBUTED LEADER ELECTION / MASTER LOCK (Multi-Instance Conflict Shield)
+// Prevents Code 440 (Conflict) when multiple Render services run at month-reset
+// ======================================================================
+const masterLockSchema = new mongoose.Schema({
+  _id: { type: String, default: 'whatsapp_master_lock' },
+  instanceId: { type: String, required: true },
+  instanceUrl: String,
+  lastHeartbeat: { type: Date, default: Date.now },
+  acquiredAt: { type: Date, default: Date.now }
+}, { collection: 'bot_master_locks' });
+
+let MasterLockModel;
+const MY_INSTANCE_ID = process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || `inst_${process.pid}_${os.hostname()}`;
+const MY_INSTANCE_URL = process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
+let isMasterInstance = false;
+let heartbeatTimer = null;
+let standbyElectionTimer = null;
+
+async function acquireOrRenewMasterLock() {
+  if (!mongoConnected) return true;
+  if (!MasterLockModel) {
+    MasterLockModel = mongoose.model('MasterLock', masterLockSchema);
+  }
+
+  const LOCK_TIMEOUT_MS = 45000; // 45s TTL
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - LOCK_TIMEOUT_MS);
+
+  try {
+    const doc = await MasterLockModel.findOneAndUpdate(
+      {
+        _id: 'whatsapp_master_lock',
+        $or: [
+          { instanceId: MY_INSTANCE_ID },
+          { lastHeartbeat: { $lt: cutoff } },
+          { instanceId: { $exists: false } }
+        ]
+      },
+      {
+        $set: {
+          instanceId: MY_INSTANCE_ID,
+          instanceUrl: MY_INSTANCE_URL,
+          lastHeartbeat: now
+        },
+        $setOnInsert: { acquiredAt: now }
+      },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    const acquired = (doc && (doc.instanceId === MY_INSTANCE_ID || doc.value?.instanceId === MY_INSTANCE_ID));
+    isMasterInstance = !!acquired;
+    return isMasterInstance;
+  } catch (err) {
+    log('⚠️', `Master lock check error: ${err.message}`);
+    try {
+      const existing = await MasterLockModel.findOne({ _id: 'whatsapp_master_lock' });
+      if (existing && existing.instanceId === MY_INSTANCE_ID) {
+        isMasterInstance = true;
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+}
+
+function startStandbyMonitor() {
+  if (standbyElectionTimer) clearInterval(standbyElectionTimer);
+  standbyElectionTimer = setInterval(async () => {
+    try {
+      const acquired = await acquireOrRenewMasterLock();
+      if (acquired) {
+        clearInterval(standbyElectionTimer);
+        standbyElectionTimer = null;
+        log('🚀', `👑 [FAILOVER PROMOTION] Previous master inactive! Promoting this instance to ACTIVE MASTER...`);
+        startBot();
+      }
+    } catch (_) {}
+  }, 15000).unref();
+}
+
+function startMasterHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(async () => {
+    try {
+      if (MasterLockModel && isMasterInstance) {
+        await MasterLockModel.updateOne(
+          { _id: 'whatsapp_master_lock', instanceId: MY_INSTANCE_ID },
+          { $set: { lastHeartbeat: new Date(), instanceUrl: MY_INSTANCE_URL } }
+        );
+      }
+    } catch (_) {}
+  }, 15000).unref();
+}
 
 // ======================================================================
 // 🗄️ PERSISTENT MEDIA BUFFER SCHEMA (MongoDB + RAM Backup)
@@ -1133,7 +1240,18 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 
     log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize}, MaxWidth 1024)`);
 
-    ffmpeg(inputPath)
+    let isSettled = false;
+    const timeoutTimer = setTimeout(() => {
+      if (!isSettled) {
+        isSettled = true;
+        log('⚠️', `Video extraction timed out (45s limit) - killing ffmpeg`);
+        try { ffCommand.kill('SIGKILL'); } catch (_) {}
+        cleanup();
+        reject(new Error('Video processing timed out after 45s'));
+      }
+    }, 45000);
+
+    const ffCommand = ffmpeg(inputPath)
       .outputOptions([
         `-vf ${videoFilter}`,
         '-vsync 0',
@@ -1141,6 +1259,9 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
       ])
       .output(outputPattern)
       .on('end', () => {
+        if (isSettled) return;
+        isSettled = true;
+        clearTimeout(timeoutTimer);
         try {
           const files = fs.readdirSync(tempDir)
             .filter(f => f.startsWith(`frame_${tempId}_`) && f.endsWith('.jpg'))
@@ -1158,10 +1279,14 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
         }
       })
       .on('error', (err) => {
+        if (isSettled) return;
+        isSettled = true;
+        clearTimeout(timeoutTimer);
         cleanup();
         reject(err);
-      })
-      .run();
+      });
+
+    ffCommand.run();
   });
 }
 // ===================================
@@ -1532,7 +1657,9 @@ app.get('/ping', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'running',
+    status: isMasterInstance ? 'running (master)' : 'standby (backup)',
+    role: isMasterInstance ? 'master' : 'standby',
+    isMaster: isMasterInstance,
     connected: isConnected,
     mongoConnected: mongoConnected,
     mode: 'universal',
@@ -1720,6 +1847,22 @@ async function startBot() {
     if (!mongoConnected && CONFIG.MONGODB_URI) {
       log('⚠️', 'MongoDB appears disconnected. Attempting to reconnect...');
       await connectMongoDB();
+    }
+
+    // 👑 DISTRIBUTED LEADER ELECTION: Acquire master lock before touching WhatsApp
+    if (mongoConnected) {
+      const acquired = await acquireOrRenewMasterLock();
+      if (!acquired) {
+        botStatus = 'Standby (Backup Node)';
+        log('🛡️', '╔══════════════════════════════════════════════════════════════╗');
+        log('🛡️', '║ STANDBY MODE: Another instance is currently ACTIVE MASTER.   ║');
+        log('🛡️', '║ Standing by as hot backup (NOT connecting to WhatsApp).      ║');
+        log('🛡️', '╚══════════════════════════════════════════════════════════════╝');
+        startStandbyMonitor();
+        return;
+      }
+      startMasterHeartbeat();
+      log('👑', `Master lock acquired by ${MY_INSTANCE_ID}. This node is ACTIVE.`);
     }
 
     // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
