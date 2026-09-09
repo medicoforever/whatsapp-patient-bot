@@ -7,37 +7,41 @@
  * your cron-job.org URL to the new service!
  */
 
-const CRON_JOB_API_KEY = process.env.CRON_JOB_API_KEY || '3GKdFNCZXErgSKSCeHMXG2SGrBYzGN6pldcaHqBHdb8=';
+const CRON_JOB_API_KEY = process.env.CRON_JOB_API_KEY;
 const CRON_JOB_ID = process.env.CRON_JOB_ID || '7156467';
 
 const RENDER_ACCOUNTS = [
   {
     name: 'medicoforever008',
-    apiKey: 'rnd_NNtHMoAwbdGttv0F4WDvFqnbg8bR',
-    serviceId: 'srv-daa4ugpf2nfc739834v0',
+    apiKey: process.env.RENDER_API_KEY_1 || process.env.RENDER_API_KEY_008,
+    serviceId: process.env.RENDER_SERVICE_ID_1 || 'srv-daa4ugpf2nfc739834v0',
     url: 'https://whatsapp-patient-bot-f9lc.onrender.com'
   },
   {
     name: 'medicoforever002',
-    apiKey: 'rnd_jYutYuSK6dtAZwYKFbrjI1ekhffB',
-    serviceId: 'srv-d5jatbq4d50c73fpbgcg',
+    apiKey: process.env.RENDER_API_KEY_2 || process.env.RENDER_API_KEY_002,
+    serviceId: process.env.RENDER_SERVICE_ID_2 || 'srv-d5jatbq4d50c73fpbgcg',
     url: 'https://whatsapp-patient-bot.onrender.com'
   },
   {
     name: 'raddoc1996',
-    apiKey: 'rnd_ATJs45AaaYcnkL3SETD3vBdkWVmf',
-    serviceId: 'srv-d9uvkuvavr4c73bljb10',
+    apiKey: process.env.RENDER_API_KEY_3 || process.env.RENDER_API_KEY_RADDOC,
+    serviceId: process.env.RENDER_SERVICE_ID_3 || 'srv-d9uvkuvavr4c73bljb10',
     url: 'https://whatsapp-patient-bot-b4tl.onrender.com'
   },
   {
     name: 'medicoforever003',
-    apiKey: 'rnd_Ma8PeY6Nkq81TNZeozNkixIJg7eC',
-    serviceId: 'srv-da46e0fqj5pc73bdboqg',
+    apiKey: process.env.RENDER_API_KEY_4 || process.env.RENDER_API_KEY_003,
+    serviceId: process.env.RENDER_SERVICE_ID_4 || 'srv-da46e0fqj5pc73bdboqg',
     url: 'https://whatsapp-patient-bot-zcmf.onrender.com'
   }
 ];
 
 async function getServiceStatus(account) {
+  if (!account.apiKey) {
+    console.warn(`[Failover] Warning: No API key provided for ${account.name}. Check environment variables/secrets.`);
+    return null;
+  }
   try {
     const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}`, {
       headers: {
@@ -54,6 +58,7 @@ async function getServiceStatus(account) {
 }
 
 async function resumeService(account) {
+  if (!account.apiKey) return false;
   try {
     console.log(`[Failover] Resuming service ${account.serviceId} on ${account.name}...`);
     const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/resume`, {
@@ -71,6 +76,7 @@ async function resumeService(account) {
 }
 
 async function suspendService(account) {
+  if (!account.apiKey) return false;
   try {
     console.log(`[Failover] Putting standby service ${account.serviceId} on ${account.name} into suspended state...`);
     const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/suspend`, {
@@ -88,6 +94,10 @@ async function suspendService(account) {
 }
 
 async function updateCronJobUrl(newUrl) {
+  if (!CRON_JOB_API_KEY) {
+    console.warn(`[Failover] Warning: CRON_JOB_API_KEY is not set. Cannot update cron-job.org.`);
+    return false;
+  }
   try {
     const targetPingUrl = newUrl.endsWith('/ping') ? newUrl : `${newUrl.replace(/\/$/, '')}/ping`;
     console.log(`[Failover] Updating cron-job.org to: ${targetPingUrl}`);
@@ -106,7 +116,7 @@ async function updateCronJobUrl(newUrl) {
       })
     });
     if (res.ok) {
-      console.log(`[Failover] ✅ cron-job.org updated successfully to ${targetPingUrl}`);
+      console.log(`[Failover] 🔄 cron-job.org updated successfully to ${targetPingUrl}`);
       return true;
     }
     throw new Error(`HTTP ${res.status}`);
@@ -160,7 +170,7 @@ async function checkAndFailover() {
   }
 
   // If all are suspended, attempt to resume the next available one (e.g. at month reset)
-  console.log(`[Failover] 🚨 All accounts suspended. Attempting sequential resume...`);
+  console.log(`[Failover] ⚠️ All accounts suspended. Attempting sequential resume...`);
   for (const acc of RENDER_ACCOUNTS) {
     const resumed = await resumeService(acc);
     if (resumed) {
