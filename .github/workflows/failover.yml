@@ -22,5 +22,9 @@ jobs:
       - name: Run Failover Check
         run: node render-failover-manager.js
         env:
-          CRON_JOB_API_KEY: '3GKdFNCZXErgSKSCeHMXG2SGrBYzGN6pldcaHqBHdb8='
+          CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
           CRON_JOB_ID: '7156467'
+          RENDER_API_KEY_1: ${{ secrets.RENDER_API_KEY_1 }}
+          RENDER_API_KEY_2: ${{ secrets.RENDER_API_KEY_2 }}
+          RENDER_API_KEY_3: ${{ secrets.RENDER_API_KEY_3 }}
+          RENDER_API_KEY_4: ${{ secrets.RENDER_API_KEY_4 }}
