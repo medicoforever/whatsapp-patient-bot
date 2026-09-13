@@ -1559,6 +1559,10 @@ app.get('/', async (req, res) => {
   res.send(html);
 });
 
+app.get('/ping', (req, res) => {
+  res.status(200).send('OK');
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'running',
