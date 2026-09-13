@@ -11,7 +11,6 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import os from 'os';
 import crypto from 'crypto';
-import sharp from 'sharp';
 
 // Setup FFmpeg path automatically for Render
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -40,12 +39,11 @@ const CONFIG = {
   API_KEYS: getApiKeys(),
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
   // 🔴 Model Chain Configuration
-  GEMINI_MODEL: 'gemini-3.8-flash',
-  GEMINI_MODEL_FALLBACK_1: 'gemini-3.7-flash',
-  GEMINI_MODEL_FALLBACK_2: 'gemini-3.5-flash',
+  GEMINI_MODEL: 'gemini-3.7-flash',
+  GEMINI_MODEL_FALLBACK_1: 'gemini-3.5-flash',
+  GEMINI_MODEL_FALLBACK_2: 'gemini-3.6-flash',
   GEMINI_MODEL_FALLBACK_3: 'gemini-3-flash-preview',
-  GEMINI_MODEL_FALLBACK_4: 'gemini-3.6-flash',
-  GEMINI_MODEL_EMERGENCY: 'gemini-3.5-flash-lite',
+  GEMINI_MODEL_FALLBACK_4: 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -163,27 +161,17 @@ IMPORTANT: Always identify whether the user is asking a question or providing ad
 // ======================================================================
 const mediaViewerStore = new Map();
 
-async function storeMediaForViewer(mediaFiles) {
+function storeMediaForViewer(mediaFiles) {
   const viewerId = crypto.randomBytes(16).toString('hex');
   const expiresAt = Date.now() + (CONFIG.MEDIA_VIEWER_EXPIRY_MS || 12 * 60 * 60 * 1000);
 
   const viewableMedia = [];
   for (const m of mediaFiles) {
     if (m.type === 'image' || m.type === 'pdf' || m.type === 'audio' || m.type === 'voice' || m.type === 'video') {
-      let dataToStore = m.data;
-      let mime = m.mimeType;
-      // Store compressed image to save egress when opened in browser
-      if (m.type === 'image' && m.data) {
-        try {
-          const opt = await optimizeImageForAi(m.data, m.mimeType);
-          dataToStore = opt.data;
-          mime = opt.mimeType;
-        } catch (_) {}
-      }
       viewableMedia.push({
         type: m.type,
-        data: dataToStore,
-        mimeType: mime,
+        data: m.data,
+        mimeType: m.mimeType,
         caption: m.caption || '',
         fileName: m.fileName || ''
       });
@@ -191,16 +179,6 @@ async function storeMediaForViewer(mediaFiles) {
   }
 
   if (viewableMedia.length === 0) return null;
-
-  // 🛡️ RAM BOUND: Cap at 60 active viewers maximum to preserve Render 512MB RAM
-  const MAX_VIEWERS = 60;
-  if (mediaViewerStore.size >= MAX_VIEWERS) {
-    const oldestKey = mediaViewerStore.keys().next().value;
-    if (oldestKey) {
-      mediaViewerStore.delete(oldestKey);
-      log('🧹', `Pruned oldest viewer ${oldestKey} to stay within RAM limits`);
-    }
-  }
 
   mediaViewerStore.set(viewerId, {
     media: viewableMedia,
@@ -261,32 +239,10 @@ function formatInputMediaSummary(counts) {
 }
 
 // ======================================================================
-// 🖼️ IMAGE HANDLER (Compressed for AI - Bandwidth Optimized)
+// 🖼️ IMAGE HANDLER (Full Quality Preserved)
 // ======================================================================
 async function optimizeImageForAi(base64Data, mimeType) {
-  try {
-    const inputBuffer = Buffer.from(base64Data, 'base64');
-    // Skip tiny images (under 50KB) — not worth compressing
-    if (inputBuffer.length < 50000) {
-      return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
-    }
-    // 1280px width + 82% quality delivers 100% sharp medical text & scan fidelity (~200KB-350KB)
-    // auto-rotates phone camera scans using EXIF orientation and handles truncated/corrupt bytes gracefully
-    const compressed = await sharp(inputBuffer, { failOn: 'none' })
-      .rotate()
-      .resize({ width: 1280, withoutEnlargement: true })
-      .jpeg({ quality: 82, mozjpeg: true })
-      .toBuffer();
-    // Only use compressed if it's actually smaller
-    if (compressed.length < inputBuffer.length) {
-      bandwidthSaved += (inputBuffer.length - compressed.length);
-      return { data: compressed.toString('base64'), mimeType: 'image/jpeg' };
-    }
-    return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
-  } catch (err) {
-    // Fallback: return original if sharp fails (e.g., unsupported format)
-    return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
-  }
+  return { data: base64Data, mimeType: mimeType || 'image/jpeg' };
 }
 
 // ======================================================================
@@ -458,101 +414,6 @@ const sessionSchema = new mongoose.Schema({
 sessionSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 86400 * 30 });
 
 let SessionModel;
-
-// ======================================================================
-// 👑 DISTRIBUTED LEADER ELECTION / MASTER LOCK (Multi-Instance Conflict Shield)
-// Prevents Code 440 (Conflict) when multiple Render services run at month-reset
-// ======================================================================
-const masterLockSchema = new mongoose.Schema({
-  _id: { type: String, default: 'whatsapp_master_lock' },
-  instanceId: { type: String, required: true },
-  instanceUrl: String,
-  lastHeartbeat: { type: Date, default: Date.now },
-  acquiredAt: { type: Date, default: Date.now }
-}, { collection: 'bot_master_locks' });
-
-let MasterLockModel;
-const MY_INSTANCE_ID = process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || `inst_${process.pid}_${os.hostname()}`;
-const MY_INSTANCE_URL = process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
-let isMasterInstance = false;
-let heartbeatTimer = null;
-let standbyElectionTimer = null;
-
-async function acquireOrRenewMasterLock() {
-  if (!mongoConnected) return true;
-  if (!MasterLockModel) {
-    MasterLockModel = mongoose.model('MasterLock', masterLockSchema);
-  }
-
-  const LOCK_TIMEOUT_MS = 45000; // 45s TTL
-  const now = new Date();
-  const cutoff = new Date(now.getTime() - LOCK_TIMEOUT_MS);
-
-  try {
-    const doc = await MasterLockModel.findOneAndUpdate(
-      {
-        _id: 'whatsapp_master_lock',
-        $or: [
-          { instanceId: MY_INSTANCE_ID },
-          { lastHeartbeat: { $lt: cutoff } },
-          { instanceId: { $exists: false } }
-        ]
-      },
-      {
-        $set: {
-          instanceId: MY_INSTANCE_ID,
-          instanceUrl: MY_INSTANCE_URL,
-          lastHeartbeat: now
-        },
-        $setOnInsert: { acquiredAt: now }
-      },
-      { upsert: true, returnDocument: 'after' }
-    );
-
-    const acquired = (doc && (doc.instanceId === MY_INSTANCE_ID || doc.value?.instanceId === MY_INSTANCE_ID));
-    isMasterInstance = !!acquired;
-    return isMasterInstance;
-  } catch (err) {
-    log('⚠️', `Master lock check error: ${err.message}`);
-    try {
-      const existing = await MasterLockModel.findOne({ _id: 'whatsapp_master_lock' });
-      if (existing && existing.instanceId === MY_INSTANCE_ID) {
-        isMasterInstance = true;
-        return true;
-      }
-    } catch (_) {}
-    return false;
-  }
-}
-
-function startStandbyMonitor() {
-  if (standbyElectionTimer) clearInterval(standbyElectionTimer);
-  standbyElectionTimer = setInterval(async () => {
-    try {
-      const acquired = await acquireOrRenewMasterLock();
-      if (acquired) {
-        clearInterval(standbyElectionTimer);
-        standbyElectionTimer = null;
-        log('🚀', `👑 [FAILOVER PROMOTION] Previous master inactive! Promoting this instance to ACTIVE MASTER...`);
-        startBot();
-      }
-    } catch (_) {}
-  }, 15000).unref();
-}
-
-function startMasterHeartbeat() {
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  heartbeatTimer = setInterval(async () => {
-    try {
-      if (MasterLockModel && isMasterInstance) {
-        await MasterLockModel.updateOne(
-          { _id: 'whatsapp_master_lock', instanceId: MY_INSTANCE_ID },
-          { $set: { lastHeartbeat: new Date(), instanceUrl: MY_INSTANCE_URL } }
-        );
-      }
-    } catch (_) {}
-  }, 15000).unref();
-}
 
 // ======================================================================
 // 🗄️ PERSISTENT MEDIA BUFFER SCHEMA (MongoDB + RAM Backup)
@@ -839,8 +700,6 @@ let isConnected = false;
 let qrCodeDataURL = null;
 let pairingCode = null;
 let processedCount = 0;
-let bandwidthSaved = 0; // bytes saved by image compression
-let totalEgressBytes = 0; // rough outbound byte counter
 let botStatus = 'Starting...';
 let lastError = null;
 let mongoConnected = false;
@@ -1142,19 +1001,8 @@ function storeContext(chatId, messageId, mediaFiles, response, senderId) {
     toRemove.forEach(([key]) => contexts.delete(key));
   }
 
-  // Strip binary data from stored context to save RAM (80-90% reduction)
-  // For follow-ups, we only need text response + metadata, not original media buffers
-  const lightMediaFiles = mediaFiles.map(m => ({
-    type: m.type,
-    mimeType: m.mimeType,
-    caption: m.caption || '',
-    fileName: m.fileName || '',
-    content: m.type === 'text' ? (m.content || '') : '',
-    // data is intentionally omitted — saves megabytes per context
-  }));
-
   contexts.set(messageId, {
-    mediaFiles: lightMediaFiles,
+    mediaFiles: mediaFiles,
     response: response,
     timestamp: Date.now(),
     senderId: senderId
@@ -1233,35 +1081,21 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
       return reject(err);
     }
 
-    const batchSize = 2;
+    const batchSize = 3;
     const inputFps = targetFps * batchSize;
 
-    const videoFilter = `fps=${inputFps},thumbnail=${batchSize},scale='min(1024\\,iw):-1'`;
+    const videoFilter = `fps=${inputFps},thumbnail=${batchSize}`;
 
-    log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize}, MaxWidth 1024)`);
+    log('🎬', `Smart Extract: Target ${targetFps}fps (Input ${inputFps}fps, Batch ${batchSize})`);
 
-    let isSettled = false;
-    const timeoutTimer = setTimeout(() => {
-      if (!isSettled) {
-        isSettled = true;
-        log('⚠️', `Video extraction timed out (45s limit) - killing ffmpeg`);
-        try { ffCommand.kill('SIGKILL'); } catch (_) {}
-        cleanup();
-        reject(new Error('Video processing timed out after 45s'));
-      }
-    }, 45000);
-
-    const ffCommand = ffmpeg(inputPath)
+    ffmpeg(inputPath)
       .outputOptions([
         `-vf ${videoFilter}`,
         '-vsync 0',
-        '-q:v 5'
+        '-q:v 2'
       ])
       .output(outputPattern)
       .on('end', () => {
-        if (isSettled) return;
-        isSettled = true;
-        clearTimeout(timeoutTimer);
         try {
           const files = fs.readdirSync(tempDir)
             .filter(f => f.startsWith(`frame_${tempId}_`) && f.endsWith('.jpg'))
@@ -1279,14 +1113,10 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
         }
       })
       .on('error', (err) => {
-        if (isSettled) return;
-        isSettled = true;
-        clearTimeout(timeoutTimer);
         cleanup();
         reject(err);
-      });
-
-    ffCommand.run();
+      })
+      .run();
   });
 }
 // ===================================
@@ -1296,7 +1126,7 @@ app.use(compression());
 const PORT = process.env.PORT || 3000;
 
 // ======================================================================
-// 🔗 MEDIA VIEWER ROUTE (Lazy-Load — Zero Inline Base64)
+// 🔗 MEDIA VIEWER ROUTE
 // ======================================================================
 app.get('/view/:viewerId', (req, res) => {
   const { viewerId } = req.params;
@@ -1358,16 +1188,43 @@ app.get('/view/:viewerId', (req, res) => {
   const remainingHours = Math.floor(remainingMs / 3600000);
   const remainingMins = Math.floor((remainingMs % 3600000) / 60000);
 
-  // Build lightweight metadata array (NO base64 data)
-  const mediaMetadata = media.map((m, index) => ({
-    index,
-    type: m.type,
-    mimeType: m.mimeType,
-    caption: (m.caption || '').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
-    fileName: (m.fileName || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  }));
+  let mediaHtml = '';
+  media.forEach((m, index) => {
+    const caption = m.caption ? `<div class="caption">${m.caption.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
+    const fileName = m.fileName ? `<div class="filename">${m.fileName.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : '';
 
-  // Lightweight HTML that lazy-loads media via /media/ endpoint
+    if (m.type === 'image') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Image</div>
+            ${caption}${fileName}
+            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+        </div>`;
+    } else if (m.type === 'pdf') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — PDF</div>
+            ${caption}${fileName}
+            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
+            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+        </div>`;
+    } else if (m.type === 'audio' || m.type === 'voice') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
+            ${caption}${fileName}
+            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+        </div>`;
+    } else if (m.type === 'video') {
+      mediaHtml += `
+        <div class="media-item">
+            <div class="media-index">#${index + 1} — Video</div>
+            ${caption}${fileName}
+            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+        </div>`;
+    }
+  });
+
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -1376,26 +1233,103 @@ app.get('/view/:viewerId', (req, res) => {
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 10px; }
-            .header { text-align: center; padding: 20px 10px; background: linear-gradient(135deg, #1a1a2e, #16213e); border-radius: 12px; margin-bottom: 15px; border: 1px solid #333; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #0f0f1a;
+                color: #e0e0e0;
+                padding: 10px;
+            }
+            .header {
+                text-align: center;
+                padding: 20px 10px;
+                background: linear-gradient(135deg, #1a1a2e, #16213e);
+                border-radius: 12px;
+                margin-bottom: 15px;
+                border: 1px solid #333;
+            }
             .header h1 { font-size: 20px; color: #25D366; margin-bottom: 8px; }
             .header .meta { font-size: 12px; color: #888; }
             .header .expiry { font-size: 11px; color: #e94560; margin-top: 5px; }
-            .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-            .media-item { background: #1a1a2e; border-radius: 10px; overflow: hidden; border: 1px solid #2a2a4a; transition: transform 0.2s; }
+            .media-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 12px;
+            }
+            .media-item {
+                background: #1a1a2e;
+                border-radius: 10px;
+                overflow: hidden;
+                border: 1px solid #2a2a4a;
+                transition: transform 0.2s;
+            }
             .media-item:hover { transform: scale(1.01); border-color: #25D366; }
-            .media-item img { width: 100%; display: block; cursor: pointer; }
-            .media-index { padding: 8px 12px; font-size: 11px; font-weight: 600; color: #25D366; background: #0f0f1a; border-bottom: 1px solid #2a2a4a; }
-            .caption { padding: 6px 12px; font-size: 12px; color: #ccc; background: #16213e; font-style: italic; }
-            .filename { padding: 4px 12px; font-size: 11px; color: #888; }
-            .loading { padding: 40px; text-align: center; color: #888; font-size: 13px; }
-            .pdf-frame { width: 100%; height: 500px; border: none; }
-            .download-btn { display: block; text-align: center; padding: 10px; background: #25D366; color: #000; text-decoration: none; font-weight: 600; font-size: 13px; }
+            .media-item img {
+                width: 100%;
+                display: block;
+                cursor: pointer;
+                transition: opacity 0.2s;
+            }
+            .media-item img:hover { opacity: 0.9; }
+            .media-index {
+                padding: 8px 12px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #25D366;
+                background: #0f0f1a;
+                border-bottom: 1px solid #2a2a4a;
+                transition: opacity 0.2s;
+            }
+            .caption {
+                padding: 6px 12px;
+                font-size: 12px;
+                color: #ccc;
+                background: #16213e;
+                font-style: italic;
+            }
+            .filename {
+                padding: 4px 12px;
+                font-size: 11px;
+                color: #888;
+            }
+            .pdf-frame {
+                width: 100%;
+                height: 500px;
+                border: none;
+            }
+            .download-btn {
+                display: block;
+                text-align: center;
+                padding: 10px;
+                background: #25D366;
+                color: #000;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 13px;
+            }
             .download-btn:hover { background: #1da851; }
-            .fullscreen-overlay { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.95); z-index: 9999; justify-content: center; align-items: center; cursor: zoom-out; }
+
+            .fullscreen-overlay {
+                display: none;
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                background: rgba(0,0,0,0.95);
+                z-index: 9999;
+                justify-content: center;
+                align-items: center;
+                cursor: zoom-out;
+            }
             .fullscreen-overlay.active { display: flex; }
-            .fullscreen-overlay img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
-            @media (max-width: 600px) { .media-grid { grid-template-columns: 1fr; } body { padding: 5px; } }
+            .fullscreen-overlay img {
+                max-width: 95vw;
+                max-height: 95vh;
+                object-fit: contain;
+            }
+
+            @media (max-width: 600px) {
+                .media-grid { grid-template-columns: 1fr; }
+                body { padding: 5px; }
+            }
         </style>
     </head>
     <body>
@@ -1404,53 +1338,28 @@ app.get('/view/:viewerId', (req, res) => {
             <div class="meta">${media.length} file(s) • Created ${new Date(entry.createdAt).toLocaleString()}</div>
             <div class="expiry">⏰ Expires in ${remainingHours}h ${remainingMins}m</div>
         </div>
-        <div class="media-grid" id="grid"></div>
+
+        <div class="media-grid">
+            ${mediaHtml}
+        </div>
+
         <div class="fullscreen-overlay" id="fsOverlay" onclick="closeFullscreen()">
             <img id="fsImage" src="" alt="Fullscreen">
         </div>
+
         <script>
-            const meta = ${JSON.stringify(mediaMetadata)};
-            const viewerId = '${viewerId}';
-            const grid = document.getElementById('grid');
-            meta.forEach(m => {
-                const item = document.createElement('div');
-                item.className = 'media-item';
-                const typeLabel = m.type === 'voice' ? 'Voice Note' : m.type.charAt(0).toUpperCase() + m.type.slice(1);
-                let inner = '<div class="media-index">#' + (m.index+1) + ' — ' + typeLabel + '</div>';
-                if (m.caption) inner += '<div class="caption">' + m.caption + '</div>';
-                if (m.fileName) inner += '<div class="filename">' + m.fileName + '</div>';
-                const mediaUrl = '/media/' + viewerId + '/' + m.index;
-                if (m.type === 'image') {
-                    inner += '<img data-src="' + mediaUrl + '" alt="Image ' + (m.index+1) + '" class="lazy" onclick="openFullscreen(this)">';
-                } else if (m.type === 'pdf') {
-                    inner += '<iframe data-src="' + mediaUrl + '" class="pdf-frame lazy-frame"></iframe>';
-                    inner += '<a href="' + mediaUrl + '" download class="download-btn">⬇️ Download PDF</a>';
-                } else if (m.type === 'audio' || m.type === 'voice') {
-                    inner += '<audio controls data-src="' + mediaUrl + '" class="lazy-audio" style="width:100%;"></audio>';
-                } else if (m.type === 'video') {
-                    inner += '<video controls data-src="' + mediaUrl + '" class="lazy-video" style="width:100%;max-height:500px;"></video>';
-                }
-                item.innerHTML = inner;
-                grid.appendChild(item);
-            });
-            // Intersection Observer for lazy loading
-            const observer = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        const el = entry.target;
-                        if (el.dataset.src) { el.src = el.dataset.src; delete el.dataset.src; }
-                        observer.unobserve(el);
-                    }
-                });
-            }, { rootMargin: '200px' });
-            document.querySelectorAll('.lazy, .lazy-frame, .lazy-audio, .lazy-video').forEach(el => observer.observe(el));
             function openFullscreen(img) {
                 const overlay = document.getElementById('fsOverlay');
-                document.getElementById('fsImage').src = img.src;
+                const fsImg = document.getElementById('fsImage');
+                fsImg.src = img.src;
                 overlay.classList.add('active');
             }
-            function closeFullscreen() { document.getElementById('fsOverlay').classList.remove('active'); }
-            document.addEventListener('keydown', e => { if (e.key === 'Escape') closeFullscreen(); });
+            function closeFullscreen() {
+                document.getElementById('fsOverlay').classList.remove('active');
+            }
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeFullscreen();
+            });
         </script>
     </body>
     </html>`);
@@ -1650,16 +1559,9 @@ app.get('/', async (req, res) => {
   res.send(html);
 });
 
-// 🏓 ULTRA-LIGHTWEIGHT PING ENDPOINT FOR CRON-JOB.ORG (Zero payload, never exceeds size limit)
-app.get('/ping', (req, res) => {
-  res.status(200).send('OK');
-});
-
 app.get('/health', (req, res) => {
   res.json({
-    status: isMasterInstance ? 'running (master)' : 'standby (backup)',
-    role: isMasterInstance ? 'master' : 'standby',
-    isMaster: isMasterInstance,
+    status: 'running',
     connected: isConnected,
     mongoConnected: mongoConnected,
     mode: 'universal',
@@ -1669,8 +1571,6 @@ app.get('/health', (req, res) => {
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
-    bandwidthSavedMB: (bandwidthSaved / (1024 * 1024)).toFixed(2),
-    totalEgressMB: (totalEgressBytes / (1024 * 1024)).toFixed(2),
     uptime: process.uptime ? process.uptime() : 0,
     timestamp: new Date().toISOString()
   });
@@ -1770,7 +1670,8 @@ https://view.stradus.com/
 🤖 *Copy-paste the clinical profile here to get suggestions regarding MRI protocols:*
 https://ai.studio/apps/86a65a19-cf2f-46de-b4d0-9a941be83604
 
-🔗 https://mri-protocols.vercel.app/
+🎙️ *Radiology dictation:*
+https://ai.studio/apps/3f0807e3-2494-4289-a3a6-c12032da731c?fullscreenApplet=true
 
 📚 *MRI protocol books*
 https://notebooklm.google.com/notebook/467e8684-c512-488f-b1f7-3a450e344cd5`;
@@ -1847,22 +1748,6 @@ async function startBot() {
     if (!mongoConnected && CONFIG.MONGODB_URI) {
       log('⚠️', 'MongoDB appears disconnected. Attempting to reconnect...');
       await connectMongoDB();
-    }
-
-    // 👑 DISTRIBUTED LEADER ELECTION: Acquire master lock before touching WhatsApp
-    if (mongoConnected) {
-      const acquired = await acquireOrRenewMasterLock();
-      if (!acquired) {
-        botStatus = 'Standby (Backup Node)';
-        log('🛡️', '╔══════════════════════════════════════════════════════════════╗');
-        log('🛡️', '║ STANDBY MODE: Another instance is currently ACTIVE MASTER.   ║');
-        log('🛡️', '║ Standing by as hot backup (NOT connecting to WhatsApp).      ║');
-        log('🛡️', '╚══════════════════════════════════════════════════════════════╝');
-        startStandbyMonitor();
-        return;
-      }
-      startMasterHeartbeat();
-      log('👑', `Master lock acquired by ${MY_INSTANCE_ID}. This node is ACTIVE.`);
     }
 
     // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
@@ -3055,90 +2940,87 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
   ];
 
-  const callModelWithKey = async (apiKey, keyIndex, modelName, useThinking) => {
-    try {
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const modelConfig = {
-        model: modelName,
-        safetySettings: safetySettings
-      };
-      if (systemInstruction) {
-        modelConfig.systemInstruction = systemInstruction;
-      }
-      if (useThinking) {
-        modelConfig.generationConfig = {
-          thinkingConfig: { thinkingLevel: 'HIGH' }
-        };
-      }
-
-      const model = genAI.getGenerativeModel(modelConfig);
-      // Track estimated outbound bytes to Gemini
+  const tryModel = async (modelName, useThinking) => {
+    for (let i = 0; i < keys.length; i++) {
       try {
-        const payloadEstimate = JSON.stringify(requestContent).length;
-        totalEgressBytes += payloadEstimate;
-        log('📊', `Gemini egress ~${(payloadEstimate / (1024 * 1024)).toFixed(2)} MB (total: ${(totalEgressBytes / (1024 * 1024)).toFixed(2)} MB)`);
-      } catch (_) {}
+        if (i > 0) {
+          log('⚠️', `Waiting 2s before retrying with Backup Key #${i + 1} (${modelName})...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
 
-      const result = await model.generateContent(requestContent);
-      const responseText = result.response.text();
+        const genAI = new GoogleGenerativeAI(keys[i]);
+        const modelConfig = {
+          model: modelName,
+          safetySettings: safetySettings
+        };
+        if (systemInstruction) {
+          modelConfig.systemInstruction = systemInstruction;
+        }
+        if (useThinking) {
+          modelConfig.generationConfig = {
+            thinkingConfig: { thinkingLevel: 'HIGH' }
+          };
+        }
 
-      if (!responseText) {
-        const feedback = JSON.stringify(result.response.promptFeedback || {});
-        throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
+        const model = genAI.getGenerativeModel(modelConfig);
+        const result = await model.generateContent(requestContent);
+        const responseText = result.response.text();
+
+        if (!responseText) {
+          const feedback = JSON.stringify(result.response.promptFeedback || {});
+          throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
+        }
+
+        return responseText;
+
+      } catch (error) {
+        lastErrorMsg = error.message;
+        log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
       }
-
-      return responseText;
-    } catch (error) {
-      lastErrorMsg = error.message;
-      log('❌', `Key #${keyIndex + 1} (${modelName}) failed: ${error.message}`);
-      return null;
     }
+    return null; 
   };
 
-  // PHASE 1: Loop through all API keys sequentially
-  // For each key: try 3.8-flash -> 3.7-flash -> 3.5-flash -> 3-flash-preview -> 3.6-flash
-  for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
-    const activeKey = keys[keyIdx];
-    log('🔑', `Attempting with API Key #${keyIdx + 1} (...${activeKey.slice(-4)})...`);
-
-    // 1. Try 3.8 Flash
-    let res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL, false);
-    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
-
-    // 2. Try 3.7 Flash
-    log('⚠️', `Key #${keyIdx + 1} 3.8 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_1} on Key #${keyIdx + 1}...`);
-    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_1, false);
-    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
-
-    // 3. Try 3.5 Flash
-    log('⚠️', `Key #${keyIdx + 1} 3.7 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_2} on Key #${keyIdx + 1}...`);
-    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_2, false);
-    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
-
-    // 4. Try 3 Flash preview
-    log('⚠️', `Key #${keyIdx + 1} 3.5 failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_3} on Key #${keyIdx + 1}...`);
-    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_3, false);
-    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
-
-    // 5. Try 3.6 Flash
-    log('⚠️', `Key #${keyIdx + 1} 3-preview failed. Trying ${CONFIG.GEMINI_MODEL_FALLBACK_4} on Key #${keyIdx + 1}...`);
-    res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_FALLBACK_4, false);
-    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_4}}_`;
-
-    log('❌', `All primary models failed for Key #${keyIdx + 1}. Switching to next API key in pool...`);
+  // 1. Loop through keys using Primary Model (gemini-3.7-flash)
+  let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
   }
 
-  // PHASE 2: If ALL primary models failed across ALL keys, only then try gemini-3.5-flash-lite for each key!
-  log('🚨', `All keys and primary models failed. Initiating fallback to ${CONFIG.GEMINI_MODEL_EMERGENCY}...`);
-  for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
-    const activeKey = keys[keyIdx];
-    log('🆘', `Trying ${CONFIG.GEMINI_MODEL_EMERGENCY} (HIGH Thinking) on Key #${keyIdx + 1}...`);
-    const res = await callModelWithKey(activeKey, keyIdx, CONFIG.GEMINI_MODEL_EMERGENCY, true);
-    if (res) return res + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_EMERGENCY}}_`;
+  log('⚠️', `All keys failed for primary model (${CONFIG.GEMINI_MODEL}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_1}...`);
+
+  // 2. Loop through keys using Fallback 1 Model (gemini-3.5-flash)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_1, false);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
   }
 
-  // All keys and all models failed
-  throw new Error(`All ${keys.length} API keys failed across all models (including ${CONFIG.GEMINI_MODEL_EMERGENCY}). Last error: ${lastErrorMsg}`);
+  log('⚠️', `All keys failed for fallback 1 (${CONFIG.GEMINI_MODEL_FALLBACK_1}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_2}...`);
+
+  // 3. Loop through keys using Fallback 2 Model (gemini-3.6-flash)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_2, false);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
+  }
+
+  log('⚠️', `All keys failed for fallback 2 (${CONFIG.GEMINI_MODEL_FALLBACK_2}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_3}...`);
+
+  // 4. Loop through keys using Fallback 3 Model (gemini-3-flash-preview)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_3, false);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
+  }
+
+  log('⚠️', `All keys failed for fallback 3 (${CONFIG.GEMINI_MODEL_FALLBACK_3}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_4} with HIGH thinking...`);
+
+  // 5. Loop through keys using Fallback 4 Model (gemini-3.5-flash-lite)
+  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_4, true);
+  if (responseText) {
+    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_4}}_`;
+  }
+
+  // 6. All models failed across all keys
+  throw new Error(`All ${keys.length} API keys failed for all models. Last error: ${lastErrorMsg}`);
 }
 
 async function runStartupRecovery() {
@@ -3417,8 +3299,8 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
     // 📥 Compute deterministic Input Media Summary (Zero AI Hallucination)
     const mediaSummary = formatInputMediaSummary(counts);
 
-    // 🔗 STORE SOURCE MEDIA FOR VIEWER (Compressed Lazy-Loading Active)
-    const viewerId = await storeMediaForViewer(mediaFiles);
+    // 🔗 STORE SOURCE MEDIA FOR VIEWER
+    const viewerId = storeMediaForViewer(mediaFiles);
     const viewerUrl = viewerId ? `${getBaseUrl()}/view/${viewerId}` : null;
 
     // --- STEP 1: Generate Primary Clinical Profile ---
@@ -3744,15 +3626,6 @@ export {
   nukeSessionKeysFromMongo,
   useMongoDBAuthState
 };
-
-// 🛡️ CRASH PROTECTION: Prevent Baileys socket/prekey timeouts from crashing Node.js
-process.on('unhandledRejection', (reason) => {
-  log('⚠️', `Handled Unhandled Rejection: ${reason?.message || reason}`);
-});
-
-process.on('uncaughtException', (err) => {
-  log('⚠️', `Handled Uncaught Exception: ${err?.message || err}`);
-});
 
 if (process.env.NODE_ENV !== 'test' && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index'))) {
   (async () => {
