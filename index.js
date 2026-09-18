@@ -731,10 +731,25 @@ async function downloadMediaWithRetry(msg, maxRetries = 5, backoffBaseMs = 1500)
   return null;
 }
 
+const recentLogs = [];
+const recentIncomingMessages = [];
+
 function log(emoji, message) {
-  const time = new Date().toLocaleTimeString();
-  console.log(`[${time}] ${emoji} ${message}`);
+  const time = new Date().toISOString();
+  const entry = `[${time}] ${emoji} ${message}`;
+  console.log(entry);
+  recentLogs.push(entry);
+  if (recentLogs.length > 200) recentLogs.shift();
 }
+
+function recordIncomingMessage(info) {
+  recentIncomingMessages.push({
+    timestamp: new Date().toISOString(),
+    ...info
+  });
+  if (recentIncomingMessages.length > 50) recentIncomingMessages.shift();
+}
+
 
 function getSenderId(msg) {
   return msg.key.participant || msg.key.remoteJid;
@@ -1567,6 +1582,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'running',
     connected: isConnected,
+    botUser: sock?.user || null,
     mongoConnected: mongoConnected,
     mode: 'universal',
     processedCount,
@@ -1575,10 +1591,46 @@ app.get('/health', (req, res) => {
     decryptFailures: decryptFailTimestamps.length,
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
+    groups: CONFIG.GROUPS,
+    lastIncomingMessage: recentIncomingMessages.length > 0 ? recentIncomingMessages[recentIncomingMessages.length - 1] : null,
     uptime: process.uptime ? process.uptime() : 0,
     timestamp: new Date().toISOString()
   });
 });
+
+app.get('/logs', (req, res) => {
+  res.json({
+    connected: isConnected,
+    botUser: sock?.user || null,
+    uptime: process.uptime ? process.uptime() : 0,
+    groups: CONFIG.GROUPS,
+    activeProcessingUsers: Array.from(activeProcessingUsers),
+    recentIncomingMessages,
+    recentLogs
+  });
+});
+
+app.get('/groups', async (req, res) => {
+  if (!sock || !isConnected) {
+    return res.status(503).json({ error: 'Bot is not connected to WhatsApp', connected: isConnected });
+  }
+  try {
+    const participating = await sock.groupFetchAllParticipating();
+    const list = Object.values(participating).map(g => ({
+      id: g.id,
+      subject: g.subject,
+      participantsCount: g.participants?.length || 0,
+      isCTSource: g.id === CONFIG.GROUPS.CT_SOURCE,
+      isCTTarget: g.id === CONFIG.GROUPS.CT_TARGET,
+      isMRISource: g.id === CONFIG.GROUPS.MRI_SOURCE,
+      isMRITarget: g.id === CONFIG.GROUPS.MRI_TARGET
+    }));
+    res.json({ count: list.length, groups: list });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ======================================================================
 // 🔗 HELPER: Get the base URL for viewer links
@@ -1955,19 +2007,28 @@ async function startBot() {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (msg.key.fromMe) continue;
+        const msgId = msg.key?.id;
+        const chatId = msg.key?.remoteJid;
+        const senderId = getSenderId(msg);
+        const fromMe = Boolean(msg.key?.fromMe);
+
+        if (fromMe) {
+          log('ℹ️', `Skipped message fromMe in ${chatId} (${msgId ? msgId.substring(0, 8) : 'unknown'})`);
+          recordIncomingMessage({ msgId, chatId, senderId, fromMe: true, decision: 'ignored_fromMe' });
+          continue;
+        }
 
         // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
-        const msgId = msg.key.id;
         if (msgId && isMessageAlreadyProcessed(msgId)) {
           log('🔁', `Skipping duplicate message ${msgId.substring(0, 8)}...`);
+          recordIncomingMessage({ msgId, chatId, senderId, decision: 'ignored_duplicate' });
           continue;
         }
 
         // 🔧 DECRYPTION FAILURE DETECTION
         if (!msg.message) {
-          const chatId = msg.key.remoteJid;
           if (chatId && chatId !== 'status@broadcast') {
+            recordIncomingMessage({ msgId, chatId, senderId, decision: 'empty_msg_decrypt_fail' });
             const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
             const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
             if (isSourceGroup || isTargetGroup) {
@@ -2262,9 +2323,9 @@ async function handleMessage(sock, msg) {
   const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
   
   if (isGroup) {
-    // 🚫 Completely ignore messages from unauthorized groups
     if (!isSourceGroup && !isTargetGroup) {
-      // We don't even log it to prevent spam
+      log('ℹ️', `Group message ignored from unmonitored group: ${chatId} (${senderName}). Configured CT_SOURCE=${CONFIG.GROUPS.CT_SOURCE}, MRI_SOURCE=${CONFIG.GROUPS.MRI_SOURCE}`);
+      recordIncomingMessage({ msgId: msg.key?.id, chatId, senderId, senderName, isGroup: true, decision: `ignored_unmonitored_group (${chatId})` });
       return; 
     }
     
@@ -2276,6 +2337,7 @@ async function handleMessage(sock, msg) {
   const content = unwrapMessage(msg.message);
 
   if (!content) {
+    recordIncomingMessage({ msgId: msg.key?.id, chatId, senderId, decision: 'unwrap_empty' });
     return;
   }
 
@@ -2287,6 +2349,18 @@ async function handleMessage(sock, msg) {
       break;
     }
   }
+
+  recordIncomingMessage({
+    msgId: msg.key?.id,
+    chatId,
+    senderId,
+    senderName,
+    messageType,
+    isSourceGroup,
+    isTargetGroup,
+    isDM,
+    decision: `handled_${messageType}`
+  });
 
   let quotedMessageId = null;
   let contextInfo = null;
