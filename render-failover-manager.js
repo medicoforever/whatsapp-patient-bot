@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 🔄 RENDER MULTI-ACCOUNT FAILOVER & CRON-JOB.ORG AUTO-SWITCHER
  * 
  * This manager monitors the active Render web service.
@@ -111,12 +111,13 @@ async function updateCronJobUrl(newUrl) {
         job: {
           url: targetPingUrl,
           saveResponses: false,
-          enabled: true
+          enabled: true,
+          requestTimeout: 60
         }
       })
     });
     if (res.ok) {
-      console.log(`[Failover] 🔄 cron-job.org updated successfully to ${targetPingUrl}`);
+      console.log(`[Failover] 🔄 cron-job.org updated successfully to ${targetPingUrl} (timeout: 60s)`);
       return true;
     }
     throw new Error(`HTTP ${res.status}`);
@@ -151,8 +152,23 @@ async function checkAndFailover() {
     }
   }
 
-  // If the active account is found, make sure cron-job.org points to it
+  // If the active account is found, verify its HTTP health & make sure cron-job.org points to it
   if (activeAccount) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 45000);
+      const hRes = await fetch(`${activeAccount.url}/health`, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (hRes.ok) {
+        const hJson = await hRes.json();
+        console.log(`[Failover] 🩺 HTTP Health OK: connected=${hJson.connected}, uptime=${Math.round(hJson.uptime)}s, botUser=${hJson.botUser?.id || 'none'}`);
+      } else {
+        console.warn(`[Failover] ⚠️ Health check returned HTTP ${hRes.status}`);
+      }
+    } catch (err) {
+      console.warn(`[Failover] ⚠️ Health check request error: ${err.message}`);
+    }
+
     await updateCronJobUrl(activeAccount.url);
     console.log(`[Failover] System healthy on ${activeAccount.name}`);
 
