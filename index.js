@@ -54,6 +54,12 @@ const CONFIG = {
     MRI_TARGET: process.env.GROUP_MRI_TARGET
   },
 
+  TELEGRAM: {
+    BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
+    CT_CHAT_ID: process.env.TELEGRAM_CT_CHAT_ID || '',
+    MRI_CHAT_ID: process.env.TELEGRAM_MRI_CHAT_ID || ''
+  },
+
   MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000, // 12 hours
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes (Standard users)
   AUTO_PROCESS_DELAY_MS: 60000, // 60 seconds (Auto-groups)
@@ -1631,6 +1637,44 @@ app.get('/groups', async (req, res) => {
   }
 });
 
+
+// ======================================================================
+// ✈️ TELEGRAM DISPATCH HELPER
+// ======================================================================
+async function sendTelegramReport(targetType, text) {
+  if (!CONFIG.TELEGRAM.BOT_TOKEN) return;
+  const chatId = targetType === 'CT' ? CONFIG.TELEGRAM.CT_CHAT_ID : CONFIG.TELEGRAM.MRI_CHAT_ID;
+  if (!chatId) return;
+
+  try {
+    // Telegram character limit is 4096. Split cleanly into 4000-char chunks.
+    const maxLen = 4000;
+    const chunks = [];
+    for (let i = 0; i < text.length; i += maxLen) {
+      chunks.push(text.substring(i, i + maxLen));
+    }
+
+    for (const chunk of chunks) {
+      const response = await fetch(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: chunk
+        })
+      });
+
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => ({}));
+        log('⚠️', `Telegram send failed to ${chatId}: ${errJson.description || response.statusText}`);
+      } else {
+        log('✈️', `Telegram report delivered to ${chatId} (${targetType})`);
+      }
+    }
+  } catch (error) {
+    log('❌', `Telegram send error: ${error.message}`);
+  }
+}
 
 // ======================================================================
 // 🔗 HELPER: Get the base URL for viewer links
@@ -3470,8 +3514,17 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
         log('💾', `Secondary Context stored for ...${shortId}`);
       }
       log('📤', `Sent Secondary (Step 2) to target!`);
+
+      // ✈️ Forward to Telegram channel simultaneously
+      const telegramType = (destinationChatId === CONFIG.GROUPS.CT_TARGET || targetChatId === CONFIG.GROUPS.CT_TARGET) ? 'CT' : ((destinationChatId === CONFIG.GROUPS.MRI_TARGET || targetChatId === CONFIG.GROUPS.MRI_TARGET) ? 'MRI' : null);
+      if (telegramType) {
+        sendTelegramReport(telegramType, step1Text).catch(() => {});
+        sendTelegramReport(telegramType, finalSecondaryText).catch(() => {});
+      }
+
       return;
     }
+
 
     // --- NORMAL PRIMARY MODE or FOLLOW-UP HANDLING ---
 
@@ -3549,6 +3602,13 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     }
 
     log('📤', `Sent to target/chat!`);
+
+    // ✈️ Forward to Telegram channel simultaneously
+    const telegramType = (destinationChatId === CONFIG.GROUPS.CT_TARGET || targetChatId === CONFIG.GROUPS.CT_TARGET) ? 'CT' : ((destinationChatId === CONFIG.GROUPS.MRI_TARGET || targetChatId === CONFIG.GROUPS.MRI_TARGET) ? 'MRI' : null);
+    if (telegramType) {
+      sendTelegramReport(telegramType, finalResponseText).catch(() => {});
+    }
+
     await markUserBufferCompleted(chatId, senderId);
 
   } catch (error) {
