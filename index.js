@@ -56,8 +56,8 @@ const CONFIG = {
 
   TELEGRAM: {
     BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8858327878:AAFuXpgwGN-vbDf-i5dlzwX46-D75BMMKEo',
-    CT_CHAT_ID: process.env.TELEGRAM_CT_CHAT_ID || '',
-    MRI_CHAT_ID: process.env.TELEGRAM_MRI_CHAT_ID || ''
+    CT_CHAT_ID: process.env.TELEGRAM_CT_CHAT_ID || '-1004456617705',
+    MRI_CHAT_ID: process.env.TELEGRAM_MRI_CHAT_ID || '-1004380868476'
   },
 
   MEDIA_VIEWER_EXPIRY_MS: 12 * 60 * 60 * 1000, // 12 hours
@@ -1598,6 +1598,7 @@ app.get('/health', (req, res) => {
     healingInProgress: isHealingInProgress,
     pendingRetries: pendingEmptyMessages.size,
     groups: CONFIG.GROUPS,
+    telegramConfigured: Boolean(CONFIG.TELEGRAM.BOT_TOKEN && CONFIG.TELEGRAM.CT_CHAT_ID && CONFIG.TELEGRAM.MRI_CHAT_ID),
     lastIncomingMessage: recentIncomingMessages.length > 0 ? recentIncomingMessages[recentIncomingMessages.length - 1] : null,
     uptime: process.uptime ? process.uptime() : 0,
     timestamp: new Date().toISOString()
