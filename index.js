@@ -55,7 +55,7 @@ const CONFIG = {
   },
 
   TELEGRAM: {
-    BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
+    BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8858327878:AAFuXpgwGN-vbDf-i5dlzwX46-D75BMMKEo',
     CT_CHAT_ID: process.env.TELEGRAM_CT_CHAT_ID || '',
     MRI_CHAT_ID: process.env.TELEGRAM_MRI_CHAT_ID || ''
   },
