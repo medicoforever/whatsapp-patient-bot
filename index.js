@@ -1589,6 +1589,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'running',
     connected: isConnected,
+    wsReadyState: sock?.ws?.readyState ?? null,
     botUser: sock?.user || null,
     mongoConnected: mongoConnected,
     mode: 'universal',
@@ -1604,6 +1605,17 @@ app.get('/health', (req, res) => {
     uptime: process.uptime ? process.uptime() : 0,
     timestamp: new Date().toISOString()
   });
+});
+
+app.get('/reconnect', async (req, res) => {
+  log('🔄', 'Manual reconnect triggered via /reconnect endpoint...');
+  try {
+    if (sock) {
+      sock.end(new Error('Manual reconnect'));
+    }
+  } catch (_) {}
+  setTimeout(startBot, 2000);
+  res.json({ success: true, message: 'Reconnecting bot in 2 seconds...' });
 });
 
 app.get('/logs', (req, res) => {
@@ -2050,7 +2062,11 @@ async function startBot() {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      log('📨', `messages.upsert event: type=${type}, count=${messages?.length || 0}`);
+      if (type !== 'notify') {
+        log('ℹ️', `Skipped non-notify upsert (type=${type})`);
+        return;
+      }
 
       for (const msg of messages) {
         const msgId = msg.key?.id;
