@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 🔄 RENDER MULTI-ACCOUNT FAILOVER & CRON-JOB.ORG AUTO-SWITCHER
  * 
  * This manager monitors the active Render web service.
@@ -93,6 +93,32 @@ async function suspendService(account) {
   }
 }
 
+async function triggerDeploy(account) {
+  if (!account.apiKey) return false;
+  try {
+    console.log(`[Failover] 🚀 Triggering deployment on ${account.name} (${account.serviceId}) to ensure latest code...`);
+    const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/deploys`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${account.apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ clearCache: 'do_not_clear' })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      console.log(`[Failover] ✅ Deploy triggered successfully: ID=${data.id}, status=${data.status}`);
+      return true;
+    }
+    const errText = await res.text();
+    console.error(`[Failover] Failed to trigger deploy on ${account.name}: HTTP ${res.status} - ${errText}`);
+    return false;
+  } catch (err) {
+    console.error(`[Failover] Error triggering deploy on ${account.name}:`, err.message);
+    return false;
+  }
+}
+
 async function updateCronJobUrl(newUrl) {
   if (!CRON_JOB_API_KEY) {
     console.warn(`[Failover] Warning: CRON_JOB_API_KEY is not set. Cannot update cron-job.org.`);
@@ -162,11 +188,17 @@ async function checkAndFailover() {
       if (hRes.ok) {
         const hJson = await hRes.json();
         console.log(`[Failover] 🩺 HTTP Health OK: connected=${hJson.connected}, uptime=${Math.round(hJson.uptime)}s, botUser=${hJson.botUser?.id || 'none'}`);
+        if (!hJson.connected || !hJson.telegramConfigured) {
+          console.warn(`[Failover] ⚠️ Active service is missing WhatsApp connection or Telegram config. Triggering auto-heal deploy...`);
+          await triggerDeploy(activeAccount);
+        }
       } else {
-        console.warn(`[Failover] ⚠️ Health check returned HTTP ${hRes.status}`);
+        console.warn(`[Failover] ⚠️ Health check returned HTTP ${hRes.status}. Triggering deploy to recover...`);
+        await triggerDeploy(activeAccount);
       }
     } catch (err) {
-      console.warn(`[Failover] ⚠️ Health check request error: ${err.message}`);
+      console.warn(`[Failover] ⚠️ Health check request error: ${err.message}. Triggering deploy to wake up container...`);
+      await triggerDeploy(activeAccount);
     }
 
     await updateCronJobUrl(activeAccount.url);
@@ -190,8 +222,10 @@ async function checkAndFailover() {
   for (const acc of RENDER_ACCOUNTS) {
     const resumed = await resumeService(acc);
     if (resumed) {
+      // Trigger a deploy to guarantee latest code is running on this newly activated service
+      await triggerDeploy(acc);
       await updateCronJobUrl(acc.url);
-      console.log(`[Failover] ✅ Successfully switched to ${acc.name}`);
+      console.log(`[Failover] ✅ Successfully switched to ${acc.name} with fresh deploy triggered`);
       break;
     }
   }
