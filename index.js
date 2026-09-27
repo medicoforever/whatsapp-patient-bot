@@ -2188,9 +2188,10 @@ async function startBot() {
             recordIncomingMessage({ msgId, chatId, senderId, decision: 'empty_msg_decrypt_fail' });
             const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
             const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
-            if (isSourceGroup || isTargetGroup) {
-              // 🔄 AUTO GROUP: Queue for retry instead of skipping
-              log('⏳', `Empty message body from auto group ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
+            const isSelf = isSelfChat(chatId);
+            if (isSourceGroup || isTargetGroup || isSelf) {
+              // 🔄 Queue for retry instead of skipping
+              log('⏳', `Empty message body from ${isSelf ? 'Self-Chat' : chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
               if (msgId && !pendingEmptyMessages.has(msgId)) {
                 // Remove from processedMessageIds so it can be reprocessed on retry
                 processedMessageIds.delete(msgId);
