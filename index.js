@@ -1076,6 +1076,50 @@ function isBotMessage(chatId, messageId) {
   return botMessageIds.get(chatId).has(messageId);
 }
 
+const sentBotMessageIds = new Set();
+const MAX_SENT_BOT_IDS = 2000;
+
+function trackBotSentMessageId(msgId) {
+  if (!msgId) return;
+  sentBotMessageIds.add(msgId);
+  if (sentBotMessageIds.size > MAX_SENT_BOT_IDS) {
+    const arr = Array.from(sentBotMessageIds);
+    arr.slice(0, 500).forEach(id => sentBotMessageIds.delete(id));
+  }
+}
+
+function isOurBotMessage(chatId, msgId) {
+  if (!msgId) return false;
+  if (sentBotMessageIds.has(msgId)) return true;
+  if (isBotMessage(chatId, msgId)) return true;
+  return false;
+}
+
+function isSelfChat(chatId) {
+  if (!chatId || !sock?.user) return false;
+  const cleanId = (id) => id ? String(id).split(':')[0].split('@')[0] : '';
+  const myPhone = cleanId(sock.user.id);
+  const myLid = cleanId(sock.user.lid);
+  const target = cleanId(chatId);
+  return Boolean((myPhone && target === myPhone) || (myLid && target === myLid));
+}
+
+async function safeSendMessage(targetSock, jid, content, options = {}) {
+  const current = targetSock || sock;
+  if (!current?.sendMessage) {
+    throw new Error('Socket not available for sendMessage');
+  }
+  const result = await current.sendMessage(jid, content, options);
+  if (result?.key?.id) {
+    trackBotSentMessageId(result.key.id);
+    trackBotMessage(jid, result.key.id);
+    if (typeof processedMessageIds !== 'undefined') {
+      processedMessageIds.add(result.key.id);
+    }
+  }
+  return result;
+}
+
 // === SMART VIDEO PROCESSING LOGIC (Oversample -> Filter) ===
 async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
   return new Promise((resolve, reject) => {
@@ -1852,7 +1896,31 @@ async function connectMongoDB() {
   }
 }
 
+let isBotStarting = false;
+let botReconnectTimeout = null;
+
 async function startBot() {
+  if (isBotStarting) {
+    log('⏳', 'startBot already in progress, skipping duplicate call.');
+    return;
+  }
+  isBotStarting = true;
+
+  if (botReconnectTimeout) {
+    clearTimeout(botReconnectTimeout);
+    botReconnectTimeout = null;
+  }
+
+  // Clean up any existing socket before opening a new one to prevent 440 conflict / duplicate listeners
+  if (sock) {
+    log('🧹', 'Cleaning up previous socket before starting new connection...');
+    try {
+      sock.ev?.removeAllListeners();
+      sock.end?.(new Error('Reconnecting'));
+    } catch (_) {}
+    sock = null;
+  }
+
   try {
     botStatus = 'Initializing...';
     log('🚀', 'Starting WhatsApp Bot...');
@@ -1944,6 +2012,7 @@ async function startBot() {
       markOnlineOnConnect: false,
       syncFullHistory: false,
       retryRequestDelayMs: 1500,
+      keepAliveIntervalMs: 25000,
       getMessage: async (key) => {
         // 🔑 CRITICAL: Return stored pending message content if available.
         // This enables Baileys' Signal protocol retry to actually work.
@@ -2006,9 +2075,14 @@ async function startBot() {
         pairingCode = null;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const reason = lastDisconnect?.error?.output?.payload?.message || 'Unknown';
+        const reason = lastDisconnect?.error?.output?.payload?.message || lastDisconnect?.error?.message || 'Unknown';
 
         log('🔌', `Connection closed. Code: ${statusCode}, Reason: ${reason}`);
+
+        if (botReconnectTimeout) {
+          clearTimeout(botReconnectTimeout);
+          botReconnectTimeout = null;
+        }
 
         const loggedOut = statusCode === DisconnectReason.loggedOut ||
           statusCode === 401 ||
@@ -2023,14 +2097,16 @@ async function startBot() {
           }
 
           log('🔄', 'Restarting with fresh session in 5 seconds...');
-          setTimeout(startBot, 5000);
+          botReconnectTimeout = setTimeout(startBot, 5000);
         } else {
           if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
             log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
             await nukeSessionKeysFromMongo();
           }
-          log('🔄', `Reconnecting in 5 seconds...`);
-          setTimeout(startBot, 5000);
+          // Code 440 is Stream Conflict: give previous socket 8s to drop on WhatsApp servers before reconnecting
+          const reconnectDelay = statusCode === 440 ? 8000 : 5000;
+          log('🔄', `Reconnecting in ${reconnectDelay / 1000} seconds...`);
+          botReconnectTimeout = setTimeout(startBot, reconnectDelay);
         }
 
       } else if (connection === 'open') {
@@ -2075,9 +2151,28 @@ async function startBot() {
         const fromMe = Boolean(msg.key?.fromMe);
 
         if (fromMe) {
-          log('ℹ️', `Skipped message fromMe in ${chatId} (${msgId ? msgId.substring(0, 8) : 'unknown'})`);
-          recordIncomingMessage({ msgId, chatId, senderId, fromMe: true, decision: 'ignored_fromMe' });
-          continue;
+          // 1. If sent by the bot process itself (tracked message ID), skip the echo
+          if (isOurBotMessage(chatId, msgId)) {
+            recordIncomingMessage({ msgId, chatId, senderId, fromMe: true, decision: 'ignored_bot_self_echo' });
+            continue;
+          }
+
+          // 2. If sent from the human user's linked phone:
+          const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
+          const isSelf = isSelfChat(chatId);
+          const hasBotReply = Boolean(
+            msg.message?.extendedTextMessage?.contextInfo?.stanzaId &&
+            isBotMessage(chatId, msg.message.extendedTextMessage.contextInfo.stanzaId)
+          );
+
+          // Allow: self-chat ("Message Yourself"), monitored source groups, or replies to bot messages.
+          // Skip other external outgoing chats to avoid interfering with personal conversations.
+          if (!isSelf && !isSourceGroup && !hasBotReply) {
+            log('ℹ️', `Skipped outgoing human message in non-monitored chat ${chatId} (${msgId ? msgId.substring(0, 8) : 'unknown'})`);
+            recordIncomingMessage({ msgId, chatId, senderId, fromMe: true, decision: 'ignored_outgoing_external_chat' });
+            continue;
+          }
+          log('👤', `Processing human message from linked phone in ${isSelf ? 'Self-Chat' : chatId} (${msgId ? msgId.substring(0, 8) : 'unknown'})`);
         }
 
         // 🆔 DEDUPLICATION: Skip if we've already processed this message ID
@@ -2157,7 +2252,8 @@ async function startBot() {
           processedMessageIds.delete(msgId);
 
           // Now process it
-          if (!fullMsg.key.fromMe && !isMessageAlreadyProcessed(msgId)) {
+          const isOurBot = isOurBotMessage(fullMsg.key?.remoteJid, msgId);
+          if (!isOurBot && !isMessageAlreadyProcessed(msgId)) {
             try {
               await handleMessage(sock, fullMsg);
             } catch (error) {
@@ -2172,7 +2268,10 @@ async function startBot() {
     log('💥', `Bot error: ${error.message}`);
     console.error(error);
     botStatus = 'Error - restarting...';
-    setTimeout(startBot, 10000);
+    if (botReconnectTimeout) clearTimeout(botReconnectTimeout);
+    botReconnectTimeout = setTimeout(startBot, 10000);
+  } finally {
+    isBotStarting = false;
   }
 }
 
@@ -2654,7 +2753,7 @@ async function handleMessage(sock, msg) {
       // 🚫 NEW: Reject trigger commands in groups
       if (isGroup) {
         log('🔇', `Rejecting trigger command in group from ${senderName} (...${shortId})`);
-        await sock.sendMessage(chatId, {
+        await safeSendMessage(sock, chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, the *${text}* command only works in my Direct Messages. Please message me privately to generate clinical profiles!`,
           mentions: [senderId]
         });
@@ -2696,14 +2795,14 @@ async function handleMessage(sock, msg) {
         }
 
       } else {
-        await sock.sendMessage(chatId, {
+        await safeSendMessage(sock, chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, you have no files buffered.\n\nSend files first, then send *.* (Standard) or *..* (Secondary Analysis).\nAdd numbers for video speed (e.g. .2 or ..2)\n\n💡 _Or reply to my previous response to ask questions!_`,
           mentions: [senderId]
         });
       }
     }
     else if (text.toLowerCase() === 'help' || text === '?') {
-      await sock.sendMessage(chatId, {
+      await safeSendMessage(sock, chatId, {
         text: `🏥 *Clinical Profile Bot*\n\n*Universal Mode Active*\nI work in this chat and any group I'm added to!\n\n*Supported Files:*\n📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Video\n\n*Commands:*\n• *.* - Standard Clinical Profile (Smart 3 FPS)\n• *..* - Secondary Chained Analysis (Profile + Advice)\n• *.1 / ..1* - Process with Smart 1 FPS\n• *.2 / ..2* - Process with Smart 2 FPS\n• *clear* - Clear buffer\n• *status* - Check status\n\n*Reply Feature:*\nReply to my messages to ask questions or provide corrections!\n\n*📥 Input Media Summary:*\nEach generated report confirms the exact count and type of media received.`
       });
     }
@@ -2721,12 +2820,12 @@ async function handleMessage(sock, msg) {
           else if (m.type === 'text') counts.texts++;
         });
 
-        await sock.sendMessage(chatId, {
+        await safeSendMessage(sock, chatId, {
           text: `🗑 @${senderId.split('@')[0]}, cleared your buffer:\n📷 ${counts.images} image(s)\n📄 ${counts.pdfs} PDF(s)\n🎵 ${counts.audio} audio\n🎬 ${counts.video} video(s)\n💬 ${counts.texts} text(s)`,
           mentions: [senderId]
         });
       } else {
-        await sock.sendMessage(chatId, {
+        await safeSendMessage(sock, chatId, {
           text: `ℹ️ @${senderId.split('@')[0]}, your buffer is empty.`,
           mentions: [senderId]
         });
@@ -2737,7 +2836,7 @@ async function handleMessage(sock, msg) {
       console.log("PING MSG KEY:", JSON.stringify(msg.key, null, 2));
       console.log("PING MSG SENDER INFO:", msg.pushName, senderId, chatId);
       try {
-        await sock.sendMessage(chatId, { text: 'pong' }, { quoted: msg });
+        await safeSendMessage(sock, chatId, { text: 'pong' }, { quoted: msg });
         log('🟢', `Pong sent successfully to ...${shortId}`);
       } catch (err) {
         log('❌', `Pong failed: ${err.message}`);
@@ -2749,7 +2848,7 @@ async function handleMessage(sock, msg) {
       const userCount = await getUserBufferCount(chatId, senderId);
       const storedContexts = chatContexts.has(chatId) ? chatContexts.get(chatId).size : 0;
 
-      await sock.sendMessage(chatId, {
+      await safeSendMessage(sock, chatId, {
         text: `📊 *Status*\n\n*Your Buffer:* ${userCount} item(s)\n\n*Chat Total:*\n👥 Active users: ${stats.users}\n📷 Images: ${stats.images}\n📄 PDFs: ${stats.pdfs}\n🎵 Audio: ${stats.audio}\n🎬 Video: ${stats.video}\n💬 Texts: ${stats.texts}\n━━━━━━━━━━\n📦 Total buffered: ${stats.total}\n🧠 Stored contexts: ${storedContexts}\n✅ Processed: ${processedCount}\n🗄 MongoDB: ${mongoConnected ? 'Connected' : 'Not connected'}\n🔑 API Keys: ${CONFIG.API_KEYS.length} available\n🔧 Decrypt Fails (1min): ${decryptFailTimestamps.length}/${CONFIG.DECRYPT_FAIL_THRESHOLD}\n⏳ Pending Retries: ${pendingEmptyMessages.size}`
       });
     }
@@ -2781,7 +2880,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   if (!storedContext) {
     // 🔧 FIX #1: Updated expiry message from "30 min limit" to "12 hour limit"
     log('⚠️', `Context expired for ...${shortId}`);
-    await sock.sendMessage(chatId, {
+    await safeSendMessage(sock, chatId, {
       text: `⏰ @${senderId.split('@')[0]}, that context has expired (12 hour limit).\n\nPlease send new files and use "." to process.`,
       mentions: [senderId]
     });
@@ -2802,7 +2901,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
     }
 
     if (!userQuestion) {
-      await sock.sendMessage(chatId, {
+      await safeSendMessage(sock, chatId, {
         text: `ℹ️ @${senderId.split('@')[0]}, please type your question as text when replying to the message.`,
         mentions: [senderId]
       });
@@ -2854,7 +2953,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
       // Add the group reply footer
       finalText += GROUP_REPLY_FOOTER;
 
-      const sentMessage = await sock.sendMessage(chatId, {
+      const sentMessage = await safeSendMessage(sock, chatId, {
         text: finalText,
         mentions: [senderId]
       });
@@ -2872,7 +2971,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 
     } catch (error) {
       log('❌', `Group reply error for ...${shortId}: ${error.message}`);
-      await sock.sendMessage(chatId, {
+      await safeSendMessage(sock, chatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your question:\n_${error.message}_\n\nPlease try again later.`,
         mentions: [senderId]
       });
@@ -3039,7 +3138,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
   }
 
   if (newContent.length === 0) {
-    await sock.sendMessage(chatId, {
+    await safeSendMessage(sock, chatId, {
       text: `ℹ️ @${senderId.split('@')[0]}, please include text, image, PDF, audio, or video in your reply.`,
       mentions: [senderId]
     });
@@ -3484,7 +3583,7 @@ Today's current date is ${currentDate}. Please pay extremely close attention to 
         step1Text += GROUP_REPLY_FOOTER;
       }
 
-      await sock.sendMessage(destinationChatId, {
+      await safeSendMessage(sock, destinationChatId, {
         text: step1Text,
         mentions: step1Mentions.length ? step1Mentions : undefined
       });
@@ -3529,7 +3628,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       console.log(finalSecondaryText);
       console.log('═'.repeat(60) + '\n');
 
-      const sentMessage = await sock.sendMessage(destinationChatId, {
+      const sentMessage = await safeSendMessage(sock, destinationChatId, {
         text: finalSecondaryText,
         mentions: step2Mentions.length ? step2Mentions : undefined
       });
@@ -3616,7 +3715,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       finalResponseText += GROUP_REPLY_FOOTER;
     }
 
-    const sentMessage = await currentSock?.sendMessage?.(destinationChatId, {
+    const sentMessage = await safeSendMessage(currentSock, destinationChatId, {
       text: finalResponseText,
       mentions: finalMentions.length ? finalMentions : undefined
     });
@@ -3646,7 +3745,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       log('⏳', `Generation/Send failed. Scheduling retry in 5 mins for ...${shortId}`);
 
       try {
-        await currentSock?.sendMessage?.(destinationChatId, {
+        await safeSendMessage(currentSock, destinationChatId, {
           text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
           mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
@@ -3665,7 +3764,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     await markUserBufferFailed(chatId, senderId);
 
     try {
-      await currentSock?.sendMessage?.(destinationChatId, {
+      await safeSendMessage(currentSock, destinationChatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
         mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
       });
@@ -3789,7 +3888,10 @@ export {
   processedMessageIds,
   groupMediaSmartly,
   nukeSessionKeysFromMongo,
-  useMongoDBAuthState
+  useMongoDBAuthState,
+  safeSendMessage,
+  isOurBotMessage,
+  isSelfChat
 };
 
 if (process.env.NODE_ENV !== 'test' && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index'))) {
