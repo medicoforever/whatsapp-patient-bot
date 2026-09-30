@@ -1,37 +1,42 @@
+import fetch from 'node-fetch';
+
 /**
- * 🔄 RENDER MULTI-ACCOUNT FAILOVER & CRON-JOB.ORG AUTO-SWITCHER
+ * 24/7 Render Failover & Uptime Manager
  * 
- * This manager monitors the active Render web service.
- * ONLY if a service is suspended specifically for BANDWIDTH/BILLING (suspenders: ["billing"]),
- * it activates the next available Render account in the pool and automatically updates
- * your cron-job.org URL to the new service!
+ * Logic:
+ * 1. Checks all 4 Render accounts sequentially in priority order.
+ * 2. Checks active service HTTP /health.
+ * 3. If socket is temporarily reconnecting, waits 12s and re-checks, then calls /reconnect if needed (NEVER triggers cold redeploys for routine reconnects!).
+ * 4. Puts standby accounts to sleep (suspend) to preserve their 750 free hours.
+ * 5. If the active account exhausts hours (billing suspension), automatically awakens the next standby account in line.
+ * 6. Keeps cron-job.org pointing to the active service.
  */
 
-const CRON_JOB_API_KEY = process.env.CRON_JOB_API_KEY;
+const CRON_JOB_API_KEY = process.env.CRON_JOB_API_KEY || '3GKdFNCZXErgSKSCeHMXG2SGrBYzGN6pldcaHqBHdb8=';
 const CRON_JOB_ID = process.env.CRON_JOB_ID || '7156467';
 
 const RENDER_ACCOUNTS = [
   {
     name: 'medicoforever008',
-    apiKey: process.env.RENDER_API_KEY_1 || process.env.RENDER_API_KEY_008,
+    apiKey: process.env.RENDER_API_KEY_1 || process.env.RENDER_API_KEY_008 || 'rnd_NNtHMoAwbdGttv0F4WDvFqnbg8bR',
     serviceId: process.env.RENDER_SERVICE_ID_1 || 'srv-daa4ugpf2nfc739834v0',
     url: 'https://whatsapp-patient-bot-f9lc.onrender.com'
   },
   {
     name: 'medicoforever002',
-    apiKey: process.env.RENDER_API_KEY_2 || process.env.RENDER_API_KEY_002,
+    apiKey: process.env.RENDER_API_KEY_2 || process.env.RENDER_API_KEY_002 || 'rnd_jYutYuSK6dtAZwYKFbrjI1ekhffB',
     serviceId: process.env.RENDER_SERVICE_ID_2 || 'srv-d5jatbq4d50c73fpbgcg',
     url: 'https://whatsapp-patient-bot.onrender.com'
   },
   {
     name: 'raddoc1996',
-    apiKey: process.env.RENDER_API_KEY_3 || process.env.RENDER_API_KEY_RADDOC,
+    apiKey: process.env.RENDER_API_KEY_3 || process.env.RENDER_API_KEY_RADDOC || 'rnd_ATJs45AaaYcnkL3SETD3vBdkWVmf',
     serviceId: process.env.RENDER_SERVICE_ID_3 || 'srv-d9uvkuvavr4c73bljb10',
     url: 'https://whatsapp-patient-bot-b4tl.onrender.com'
   },
   {
     name: 'medicoforever003',
-    apiKey: process.env.RENDER_API_KEY_4 || process.env.RENDER_API_KEY_003,
+    apiKey: process.env.RENDER_API_KEY_4 || process.env.RENDER_API_KEY_003 || 'rnd_k7763fBzTQHt7R0crVsSQrWYoKFB',
     serviceId: process.env.RENDER_SERVICE_ID_4 || 'srv-da46e0fqj5pc73bdboqg',
     url: 'https://whatsapp-patient-bot-zcmf.onrender.com'
   }
@@ -183,26 +188,46 @@ async function checkAndFailover() {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 45000);
-      const hRes = await fetch(`${activeAccount.url}/health`, { signal: controller.signal });
+      let hRes = await fetch(`${activeAccount.url}/health`, { signal: controller.signal });
       clearTimeout(timeout);
+
       if (hRes.ok) {
-        const hJson = await hRes.json();
+        let hJson = await hRes.json();
         console.log(`[Failover] 🩺 HTTP Health OK: connected=${hJson.connected}, uptime=${Math.round(hJson.uptime)}s, botUser=${hJson.botUser?.id || 'none'}`);
-        if (!hJson.connected || !hJson.telegramConfigured) {
-          console.warn(`[Failover] ⚠️ Active service is missing WhatsApp connection or Telegram config. Triggering auto-heal deploy...`);
-          await triggerDeploy(activeAccount);
+
+        // If temporarily disconnected (routine 5s reconnect), wait 12s and re-check before jumping to conclusions
+        if (!hJson.connected) {
+          console.log(`[Failover] ⏳ Socket not connected, waiting 12s to see if routine reconnect is finishing...`);
+          await new Promise(r => setTimeout(r, 12000));
+          try {
+            const retryRes = await fetch(`${activeAccount.url}/health`);
+            if (retryRes.ok) {
+              hJson = await retryRes.json();
+              console.log(`[Failover] 🩺 Re-check result: connected=${hJson.connected}`);
+            }
+          } catch (_) {}
+        }
+
+        // If STILL not connected after waiting, call /reconnect endpoint to reset socket in-memory without a cold redeploy
+        if (!hJson.connected) {
+          console.warn(`[Failover] 🔄 Socket still disconnected. Calling in-memory /reconnect endpoint...`);
+          try {
+            const recRes = await fetch(`${activeAccount.url}/reconnect`);
+            const recJson = await recRes.json();
+            console.log(`[Failover] In-memory reconnect requested:`, recJson);
+          } catch (rErr) {
+            console.error(`[Failover] Failed calling /reconnect:`, rErr.message);
+          }
         }
       } else {
-        console.warn(`[Failover] ⚠️ Health check returned HTTP ${hRes.status}. Triggering deploy to recover...`);
-        await triggerDeploy(activeAccount);
+        console.warn(`[Failover] ⚠️ Health check returned HTTP ${hRes.status}.`);
       }
     } catch (err) {
-      console.warn(`[Failover] ⚠️ Health check request error: ${err.message}. Triggering deploy to wake up container...`);
-      await triggerDeploy(activeAccount);
+      console.warn(`[Failover] ⚠️ Health check request error: ${err.message}.`);
     }
 
     await updateCronJobUrl(activeAccount.url);
-    console.log(`[Failover] System healthy on ${activeAccount.name}`);
+    console.log(`[Failover] System status checked on ${activeAccount.name}`);
 
     // If month reset un-suspended any standby accounts, put them back to sleep
     for (const acc of RENDER_ACCOUNTS) {
