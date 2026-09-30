@@ -1,6 +1,5 @@
-import fetch from 'node-fetch';
-
 /**
+
  * 24/7 Render Failover & Uptime Manager
  * 
  * Logic:
