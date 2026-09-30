@@ -2015,14 +2015,14 @@ async function startBot() {
 
     botStatus = 'Connecting...';
 
-    const baileysLogger = pino({ level: 'silent' });
+    const baileysLogger = pino({ level: 'warn' });
 
     sock = makeWASocket({
       version,
       auth: state,
       logger: baileysLogger,
-      browser: ['WhatsApp-Bot', 'Chrome', '120.0.0'],
-      markOnlineOnConnect: false,
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      markOnlineOnConnect: true,
       syncFullHistory: false,
       retryRequestDelayMs: 1500,
       keepAliveIntervalMs: 25000,
@@ -2112,10 +2112,7 @@ async function startBot() {
           log('🔄', 'Restarting with fresh session in 5 seconds...');
           botReconnectTimeout = setTimeout(startBot, 5000);
         } else {
-          if (statusCode === 428 || statusCode === 408 || statusCode === 515) {
-            log('🔧', `Error ${statusCode} — clearing session keys before reconnect...`);
-            await nukeSessionKeysFromMongo();
-          }
+          // Normal disconnect/reconnect: DO NOT delete cryptographic keys on routine 428/408/500!
           // Code 440 is Stream Conflict: give previous socket 8s to drop on WhatsApp servers before reconnecting
           const reconnectDelay = statusCode === 440 ? 8000 : 5000;
           log('🔄', `Reconnecting in ${reconnectDelay / 1000} seconds...`);
@@ -2150,6 +2147,16 @@ async function startBot() {
           }
         } catch (pkErr) {
           log('ℹ️', `Pre-key status: ${pkErr.message}`);
+        }
+
+        // Send active presence so WhatsApp routes incoming group messages immediately
+        try {
+          if (typeof sock.sendPresenceUpdate === 'function') {
+            await sock.sendPresenceUpdate('available');
+            log('🟢', 'Presence set to available');
+          }
+        } catch (presErr) {
+          log('ℹ️', `Presence status: ${presErr.message}`);
         }
       }
     });
