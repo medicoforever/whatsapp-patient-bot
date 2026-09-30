@@ -279,13 +279,14 @@ async function nukeSessionKeysFromMongo() {
     return 0;
   }
   try {
+    // Only delete individual contact session ratchets, NEVER delete pre-keys or app-state-sync keys!
     const result = await SessionModel.deleteMany({
-      key: { $regex: /^key_/ }
+      key: { $regex: /^key_session_/ }
     });
-    log('🗑', ` Nuked ${result.deletedCount} signal session keys from MongoDB`);
+    log('🗑', ` Cleared ${result.deletedCount} Signal contact session keys from MongoDB (pre-keys & app-state preserved ✅)`);
     return result.deletedCount;
   } catch (error) {
-    log('❌', ` Failed to nuke keys: ${error.message}`);
+    log('❌', ` Failed to clean session keys: ${error.message}`);
     return 0;
   }
 }
@@ -1662,6 +1663,28 @@ app.get('/reconnect', async (req, res) => {
   res.json({ success: true, message: 'Reconnecting bot in 2 seconds...' });
 });
 
+app.get('/test-ping', async (req, res) => {
+  if (!sock || !isConnected) {
+    return res.status(503).json({ error: 'Bot is not connected to WhatsApp', connected: isConnected });
+  }
+  try {
+    const rawId = sock.user?.id || '';
+    const cleanNumber = rawId.split(':')[0].split('@')[0];
+    if (!cleanNumber) {
+      return res.status(500).json({ error: 'Bot user ID not resolved' });
+    }
+    const targetJid = `${cleanNumber}@s.whatsapp.net`;
+    log('🧪', `Sending diagnostic test message to self (${targetJid})...`);
+    const sent = await safeSendMessage(sock, targetJid, {
+      text: `🤖 *WhatsApp Bot Diagnostic Test*\n\n✅ *Status:* Online & Connected\n⏱ *Time:* ${new Date().toISOString()}\n⏳ *Uptime:* ${Math.round(process.uptime())}s\n🔑 *Active API Keys:* ${CONFIG.API_KEYS.length}\n\n_If you received this message, WhatsApp outbound & inbound messaging is fully operational!_`
+    });
+    res.json({ success: true, messageId: sent?.key?.id, sentTo: targetJid, timestamp: new Date().toISOString() });
+  } catch (err) {
+    log('❌', `Diagnostic test send error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/logs', (req, res) => {
   res.json({
     connected: isConnected,
@@ -1932,18 +1955,8 @@ async function startBot() {
       await connectMongoDB();
     }
 
-    // ONE-TIME STARTUP HEAL — Nuke stale session keys on first boot
-    if (!startupHealDone && mongoConnected) {
-      if (!SessionModel) {
-        SessionModel = mongoose.model('Session', sessionSchema);
-      }
-      log('🔧', '╔══════════════════════════════════════════╗');
-      log('🔧', '║ STARTUP HEAL: Cleaning session keys...  ║');
-      log('🔧', '╚══════════════════════════════════════════╝');
-      const deleted = await nukeSessionKeysFromMongo();
-      log('🔧', ` Startup heal complete. Removed ${deleted} stale keys.`);
-      startupHealDone = true;
-    }
+    // Preserving all established Signal sessions and pre-keys in MongoDB across restarts
+
 
     let state, saveCreds, clearAll, clearSessionKeys;
 
@@ -2128,6 +2141,16 @@ async function startBot() {
         log('🌍', 'Universal Mode: Bot is active for ALL chats.');
         if (CONFIG.GROUPS.CT_SOURCE) log('🏥', 'Monitoring CT Source Group');
         if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
+
+        // Refresh Signal pre-keys on WhatsApp servers to ensure incoming stanzas always have valid keys
+        try {
+          if (typeof sock.uploadPreKeys === 'function') {
+            await sock.uploadPreKeys(30);
+            log('🔑', 'Refreshed Signal pre-keys on WhatsApp servers ✅');
+          }
+        } catch (pkErr) {
+          log('ℹ️', `Pre-key status: ${pkErr.message}`);
+        }
       }
     });
 
