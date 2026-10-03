@@ -218,6 +218,12 @@ async function checkAndFailover() {
             console.error(`[Failover] Failed calling /reconnect:`, rErr.message);
           }
         }
+
+        // Detect if active service is running outdated code missing critical features
+        if (hJson.telegramConfigured === undefined) {
+          console.warn(`[Failover] ⚠️ Active account ${activeAccount.name} is running outdated code missing modern features. Triggering deploy...`);
+          await triggerDeploy(activeAccount);
+        }
       } else {
         console.warn(`[Failover] ⚠️ Health check returned HTTP ${hRes.status}.`);
       }
