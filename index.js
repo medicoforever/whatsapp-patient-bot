@@ -1685,6 +1685,32 @@ app.get('/test-ping', async (req, res) => {
   }
 });
 
+app.get('/reset-session', async (req, res) => {
+  log('⚠️', 'Session reset requested via /reset-session. Clearing auth credentials to force fresh QR code...');
+  try {
+    isConnected = false;
+    botStatus = 'Resetting session...';
+    if (sock) {
+      try {
+        sock.end(new Error('Session reset requested'));
+      } catch (_) {}
+    }
+    if (authState?.clearAll) {
+      await authState.clearAll();
+      log('🗑', 'Cleared auth credentials from database');
+    }
+    setTimeout(startBot, 2000);
+    res.json({
+      success: true,
+      message: 'Session cleared successfully! Open the main website to scan the new QR code.',
+      url: `${getBaseUrl()}/`
+    });
+  } catch (err) {
+    log('❌', `Reset session error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/logs', (req, res) => {
   res.json({
     connected: isConnected,
@@ -2169,8 +2195,8 @@ async function startBot() {
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       log('📨', `messages.upsert event: type=${type}, count=${messages?.length || 0}`);
-      if (type !== 'notify') {
-        log('ℹ️', `Skipped non-notify upsert (type=${type})`);
+      if (type !== 'notify' && type !== 'append') {
+        log('ℹ️', `Skipped unsupported upsert (type=${type})`);
         return;
       }
 
