@@ -1254,6 +1254,9 @@ app.get('/view/:viewerId', (req, res) => {
   const remainingMs = entry.expiresAt - Date.now();
   const remainingHours = Math.floor(remainingMs / 3600000);
   const remainingMins = Math.floor((remainingMs % 3600000) / 60000);
+  const maxAgeSeconds = Math.max(0, Math.floor(remainingMs / 1000));
+
+  res.setHeader('Cache-Control', `public, max-age=${maxAgeSeconds}`);
 
   let mediaHtml = '';
   media.forEach((m, index) => {
@@ -1265,29 +1268,29 @@ app.get('/view/:viewerId', (req, res) => {
         <div class="media-item">
             <div class="media-index">#${index + 1} — Image</div>
             ${caption}${fileName}
-            <img src="data:${m.mimeType};base64,${m.data}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
+            <img src="/media/${viewerId}/${index}" alt="Source Image ${index + 1}" loading="lazy" onclick="openFullscreen(this)">
         </div>`;
     } else if (m.type === 'pdf') {
       mediaHtml += `
         <div class="media-item">
             <div class="media-index">#${index + 1} — PDF</div>
             ${caption}${fileName}
-            <iframe src="data:application/pdf;base64,${m.data}" class="pdf-frame"></iframe>
-            <a href="data:application/pdf;base64,${m.data}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
+            <iframe src="/media/${viewerId}/${index}" class="pdf-frame"></iframe>
+            <a href="/media/${viewerId}/${index}" download="${m.fileName || 'document.pdf'}" class="download-btn">⬇️ Download PDF</a>
         </div>`;
     } else if (m.type === 'audio' || m.type === 'voice') {
       mediaHtml += `
         <div class="media-item">
             <div class="media-index">#${index + 1} — ${m.type === 'voice' ? 'Voice Note' : 'Audio'}</div>
             ${caption}${fileName}
-            <audio controls src="data:${m.mimeType};base64,${m.data}" style="width:100%;"></audio>
+            <audio controls src="/media/${viewerId}/${index}" style="width:100%;"></audio>
         </div>`;
     } else if (m.type === 'video') {
       mediaHtml += `
         <div class="media-item">
             <div class="media-index">#${index + 1} — Video</div>
             ${caption}${fileName}
-            <video controls src="data:${m.mimeType};base64,${m.data}" style="width:100%; max-height:500px;"></video>
+            <video controls src="/media/${viewerId}/${index}" style="width:100%; max-height:500px;"></video>
         </div>`;
     }
   });
@@ -1445,10 +1448,18 @@ app.get('/media/:viewerId/:index', (req, res) => {
     return res.status(404).send('Invalid index');
   }
 
+  const etag = `"${viewerId}-${idx}"`;
+  if (req.headers['if-none-match'] === etag) {
+    return res.status(304).end();
+  }
+
+  const remainingSeconds = Math.max(0, Math.floor((entry.expiresAt - Date.now()) / 1000));
   const m = entry.media[idx];
   const buffer = Buffer.from(m.data, 'base64');
   res.setHeader('Content-Type', m.mimeType);
   res.setHeader('Content-Length', buffer.length);
+  res.setHeader('ETag', etag);
+  res.setHeader('Cache-Control', `public, max-age=${remainingSeconds}, immutable`);
   res.send(buffer);
 });
 // ======================================================================
