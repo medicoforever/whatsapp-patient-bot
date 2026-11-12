@@ -39,8 +39,8 @@ const CONFIG = {
   API_KEYS: getApiKeys(),
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
   // 🔴 Model Chain Configuration
-  GEMINI_MODEL: 'gemini-3.8-flash',
-  GEMINI_MODEL_FALLBACK_1: 'gemini-3.7-flash',
+  GEMINI_MODEL: 'gemini-4-hydrogen',
+  GEMINI_MODEL_FALLBACK_1: 'gemini-3.8-flash',
   GEMINI_MODEL_FALLBACK_2: 'gemini-3.5-flash',
   GEMINI_MODEL_FALLBACK_3: 'gemini-3.6-flash',
   GEMINI_MODEL_FALLBACK_4: 'gemini-3-flash-preview',
@@ -3288,7 +3288,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     return null; 
   };
 
-  // 1. Loop through keys using Primary Model (gemini-3.8-flash)
+  // 1. Loop through keys using Primary Model (gemini-4-hydrogen)
   let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
   if (responseText) {
     return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
@@ -3296,7 +3296,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 
   log('⚠️', `All keys failed for primary model (${CONFIG.GEMINI_MODEL}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_1}...`);
 
-  // 2. Loop through keys using Fallback 1 Model (gemini-3.7-flash)
+  // 2. Loop through keys using Fallback 1 Model (gemini-3.8-flash)
   responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_1, false);
   if (responseText) {
     return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
