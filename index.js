@@ -19,20 +19,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Helper to parse keys from comma-separated string
-const DEFAULT_GEMINI_KEYS = [
-  'AIzaSyCH2C4C3eTk3Wj7nXFwm_CQWp1n5fY58Gw',
-  'AIzaSyB9es1ioa5T-dYfktYcMMyagtBcjGu_mNc',
-  'AIzaSyBNVt8JEC704IXxgCRD2ZaLtBKsWEMyx0U',
-  'AIzaSyDtPeyCLsfJdLFVGEcO8TRjPC9CWkDZXLs',
-  'AIzaSyCipPp4Hk1CAo8kv1mzLmSclg3xEMRVsKY'
-];
-
 const getApiKeys = () => {
   const keys = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
   const parsed = keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
-  const filtered = parsed.filter(k => k !== 'AIzaSyDXKZu77KZJG0NAEHDYRFD7G55K6l_Z1lQ');
-  if (filtered.length > 0) return filtered;
-  return [...DEFAULT_GEMINI_KEYS];
+  return parsed.filter(k => k !== 'AIzaSyDXKZu77KZJG0NAEHDYRFD7G55K6l_Z1lQ');
 };
 
 // ======================================================================
@@ -50,12 +40,11 @@ const CONFIG = {
   API_KEYS: getApiKeys(),
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
   // 🔴 Model Chain Configuration
-  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-4-hydrogen',
-  GEMINI_MODEL_FALLBACK_1: process.env.GEMINI_MODEL_FALLBACK_1 || 'gemini-3.8-flash',
-  GEMINI_MODEL_FALLBACK_2: process.env.GEMINI_MODEL_FALLBACK_2 || 'gemini-2.5-flash',
-  GEMINI_MODEL_FALLBACK_3: process.env.GEMINI_MODEL_FALLBACK_3 || 'gemini-2.5-flash-lite',
-  GEMINI_MODEL_FALLBACK_4: process.env.GEMINI_MODEL_FALLBACK_4 || 'gemini-3.5-flash',
-  GEMINI_MODEL_FALLBACK_5: process.env.GEMINI_MODEL_FALLBACK_5 || 'gemini-3.5-flash-lite',
+  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+  GEMINI_MODEL_FALLBACK_1: process.env.GEMINI_MODEL_FALLBACK_1 || 'gemini-3.5-flash',
+  GEMINI_MODEL_FALLBACK_2: process.env.GEMINI_MODEL_FALLBACK_2 || 'gemini-3.6-flash',
+  GEMINI_MODEL_FALLBACK_3: process.env.GEMINI_MODEL_FALLBACK_3 || 'gemini-3-flash-preview',
+  GEMINI_MODEL_FALLBACK_4: process.env.GEMINI_MODEL_FALLBACK_4 || 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -3245,7 +3234,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     return await generateGeminiContentMock(requestContent, systemInstruction);
   }
   if (!CONFIG.API_KEYS || CONFIG.API_KEYS.length === 0) {
-    CONFIG.API_KEYS = [...DEFAULT_GEMINI_KEYS];
+    CONFIG.API_KEYS = getApiKeys();
   }
 
   let lastErrorMsg = '';
@@ -3303,7 +3292,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
       } catch (error) {
         lastErrorMsg = error.message;
         const msg = error.message || '';
-        const isInvalidKey = msg.includes('API key not valid') || msg.includes('API_KEY_INVALID') || msg.includes('API_KEY_SERVICE_BLOCKED');
+        const isInvalidKey = msg.includes('API key not valid') || msg.includes('API_KEY_INVALID') || msg.includes('API_KEY_SERVICE_BLOCKED') || msg.includes('reported as leaked');
         const isRateLimit = msg.includes('429') || msg.includes('Quota exceeded') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Too Many Requests');
 
         if (isInvalidKey) {
@@ -3332,13 +3321,9 @@ async function generateGeminiContent(requestContent, systemInstruction) {
   const MODEL_CHAIN = [
     { name: CONFIG.GEMINI_MODEL, thinking: false },
     { name: CONFIG.GEMINI_MODEL_FALLBACK_1, thinking: false },
-    { name: 'gemini-2.5-flash', thinking: false },
-    { name: 'gemini-2.5-flash-lite', thinking: false },
-    { name: CONFIG.GEMINI_MODEL_FALLBACK_4 || 'gemini-3.5-flash', thinking: false },
-    { name: 'gemini-3.6-flash', thinking: false },
-    { name: 'gemini-3-flash-preview', thinking: false },
-    { name: CONFIG.GEMINI_MODEL_FALLBACK_5 || 'gemini-3.5-flash-lite', thinking: true },
-    { name: 'gemini-flash-latest', thinking: false }
+    { name: CONFIG.GEMINI_MODEL_FALLBACK_2, thinking: false },
+    { name: CONFIG.GEMINI_MODEL_FALLBACK_3, thinking: false },
+    { name: CONFIG.GEMINI_MODEL_FALLBACK_4, thinking: true }
   ];
 
   // Deduplicate model names preserving order
