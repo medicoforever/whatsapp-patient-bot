@@ -260,8 +260,21 @@ async function checkAccountHealth(account) {
     let json = await res.json();
     console.log(`[Failover] 🩺 HTTP Health for ${account.name}: connected=${json.connected}, uptime=${Math.round(json.uptime || 0)}s, botUser=${json.botUser?.id || 'none'}`);
 
-    // If temporarily disconnected, wait 12s and re-check before escalating
-    if (!json.connected) {
+    // Fresh cold start grace period (Baileys socket handshake takes 20-45s)
+    if (!json.connected && (json.uptime || 0) < 90) {
+      console.log(`[Failover] ⏳ Service ${account.name} recently booted (uptime: ${Math.round(json.uptime || 0)}s). Waiting 25s for initial socket handshake...`);
+      await new Promise(r => setTimeout(r, 25000));
+      try {
+        const bootRes = await fetch(`${account.url}/health`);
+        if (bootRes.ok) {
+          json = await bootRes.json();
+          console.log(`[Failover] 🩺 Fresh boot re-check: connected=${json.connected}, uptime=${Math.round(json.uptime || 0)}s`);
+        }
+      } catch (_) {}
+    }
+
+    // If temporarily disconnected on an established server, wait 12s and re-check before escalating
+    if (!json.connected && (json.uptime || 0) >= 90) {
       console.log(`[Failover] ⏳ Socket not connected on ${account.name}, waiting 12s for routine reconnect...`);
       await new Promise(r => setTimeout(r, 12000));
       try {
@@ -274,14 +287,16 @@ async function checkAccountHealth(account) {
     }
 
     // If STILL not connected after grace period, call in-memory /reconnect endpoint
-    if (!json.connected) {
+    if (!json.connected && (json.uptime || 0) >= 90) {
       console.warn(`[Failover] 🔄 Socket still disconnected. Requesting in-memory /reconnect on ${account.name}...`);
       try {
         const recRes = await fetch(`${account.url}/reconnect`);
-        const recJson = await recRes.json();
-        console.log(`[Failover] In-memory reconnect result:`, recJson);
-        // Wait 8s and re-verify
-        await new Promise(r => setTimeout(r, 8000));
+        if (recRes.ok) {
+          const recJson = await recRes.json();
+          console.log(`[Failover] In-memory reconnect result:`, recJson);
+        }
+        // Wait 10s and re-verify
+        await new Promise(r => setTimeout(r, 10000));
         const finalRes = await fetch(`${account.url}/health`);
         if (finalRes.ok) {
           json = await finalRes.json();
@@ -351,6 +366,7 @@ async function checkAndFailover() {
   if (activeEntry) {
     console.log(`\n[Failover] 🟢 Found ACTIVE service: ${activeEntry.account.name} (${activeEntry.account.url})`);
     const health = await checkAccountHealth(activeEntry.account);
+    activeEntry.uptime = health.data?.uptime || 0;
     if (health.ok) {
       activeHealthy = true;
       console.log(`[Failover] ✅ Active service ${activeEntry.account.name} is 100% HEALTHY.`);
@@ -386,13 +402,18 @@ async function checkAndFailover() {
   );
 
   if (candidates.length === 0) {
-    console.error(`[Failover] ❌ CRITICAL: No eligible standby accounts found without billing exhaustion!`);
+    console.warn(`[Failover] ℹ️ Notice: No other standby accounts available without billing exhaustion.`);
     if (activeEntry) {
-      console.warn(`[Failover] Attempting emergency redeploy on current active ${activeEntry.account.name}...`);
-      await triggerDeploy(activeEntry.account);
+      const currentUptime = activeEntry.uptime || 0;
+      if (currentUptime >= 180) {
+        console.warn(`[Failover] Active service has persistent disconnect (uptime: ${Math.round(currentUptime)}s). Attempting emergency redeploy on ${activeEntry.account.name}...`);
+        await triggerDeploy(activeEntry.account);
+      } else {
+        console.log(`[Failover] Service recently deployed or booting (uptime: ${Math.round(currentUptime)}s). Giving socket time to stabilize on ${activeEntry.account.name}.`);
+      }
       await updateCronJobUrl(activeEntry.account.url);
     }
-    return { success: false, error: 'all_accounts_exhausted' };
+    return { success: false, error: 'all_other_accounts_exhausted' };
   }
 
   // Pick first available candidate
