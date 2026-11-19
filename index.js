@@ -19,9 +19,20 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Helper to parse keys from comma-separated string
+const DEFAULT_GEMINI_KEYS = [
+  'AIzaSyCH2C4C3eTk3Wj7nXFwm_CQWp1n5fY58Gw',
+  'AIzaSyB9es1ioa5T-dYfktYcMMyagtBcjGu_mNc',
+  'AIzaSyBNVt8JEC704IXxgCRD2ZaLtBKsWEMyx0U',
+  'AIzaSyDtPeyCLsfJdLFVGEcO8TRjPC9CWkDZXLs',
+  'AIzaSyCipPp4Hk1CAo8kv1mzLmSclg3xEMRVsKY'
+];
+
 const getApiKeys = () => {
   const keys = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
-  return keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
+  const parsed = keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
+  const filtered = parsed.filter(k => k !== 'AIzaSyDXKZu77KZJG0NAEHDYRFD7G55K6l_Z1lQ');
+  if (filtered.length > 0) return filtered;
+  return [...DEFAULT_GEMINI_KEYS];
 };
 
 // ======================================================================
@@ -39,12 +50,12 @@ const CONFIG = {
   API_KEYS: getApiKeys(),
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
   // 🔴 Model Chain Configuration
-  GEMINI_MODEL: 'gemini-4-hydrogen',
-  GEMINI_MODEL_FALLBACK_1: 'gemini-3.8-flash',
-  GEMINI_MODEL_FALLBACK_2: 'gemini-3.5-flash',
-  GEMINI_MODEL_FALLBACK_3: 'gemini-3.6-flash',
-  GEMINI_MODEL_FALLBACK_4: 'gemini-3-flash-preview',
-  GEMINI_MODEL_FALLBACK_5: 'gemini-3.5-flash-lite',
+  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-4-hydrogen',
+  GEMINI_MODEL_FALLBACK_1: process.env.GEMINI_MODEL_FALLBACK_1 || 'gemini-3.8-flash',
+  GEMINI_MODEL_FALLBACK_2: process.env.GEMINI_MODEL_FALLBACK_2 || 'gemini-2.5-flash',
+  GEMINI_MODEL_FALLBACK_3: process.env.GEMINI_MODEL_FALLBACK_3 || 'gemini-2.5-flash-lite',
+  GEMINI_MODEL_FALLBACK_4: process.env.GEMINI_MODEL_FALLBACK_4 || 'gemini-3.5-flash',
+  GEMINI_MODEL_FALLBACK_5: process.env.GEMINI_MODEL_FALLBACK_5 || 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -3228,14 +3239,13 @@ function setGenerateGeminiContentMock(mockFn) {
   generateGeminiContentMock = mockFn;
 }
 
-// 🟢 MODIFIED: Fallback Model Chain Logic
+// 🟢 MODIFIED: Robust Fallback Model Chain Logic with Reactive Key Rotation & Dead Key Pruning
 async function generateGeminiContent(requestContent, systemInstruction) {
   if (generateGeminiContentMock) {
     return await generateGeminiContentMock(requestContent, systemInstruction);
   }
-  const keys = CONFIG.API_KEYS;
-  if (keys.length === 0) {
-    throw new Error('No API keys configured!');
+  if (!CONFIG.API_KEYS || CONFIG.API_KEYS.length === 0) {
+    CONFIG.API_KEYS = [...DEFAULT_GEMINI_KEYS];
   }
 
   let lastErrorMsg = '';
@@ -3248,14 +3258,15 @@ async function generateGeminiContent(requestContent, systemInstruction) {
   ];
 
   const tryModel = async (modelName, useThinking) => {
-    for (let i = 0; i < keys.length; i++) {
+    for (let i = 0; i < CONFIG.API_KEYS.length; i++) {
+      const currentKey = CONFIG.API_KEYS[i];
       try {
         if (i > 0) {
-          log('⚠️', `Waiting 2s before retrying with Backup Key #${i + 1} (${modelName})...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          log('⚠️', `Retrying with Backup Key #${i + 1} (...${currentKey.slice(-4)}) on ${modelName}...`);
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
 
-        const genAI = new GoogleGenerativeAI(keys[i]);
+        const genAI = new GoogleGenerativeAI(currentKey);
         const modelConfig = {
           model: modelName,
           safetySettings: safetySettings
@@ -3278,65 +3289,75 @@ async function generateGeminiContent(requestContent, systemInstruction) {
           throw new Error(`Empty response from API (Safety/Filter/Glitch). Feedback: ${feedback}`);
         }
 
+        // Reactive priority: Elevate winning key to index 0 so subsequent calls succeed on first attempt
+        if (i > 0) {
+          const idx = CONFIG.API_KEYS.indexOf(currentKey);
+          if (idx > 0) {
+            CONFIG.API_KEYS.splice(idx, 1);
+            CONFIG.API_KEYS.unshift(currentKey);
+          }
+        }
+
         return responseText;
 
       } catch (error) {
         lastErrorMsg = error.message;
-        log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
+        const msg = error.message || '';
+        const isInvalidKey = msg.includes('API key not valid') || msg.includes('API_KEY_INVALID') || msg.includes('API_KEY_SERVICE_BLOCKED');
+        const isRateLimit = msg.includes('429') || msg.includes('Quota exceeded') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Too Many Requests');
+
+        if (isInvalidKey) {
+          log('🚫', `Key #${i + 1} (...${currentKey.slice(-4)}) is permanently INVALID/REVOKED. Pruning from pool.`);
+          CONFIG.API_KEYS = CONFIG.API_KEYS.filter(k => k !== currentKey);
+          i--;
+          continue;
+        }
+
+        if (isRateLimit) {
+          log('⚠️', `Key #${i + 1} (...${currentKey.slice(-4)}) rate-limited/quota-exhausted on ${modelName}. Rotating to back.`);
+          const idx = CONFIG.API_KEYS.indexOf(currentKey);
+          if (idx > -1 && CONFIG.API_KEYS.length > 1) {
+            CONFIG.API_KEYS.splice(idx, 1);
+            CONFIG.API_KEYS.push(currentKey);
+            i--;
+          }
+        } else {
+          log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
+        }
       }
     }
     return null; 
   };
 
-  // 1. Loop through keys using Primary Model (gemini-4-hydrogen)
-  let responseText = await tryModel(CONFIG.GEMINI_MODEL, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL}}_`;
+  const MODEL_CHAIN = [
+    { name: CONFIG.GEMINI_MODEL, thinking: false },
+    { name: CONFIG.GEMINI_MODEL_FALLBACK_1, thinking: false },
+    { name: 'gemini-2.5-flash', thinking: false },
+    { name: 'gemini-2.5-flash-lite', thinking: false },
+    { name: CONFIG.GEMINI_MODEL_FALLBACK_4 || 'gemini-3.5-flash', thinking: false },
+    { name: 'gemini-3.6-flash', thinking: false },
+    { name: 'gemini-3-flash-preview', thinking: false },
+    { name: CONFIG.GEMINI_MODEL_FALLBACK_5 || 'gemini-3.5-flash-lite', thinking: true },
+    { name: 'gemini-flash-latest', thinking: false }
+  ];
+
+  // Deduplicate model names preserving order
+  const uniqueModels = MODEL_CHAIN.filter((m, idx, arr) => m.name && arr.findIndex(x => x.name === m.name) === idx);
+
+  for (let mIdx = 0; mIdx < uniqueModels.length; mIdx++) {
+    const { name: modelName, thinking: useThinking } = uniqueModels[mIdx];
+    if (mIdx > 0) {
+      log('⚠️', `Cascading to fallback model [${mIdx + 1}/${uniqueModels.length}]: ${modelName}...`);
+    }
+
+    const responseText = await tryModel(modelName, useThinking);
+    if (responseText) {
+      return responseText + `\n\n_{model used: ${modelName}}_`;
+    }
   }
 
-  log('⚠️', `All keys failed for primary model (${CONFIG.GEMINI_MODEL}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_1}...`);
-
-  // 2. Loop through keys using Fallback 1 Model (gemini-3.8-flash)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_1, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_1}}_`;
-  }
-
-  log('⚠️', `All keys failed for fallback 1 (${CONFIG.GEMINI_MODEL_FALLBACK_1}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_2}...`);
-
-  // 3. Loop through keys using Fallback 2 Model (gemini-3.5-flash)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_2, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_2}}_`;
-  }
-
-  log('⚠️', `All keys failed for fallback 2 (${CONFIG.GEMINI_MODEL_FALLBACK_2}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_3}...`);
-
-  // 4. Loop through keys using Fallback 3 Model (gemini-3.6-flash)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_3, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_3}}_`;
-  }
-
-  log('⚠️', `All keys failed for fallback 3 (${CONFIG.GEMINI_MODEL_FALLBACK_3}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_4}...`);
-
-  // 5. Loop through keys using Fallback 4 Model (gemini-3-flash-preview)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_4, false);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_4}}_`;
-  }
-
-  log('⚠️', `All keys failed for fallback 4 (${CONFIG.GEMINI_MODEL_FALLBACK_4}). Falling back to ${CONFIG.GEMINI_MODEL_FALLBACK_5} with HIGH thinking...`);
-
-  // 6. Loop through keys using Fallback 5 Model (gemini-3.5-flash-lite)
-  responseText = await tryModel(CONFIG.GEMINI_MODEL_FALLBACK_5, true);
-  if (responseText) {
-    return responseText + `\n\n_{model used: ${CONFIG.GEMINI_MODEL_FALLBACK_5}}_`;
-  }
-
-  // 7. All models failed across all keys
-  throw new Error(`All ${keys.length} API keys failed for all models. Last error: ${lastErrorMsg}`);
-
+  // All models failed across all keys
+  throw new Error(`All ${CONFIG.API_KEYS.length} API keys failed across all cascade models. Last error: ${lastErrorMsg}`);
 }
 
 async function runStartupRecovery() {
