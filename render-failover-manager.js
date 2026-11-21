@@ -44,10 +44,10 @@ const RENDER_ACCOUNTS = [
     url: 'https://whatsapp-patient-bot-b4tl.onrender.com'
   },
   {
-    name: 'medicoforever003_pool3',
-    apiKey: (process.env.RENDER_API_KEY_003_POOL3 || process.env.RENDER_API_KEY_5 || '').trim() || 'rnd_Ma8PeY6Nkq81TNZeozNkixIJg7eC',
-    serviceId: (process.env.RENDER_SERVICE_ID_5 || '').trim() || 'srv-da46e0fqj5pc73bdboqg',
-    url: 'https://whatsapp-patient-bot-zcmf.onrender.com'
+    name: 'medicoforever006',
+    apiKey: (process.env.RENDER_API_KEY_006 || process.env.RENDER_API_KEY_5 || '').trim() || 'rnd_AFsAqE0AQo1AqPFhY56LVYCbvlE9',
+    serviceId: (process.env.RENDER_SERVICE_ID_006 || process.env.RENDER_SERVICE_ID_5 || '').trim() || 'srv-dbafg0e1egvs73agvsk0',
+    url: 'https://whatsapp-patient-bot-pmfg.onrender.com'
   }
 ];
 
@@ -359,11 +359,32 @@ async function checkAndFailover() {
     });
   }
 
-  // Find currently active (not_suspended) service
-  let activeEntry = accountsStatus.find(e => e.state === 'ACTIVE');
+  // Enforce single-container multi-device mutual exclusivity
+  const activeEntries = accountsStatus.filter(e => e.state === 'ACTIVE');
+  let activeEntry = null;
   let activeHealthy = false;
 
-  if (activeEntry) {
+  if (activeEntries.length > 1) {
+    console.warn(`\n[Failover] ⚠️ CONFLICT HAZARD: Detected ${activeEntries.length} simultaneous active services!`);
+    console.warn(`[Failover] Checking which active service is healthy to eliminate multi-container stream conflicts...`);
+    
+    // Check health of each active service
+    for (const entry of activeEntries) {
+      const health = await checkAccountHealth(entry.account);
+      entry.uptime = health.data?.uptime || 0;
+      if (health.ok && !activeEntry) {
+        activeEntry = entry;
+        activeHealthy = true;
+        console.log(`[Failover] 🎯 Preserving primary healthy service: ${entry.account.name}`);
+      } else {
+        console.log(`[Failover] 🛑 Immediately suspending competing active service: ${entry.account.name}...`);
+        await suspendService(entry.account);
+        entry.state = 'STANDBY';
+        entry.isSuspended = true;
+      }
+    }
+  } else if (activeEntries.length === 1) {
+    activeEntry = activeEntries[0];
     console.log(`\n[Failover] 🟢 Found ACTIVE service: ${activeEntry.account.name} (${activeEntry.account.url})`);
     const health = await checkAccountHealth(activeEntry.account);
     activeEntry.uptime = health.data?.uptime || 0;
