@@ -513,7 +513,11 @@ async function useMongoDBAuthState() {
     if (!flushTimer) {
       flushTimer = setTimeout(async () => {
         flushTimer = null;
-        await flushPendingWrites();
+        try {
+          await flushPendingWrites();
+        } catch (err) {
+          log('⚠️', `flushPendingWrites error: ${err.message}`);
+        }
       }, 3000);
     }
   };
@@ -750,6 +754,14 @@ function log(emoji, message) {
   if (recentLogs.length > 200) recentLogs.shift();
 }
 
+process.on('unhandledRejection', (reason) => {
+  log('💥', `UNHANDLED REJECTION: ${reason?.stack || reason?.message || String(reason)}`);
+});
+
+process.on('uncaughtException', (err) => {
+  log('💥', `UNCAUGHT EXCEPTION: ${err?.stack || err?.message || String(err)}`);
+});
+
 function recordIncomingMessage(info) {
   recentIncomingMessages.push({
     timestamp: new Date().toISOString(),
@@ -957,44 +969,49 @@ function resetUserTimeout(chatId, senderId, senderName) {
   const shortId = getShortSenderId(senderId);
 
   const timeoutCallback = async () => {
-    if (isAutoGroup) {
-      const mediaFiles = await clearUserBuffer(chatId, senderId);
-      if (mediaFiles.length > 0) {
-        log('⏱️', `Auto-processing ${mediaFiles.length} item(s) from Auto Group (${isCTGroup ? 'CT' : 'MRI'})`);
+    try {
+      if (isAutoGroup) {
+        const mediaFiles = await clearUserBuffer(chatId, senderId);
+        if (mediaFiles.length > 0) {
+          log('⏱️', `Auto-processing ${mediaFiles.length} item(s) from Auto Group (${isCTGroup ? 'CT' : 'MRI'})`);
 
-        const targetChatId = isCTGroup ? CONFIG.GROUPS.CT_TARGET : CONFIG.GROUPS.MRI_TARGET;
+          const targetChatId = isCTGroup ? CONFIG.GROUPS.CT_TARGET : CONFIG.GROUPS.MRI_TARGET;
 
-        if (targetChatId) {
-          const batches = groupMediaSmartly(mediaFiles);
+          if (targetChatId) {
+            const batches = groupMediaSmartly(mediaFiles);
 
-          if (batches.length > 1) {
-            log('🔀', `Detected ${batches.length} distinct patient contexts. Processing separately.`);
-          }
-
-          for (let i = 0; i < batches.length; i++) {
-            const batch = batches[i];
-            if (batch.length === 0) continue;
-
-            log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
-
-            await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
-
-            if (i < batches.length - 1) {
-              await new Promise(r => setTimeout(r, 2000));
+            if (batches.length > 1) {
+              log('🔀', `Detected ${batches.length} distinct patient contexts. Processing separately.`);
             }
-          }
 
-        } else {
-          log('⚠️', 'Target group not configured for this source!');
+            for (let i = 0; i < batches.length; i++) {
+              const batch = batches[i];
+              if (batch.length === 0) continue;
+
+              log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
+
+              await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
+
+              if (i < batches.length - 1) {
+                await new Promise(r => setTimeout(r, 2000));
+              }
+            }
+
+          } else {
+            log('⚠️', 'Target group not configured for this source!');
+          }
+        }
+      } else {
+        const clearedItems = await clearUserBuffer(chatId, senderId);
+        if (clearedItems.length > 0) {
+          log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
         }
       }
-    } else {
-      const clearedItems = await clearUserBuffer(chatId, senderId);
-      if (clearedItems.length > 0) {
-        log('⏰', `Auto-cleared ${clearedItems.length} item(s) for user ...${shortId} after timeout`);
-      }
+    } catch (err) {
+      log('❌', `Auto-processing error for user ...${shortId} in ${chatId}: ${err.message}`);
+    } finally {
+      chatTimeoutMap.delete(senderId);
     }
-    chatTimeoutMap.delete(senderId);
   };
 
   chatTimeoutMap.set(senderId, setTimeout(timeoutCallback, delay));
