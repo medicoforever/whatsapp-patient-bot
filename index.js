@@ -2193,15 +2193,7 @@ async function startBot() {
         if (CONFIG.GROUPS.CT_SOURCE) log('🏥', 'Monitoring CT Source Group');
         if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
 
-        // Refresh Signal pre-keys on WhatsApp servers to ensure incoming stanzas always have valid keys
-        try {
-          if (typeof sock.uploadPreKeys === 'function') {
-            await sock.uploadPreKeys(30);
-            log('🔑', 'Refreshed Signal pre-keys on WhatsApp servers ✅');
-          }
-        } catch (pkErr) {
-          log('ℹ️', `Pre-key status: ${pkErr.message}`);
-        }
+        // Signal pre-keys are automatically uploaded by Baileys when server count drops below threshold
 
         // Send active presence so WhatsApp routes incoming group messages immediately
         try {
@@ -2268,14 +2260,18 @@ async function startBot() {
 
         // 🔧 DECRYPTION FAILURE DETECTION
         if (!msg.message) {
+          // If sent from phone (fromMe), this is a protocol sync/presence stub — ignore without retrying
+          if (fromMe) {
+            recordIncomingMessage({ msgId, chatId, senderId, fromMe: true, decision: 'ignored_outgoing_stub' });
+            continue;
+          }
           if (chatId && chatId !== 'status@broadcast') {
             recordIncomingMessage({ msgId, chatId, senderId, decision: 'empty_msg_decrypt_fail' });
             const isSourceGroup = chatId === CONFIG.GROUPS.CT_SOURCE || chatId === CONFIG.GROUPS.MRI_SOURCE;
             const isTargetGroup = chatId === CONFIG.GROUPS.CT_TARGET || chatId === CONFIG.GROUPS.MRI_TARGET;
-            const isSelf = isSelfChat(chatId);
-            if (isSourceGroup || isTargetGroup || isSelf) {
+            if (isSourceGroup || isTargetGroup) {
               // 🔄 Queue for retry instead of skipping
-              log('⏳', `Empty message body from ${isSelf ? 'Self-Chat' : chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
+              log('⏳', `Empty message body from source/target group ${chatId} — queuing for retry (msg: ${msgId ? msgId.substring(0, 8) : 'unknown'}...)`);
               if (msgId && !pendingEmptyMessages.has(msgId)) {
                 // Remove from processedMessageIds so it can be reprocessed on retry
                 processedMessageIds.delete(msgId);
