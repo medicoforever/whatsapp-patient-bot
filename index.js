@@ -2027,6 +2027,7 @@ async function connectMongoDB() {
 let isBotStarting = false;
 let botReconnectTimeout = null;
 let reconnectAttempts = 0;
+let connectionStabilizedTimer = null;
 
 async function startBot() {
   if (isBotStarting) {
@@ -2195,6 +2196,11 @@ async function startBot() {
         qrCodeDataURL = null;
         pairingCode = null;
 
+        if (connectionStabilizedTimer) {
+          clearTimeout(connectionStabilizedTimer);
+          connectionStabilizedTimer = null;
+        }
+
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.output?.payload?.message || lastDisconnect?.error?.message || 'Unknown';
 
@@ -2242,10 +2248,18 @@ async function startBot() {
 
       } else if (connection === 'open') {
         isConnected = true;
-        reconnectAttempts = 0;
         qrCodeDataURL = null;
         pairingCode = null;
         botStatus = 'Connected';
+
+        // Only reset reconnect attempts after socket remains stable for 30s
+        if (connectionStabilizedTimer) clearTimeout(connectionStabilizedTimer);
+        connectionStabilizedTimer = setTimeout(() => {
+          if (isConnected) {
+            reconnectAttempts = 0;
+            log('🟢', 'WhatsApp connection stabilized (30s+). Reconnection counters reset.');
+          }
+        }, 30000);
 
         // 🔧 Reset decryption failure counter on successful connection
         decryptFailTimestamps = [];
