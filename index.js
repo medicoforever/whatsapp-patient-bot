@@ -3223,6 +3223,7 @@ async function handleReplyToBot(sock, msg, chatId, quotedMessageId, senderId, se
 }
 
 let generateGeminiContentMock = null;
+const modelCooldowns = new Map();
 
 function setGenerateGeminiContentMock(mockFn) {
   generateGeminiContentMock = mockFn;
@@ -3247,12 +3248,23 @@ async function generateGeminiContent(requestContent, systemInstruction) {
   ];
 
   const tryModel = async (modelName, useThinking) => {
-    for (let i = 0; i < CONFIG.API_KEYS.length; i++) {
-      const currentKey = CONFIG.API_KEYS[i];
+    // Check if model is on cooldown
+    if (modelCooldowns.has(modelName) && Date.now() < modelCooldowns.get(modelName)) {
+      log('⏳', `Model ${modelName} is in quota cooldown (${Math.round((modelCooldowns.get(modelName) - Date.now()) / 1000)}s remaining). Cascading immediately...`);
+      return null;
+    }
+
+    const keysToTry = [...CONFIG.API_KEYS];
+    let allRateLimited = true;
+
+    for (let i = 0; i < keysToTry.length; i++) {
+      const currentKey = keysToTry[i];
+      if (!CONFIG.API_KEYS.includes(currentKey)) continue; // was pruned dynamically
+
       try {
         if (i > 0) {
           log('⚠️', `Retrying with Backup Key #${i + 1} (...${currentKey.slice(-4)}) on ${modelName}...`);
-          await new Promise(resolve => setTimeout(resolve, 500));
+          await new Promise(resolve => setTimeout(resolve, 300));
         }
 
         const genAI = new GoogleGenerativeAI(currentKey);
@@ -3296,25 +3308,31 @@ async function generateGeminiContent(requestContent, systemInstruction) {
         const isRateLimit = msg.includes('429') || msg.includes('Quota exceeded') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Too Many Requests');
 
         if (isInvalidKey) {
-          log('🚫', `Key #${i + 1} (...${currentKey.slice(-4)}) is permanently INVALID/REVOKED. Pruning from pool.`);
+          log('🚫', `Key (...${currentKey.slice(-4)}) is permanently INVALID/REVOKED. Pruning from pool.`);
           CONFIG.API_KEYS = CONFIG.API_KEYS.filter(k => k !== currentKey);
-          i--;
           continue;
         }
 
         if (isRateLimit) {
-          log('⚠️', `Key #${i + 1} (...${currentKey.slice(-4)}) rate-limited/quota-exhausted on ${modelName}. Rotating to back.`);
+          log('⚠️', `Key (...${currentKey.slice(-4)}) rate-limited/quota-exhausted on ${modelName}. Rotating to back.`);
           const idx = CONFIG.API_KEYS.indexOf(currentKey);
           if (idx > -1 && CONFIG.API_KEYS.length > 1) {
             CONFIG.API_KEYS.splice(idx, 1);
             CONFIG.API_KEYS.push(currentKey);
-            i--;
           }
         } else {
-          log('❌', `Key #${i + 1} (${modelName}) failed: ${error.message}`);
+          allRateLimited = false;
+          log('❌', `Key (...${currentKey.slice(-4)}) failed on ${modelName}: ${error.message}`);
         }
       }
     }
+
+    // If all keys hit rate-limit on this model, put it on 15m cooldown to avoid wasting time on every message
+    if (allRateLimited && keysToTry.length > 0) {
+      log('⏸️', `All ${keysToTry.length} keys exhausted quota for ${modelName}. Putting ${modelName} on 15m cooldown.`);
+      modelCooldowns.set(modelName, Date.now() + 15 * 60 * 1000);
+    }
+
     return null; 
   };
 
