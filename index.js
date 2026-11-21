@@ -291,6 +291,56 @@ async function nukeSessionKeysFromMongo() {
   }
 }
 
+// ======================================================================
+// 🧹 AUTONOMOUS PRE-KEY PRUNER (Keeps MongoDB lean, lightning fast & under limit)
+// ======================================================================
+async function pruneOldPreKeysFromMongo() {
+  if (!mongoConnected || !SessionModel) return 0;
+  try {
+    const credsDoc = await SessionModel.findOne({ key: 'auth_creds' });
+    if (!credsDoc || !credsDoc.value) return 0;
+    let creds;
+    try {
+      creds = typeof credsDoc.value === 'string' ? JSON.parse(credsDoc.value) : credsDoc.value;
+    } catch (_) {
+      return 0;
+    }
+    const nextId = creds?.nextPreKeyId || 0;
+    if (nextId <= 300) return 0; // Not enough keys to warrant pruning
+    const cutoff = nextId - 150; // Keep the latest 150 pre-keys
+
+    const preKeys = await SessionModel.find(
+      { key: { $regex: /^key_pre-key_/ } },
+      { key: 1 }
+    ).lean();
+
+    const keysToDelete = [];
+    for (const doc of preKeys) {
+      const id = parseInt(doc.key.replace('key_pre-key_', ''), 10);
+      if (!isNaN(id) && id < cutoff) {
+        keysToDelete.push(doc.key);
+      }
+    }
+
+    if (keysToDelete.length > 0) {
+      const batchSize = 1000;
+      let deleted = 0;
+      for (let i = 0; i < keysToDelete.length; i += batchSize) {
+        const slice = keysToDelete.slice(i, i + batchSize);
+        const res = await SessionModel.deleteMany({ key: { $in: slice } });
+        deleted += res.deletedCount;
+      }
+      log('🧹', `Autonomously pruned ${deleted} obsolete pre-keys from MongoDB (kept latest 150)`);
+      return deleted;
+    }
+    return 0;
+  } catch (err) {
+    log('⚠️', `Autonomous pre-key pruning error: ${err.message}`);
+    return 0;
+  }
+}
+setInterval(pruneOldPreKeysFromMongo, 12 * 60 * 60 * 1000).unref();
+
 async function triggerSessionHeal(reason = 'threshold') {
   if (isHealingInProgress) return;
   isHealingInProgress = true;
@@ -1961,9 +2011,10 @@ async function connectMongoDB() {
     mongoConnected = true;
     log('✅', 'MongoDB connected! Sessions will persist.');
 
-    // 🔥 Startup Recovery: Process any pending media that was abandoned during a restart
+    // 🔥 Startup Recovery & Autonomous Maintenance
     setTimeout(async () => {
       await runStartupRecovery();
+      await pruneOldPreKeysFromMongo();
     }, 5000);
     return true;
   } catch (error) {
@@ -1975,6 +2026,7 @@ async function connectMongoDB() {
 
 let isBotStarting = false;
 let botReconnectTimeout = null;
+let reconnectAttempts = 0;
 
 async function startBot() {
   if (isBotStarting) {
@@ -1993,6 +2045,8 @@ async function startBot() {
     log('🧹', 'Cleaning up previous socket before starting new connection...');
     try {
       sock.ev?.removeAllListeners();
+      try { sock.ws?.close?.(); } catch(_) {}
+      try { sock.ws?.terminate?.(); } catch(_) {}
       sock.end?.(new Error('Reconnecting'));
     } catch (_) {}
     sock = null;
@@ -2166,15 +2220,29 @@ async function startBot() {
           log('🔄', 'Restarting with fresh session in 5 seconds...');
           botReconnectTimeout = setTimeout(startBot, 5000);
         } else {
+          reconnectAttempts++;
           // Normal disconnect/reconnect: DO NOT delete cryptographic keys on routine 428/408/500!
-          // Code 440 is Stream Conflict: give previous socket 8s to drop on WhatsApp servers before reconnecting
-          const reconnectDelay = statusCode === 440 ? 8000 : 5000;
-          log('🔄', `Reconnecting in ${reconnectDelay / 1000} seconds...`);
+          let reconnectDelay;
+          if (statusCode === 440) {
+            // Autonomous healing: if 8 consecutive 440 conflicts occur, auto-heal stale session keys
+            if (reconnectAttempts >= 8) {
+              log('🔧', `Autonomous heal: ${reconnectAttempts} consecutive 440 conflicts. Auto-resetting session keys...`);
+              await triggerSessionHeal('consecutive_440_conflicts');
+              reconnectAttempts = 0;
+            }
+            // Code 440 is Stream Conflict: give previous socket escalating time to drop on WhatsApp servers
+            reconnectDelay = Math.min(8000 + (reconnectAttempts * 6000), 32000);
+            log('🔄', `Stream conflict (440). Attempt ${reconnectAttempts}. Waiting ${reconnectDelay / 1000}s for server socket to clear...`);
+          } else {
+            reconnectDelay = Math.min(3000 + (reconnectAttempts * 2000), 20000);
+            log('🔄', `Reconnecting in ${reconnectDelay / 1000} seconds...`);
+          }
           botReconnectTimeout = setTimeout(startBot, reconnectDelay);
         }
 
       } else if (connection === 'open') {
         isConnected = true;
+        reconnectAttempts = 0;
         qrCodeDataURL = null;
         pairingCode = null;
         botStatus = 'Connected';
@@ -2195,15 +2263,12 @@ async function startBot() {
 
         // Signal pre-keys are automatically uploaded by Baileys when server count drops below threshold
 
-        // Send active presence so WhatsApp routes incoming group messages immediately
-        try {
-          if (typeof sock.sendPresenceUpdate === 'function') {
-            await sock.sendPresenceUpdate('available');
-            log('🟢', 'Presence set to available');
+        // Send active presence safely after handshake has stabilized (10s delay prevents conflict race condition)
+        setTimeout(() => {
+          if (isConnected && sock?.sendPresenceUpdate) {
+            sock.sendPresenceUpdate('available').catch(() => {});
           }
-        } catch (presErr) {
-          log('ℹ️', `Presence status: ${presErr.message}`);
-        }
+        }, 10000);
       }
     });
 
