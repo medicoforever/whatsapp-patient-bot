@@ -35,16 +35,38 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 
 // ======================================================================
 
+function isAllowedGeminiModel(modelName) {
+  if (!modelName || typeof modelName !== 'string') return false;
+  const lower = modelName.trim().toLowerCase();
+  if (lower.includes('hydrogen') || lower.includes('gemini-4') || lower.includes('2.5')) {
+    return false;
+  }
+  return true;
+}
+
+const REQUESTED_DEFAULT_MODEL_HIERARCHY = [
+  'gemini-3.8-flash',
+  'gemini-3.5-flash',
+  'gemini-3.6-flash',
+  'gemini-3-flash-preview',
+  'gemini-3.5-flash-lite'
+];
+
+function isProductionEnv() {
+  if (process.env.NODE_ENV === 'test') return false;
+  return Boolean(process.env.RENDER || process.env.NODE_ENV === 'production' || !process.env.LOCAL_DEV);
+}
+
 const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
-  // 🔴 Model Chain Configuration
-  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-  GEMINI_MODEL_FALLBACK_1: process.env.GEMINI_MODEL_FALLBACK_1 || 'gemini-3.5-flash',
-  GEMINI_MODEL_FALLBACK_2: process.env.GEMINI_MODEL_FALLBACK_2 || 'gemini-3.6-flash',
-  GEMINI_MODEL_FALLBACK_3: process.env.GEMINI_MODEL_FALLBACK_3 || 'gemini-3-flash-preview',
-  GEMINI_MODEL_FALLBACK_4: process.env.GEMINI_MODEL_FALLBACK_4 || 'gemini-3.5-flash-lite',
+  // 🔴 Model Chain Configuration - Strictly preserving requested hierarchy (no gemini-4-hydrogen, no gemini-2.5)
+  GEMINI_MODEL: (process.env.GEMINI_MODEL && isAllowedGeminiModel(process.env.GEMINI_MODEL)) ? process.env.GEMINI_MODEL.trim() : 'gemini-3.8-flash',
+  GEMINI_MODEL_FALLBACK_1: (process.env.GEMINI_MODEL_FALLBACK_1 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_1)) ? process.env.GEMINI_MODEL_FALLBACK_1.trim() : 'gemini-3.5-flash',
+  GEMINI_MODEL_FALLBACK_2: (process.env.GEMINI_MODEL_FALLBACK_2 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_2)) ? process.env.GEMINI_MODEL_FALLBACK_2.trim() : 'gemini-3.6-flash',
+  GEMINI_MODEL_FALLBACK_3: (process.env.GEMINI_MODEL_FALLBACK_3 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_3)) ? process.env.GEMINI_MODEL_FALLBACK_3.trim() : 'gemini-3-flash-preview',
+  GEMINI_MODEL_FALLBACK_4: (process.env.GEMINI_MODEL_FALLBACK_4 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_4)) ? process.env.GEMINI_MODEL_FALLBACK_4.trim() : 'gemini-3.5-flash-lite',
   MONGODB_URI: process.env.MONGODB_URI,
 
   // Group Routing Configuration
@@ -1704,7 +1726,22 @@ app.get('/', async (req, res) => {
   res.send(html);
 });
 
+const STARTUP_GRACE_PERIOD_S = 90; // Grace period (seconds) for Baileys socket handshake & auth
+
 app.get('/ping', (req, res) => {
+  const uptime = process.uptime ? process.uptime() : 0;
+  if (!isConnected && uptime >= STARTUP_GRACE_PERIOD_S) {
+    if (req.accepts('json') && !req.accepts('text/html') && !req.accepts('text/plain')) {
+      return res.status(503).json({
+        status: 'error',
+        connected: false,
+        uptime: Math.round(uptime),
+        mongoConnected,
+        reason: 'WhatsApp socket is disconnected past initial startup grace period'
+      });
+    }
+    return res.status(503).send(`SERVICE_UNAVAILABLE: WhatsApp socket is disconnected (uptime: ${Math.round(uptime)}s, mongoConnected: ${mongoConnected})`);
+  }
   res.status(200).send('OK');
 });
 
@@ -1983,6 +2020,11 @@ async function loadBaileys() {
 
 async function connectMongoDB() {
   if (!CONFIG.MONGODB_URI) {
+    if (isProductionEnv()) {
+      log('🚨', 'FATAL: MONGODB_URI is not configured in production! Ephemeral fallback is blocked to prevent QR scan thrashing.');
+      mongoConnected = false;
+      return false;
+    }
     log('⚠️', 'No MONGODB_URI configured - sessions will not persist!');
     return false;
   }
@@ -2082,6 +2124,11 @@ async function startBot() {
         throw e;
       }
     } else {
+      if (isProductionEnv()) {
+        botStatus = 'Fatal: Missing MONGODB_URI in production';
+        log('🚨', 'FATAL: Ephemeral file session fallback is disabled in production to prevent QR scan loops. MONGODB_URI must be configured.');
+        throw new Error('MONGODB_URI is required in production. Refusing ephemeral auth fallback to prevent QR scan loop.');
+      }
       const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
       const authPath = join(__dirname, 'auth_session');
       const fileAuth = await useMultiFileAuthState(authPath);
@@ -2427,9 +2474,16 @@ async function startBot() {
   } catch (error) {
     log('💥', `Bot error: ${error.message}`);
     console.error(error);
-    botStatus = 'Error - restarting...';
-    if (botReconnectTimeout) clearTimeout(botReconnectTimeout);
-    botReconnectTimeout = setTimeout(startBot, 10000);
+    if (error.message && error.message.includes('MONGODB_URI is required in production')) {
+      botStatus = 'Fatal: Missing MONGODB_URI in production';
+      log('🛑', 'Halting rapid restart loop: MONGODB_URI is missing in production. Waiting 60s before retry.');
+      if (botReconnectTimeout) clearTimeout(botReconnectTimeout);
+      botReconnectTimeout = setTimeout(startBot, 60000);
+    } else {
+      botStatus = 'Error - restarting...';
+      if (botReconnectTimeout) clearTimeout(botReconnectTimeout);
+      botReconnectTimeout = setTimeout(startBot, 10000);
+    }
   } finally {
     isBotStarting = false;
   }
@@ -3428,13 +3482,17 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     return null; 
   };
 
-  const MODEL_CHAIN = [
-    { name: CONFIG.GEMINI_MODEL, thinking: false },
-    { name: CONFIG.GEMINI_MODEL_FALLBACK_1, thinking: false },
-    { name: CONFIG.GEMINI_MODEL_FALLBACK_2, thinking: false },
-    { name: CONFIG.GEMINI_MODEL_FALLBACK_3, thinking: false },
-    { name: CONFIG.GEMINI_MODEL_FALLBACK_4, thinking: true }
-  ];
+  const candidateModels = [
+    CONFIG.GEMINI_MODEL,
+    CONFIG.GEMINI_MODEL_FALLBACK_1,
+    CONFIG.GEMINI_MODEL_FALLBACK_2,
+    CONFIG.GEMINI_MODEL_FALLBACK_3,
+    CONFIG.GEMINI_MODEL_FALLBACK_4
+  ].filter(m => m && isAllowedGeminiModel(m));
+
+  // Strict requested hierarchy: gemini-3.8-flash -> gemini-3.5-flash -> gemini-3.6-flash -> gemini-3-flash-preview -> gemini-3.5-flash-lite
+  const effectiveModels = candidateModels.length > 0 ? candidateModels : REQUESTED_DEFAULT_MODEL_HIERARCHY;
+  const MODEL_CHAIN = effectiveModels.map(name => ({ name, thinking: false }));
 
   // Deduplicate model names preserving order
   const uniqueModels = MODEL_CHAIN.filter((m, idx, arr) => m.name && arr.findIndex(x => x.name === m.name) === idx);
@@ -4075,7 +4133,11 @@ export {
   useMongoDBAuthState,
   safeSendMessage,
   isOurBotMessage,
-  isSelfChat
+  isSelfChat,
+  isAllowedGeminiModel,
+  REQUESTED_DEFAULT_MODEL_HIERARCHY,
+  isProductionEnv,
+  STARTUP_GRACE_PERIOD_S
 };
 
 if (process.env.NODE_ENV !== 'test' && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index'))) {

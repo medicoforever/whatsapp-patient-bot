@@ -51,6 +51,174 @@ const RENDER_ACCOUNTS = [
   }
 ];
 
+const MASTER_ENV_CONFIG = {
+  NODE_VERSION: '20.10.0',
+  MONGODB_URI: (process.env.MONGODB_URI || '').trim() || 'mongodb+srv://raddoc1996_db_user:lNryCi4OV8MApRoC@cluster0.yxtnjug.mongodb.net/?appName=Cluster0',
+  GROUP_MRI_TARGET: (process.env.GROUP_MRI_TARGET || '').trim() || '120363424585068867@g.us',
+  GROUP_MRI_SOURCE: (process.env.GROUP_MRI_SOURCE || '').trim() || '120363047547742844@g.us',
+  GROUP_CT_TARGET: (process.env.GROUP_CT_TARGET || '').trim() || '120363425099016220@g.us',
+  GROUP_CT_SOURCE: (process.env.GROUP_CT_SOURCE || '').trim() || '919442508568-1594612808@g.us',
+  ALLOWED_GROUP_ID: (process.env.ALLOWED_GROUP_ID || '').trim() || '120363405051771143@g.us',
+  TELEGRAM_BOT_TOKEN: (process.env.TELEGRAM_BOT_TOKEN || '').trim() || '8858327878:AAFuXpgwGN-vbDf-i5dlzwX46-D75BMMKEo',
+  TELEGRAM_CT_CHAT_ID: (process.env.TELEGRAM_CT_CHAT_ID || '').trim() || '-1004456617705',
+  TELEGRAM_MRI_CHAT_ID: (process.env.TELEGRAM_MRI_CHAT_ID || '').trim() || '-1004380868476',
+  GEMINI_API_KEYS: (process.env.GEMINI_API_KEYS || '').trim()
+};
+
+async function getAccountEnvVars(account) {
+  if (!account.apiKey || !account.serviceId) return null;
+  try {
+    const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/env-vars`, {
+      headers: {
+        'Authorization': `Bearer ${account.apiKey}`,
+        'Accept': 'application/json'
+      }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const map = new Map();
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          const k = item.envVar?.key || item.key;
+          const v = item.envVar?.value ?? item.value ?? '';
+          if (k) map.set(k, v);
+        }
+      }
+      return map;
+    }
+  } catch (err) {
+    console.warn(`[Failover] Failed fetching env vars for ${account.name}: ${err.message}`);
+  }
+  return null;
+}
+
+async function resolveMasterEnvConfig() {
+  const master = { ...MASTER_ENV_CONFIG };
+
+  // Allow process.env overrides
+  for (const key of Object.keys(master)) {
+    if (process.env[key] && process.env[key].trim()) {
+      master[key] = process.env[key].trim();
+    }
+  }
+
+  // Scan reachable Render accounts to pull configured variables (e.g. GEMINI_API_KEYS, MONGODB_URI)
+  for (const acc of RENDER_ACCOUNTS) {
+    if (!acc.apiKey || !acc.serviceId) continue;
+    try {
+      const map = await getAccountEnvVars(acc);
+      if (map && map.size >= 1) {
+        for (const [k, v] of map.entries()) {
+          if (v && (!master[k] || master[k].length === 0)) {
+            master[k] = v;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  return master;
+}
+
+async function syncAccountEnvVars(account, masterConfig) {
+  if (!account.apiKey || !account.serviceId) {
+    return { synced: false, reason: 'missing_credentials' };
+  }
+
+  const existingMap = await getAccountEnvVars(account);
+  if (!existingMap) {
+    return { synced: false, reason: 'failed_to_fetch_existing_vars' };
+  }
+
+  const requiredKeys = Object.keys(masterConfig);
+  const missingOrEmpty = [];
+
+  for (const key of requiredKeys) {
+    const existingVal = existingMap.get(key);
+    if (existingVal === undefined || existingVal === null || existingVal === '') {
+      missingOrEmpty.push(key);
+    }
+  }
+
+  if (missingOrEmpty.length === 0) {
+    console.log(`[Failover] 🛡️ Configuration on ${account.name} is complete (${existingMap.size} variables verified).`);
+    return { synced: true, updated: false, missingCount: 0 };
+  }
+
+  console.warn(`[Failover] ⚠️ Self-Healing Triggered: ${account.name} is missing ${missingOrEmpty.length} variables: ${missingOrEmpty.join(', ')}`);
+
+  // Build merged payload preserving existing keys and supplementing missing keys
+  const mergedPayload = [];
+  for (const [key, value] of existingMap.entries()) {
+    const finalVal = (value !== '' && value !== null && value !== undefined) ? value : (masterConfig[key] || '');
+    mergedPayload.push({ key, value: finalVal });
+  }
+
+  for (const key of missingOrEmpty) {
+    if (!existingMap.has(key)) {
+      mergedPayload.push({ key, value: masterConfig[key] || '' });
+    }
+  }
+
+  try {
+    const putRes = await fetch(`https://api.render.com/v1/services/${account.serviceId}/env-vars`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${account.apiKey}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(mergedPayload)
+    });
+
+    if (putRes.ok) {
+      console.log(`[Failover] ✅ Injected ${missingOrEmpty.length} missing environment variables into ${account.name}!`);
+      return { synced: true, updated: true, missingCount: missingOrEmpty.length, injected: missingOrEmpty };
+    } else {
+      const errText = await putRes.text();
+      console.error(`[Failover] ❌ Failed injecting env vars into ${account.name}: HTTP ${putRes.status} - ${errText}`);
+      return { synced: false, updated: false, reason: `put_error_${putRes.status}` };
+    }
+  } catch (err) {
+    console.error(`[Failover] Error pushing env vars to ${account.name}:`, err.message);
+    return { synced: false, updated: false, reason: err.message };
+  }
+}
+
+async function getRecentDeploys(account, limit = 5) {
+  if (!account.apiKey || !account.serviceId) return [];
+  try {
+    const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/deploys?limit=${limit}`, {
+      headers: {
+        'Authorization': `Bearer ${account.apiKey}`,
+        'Accept': 'application/json'
+      }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data) ? data.map(item => item.deploy || item) : [];
+    }
+  } catch (err) {
+    console.warn(`[Failover] Failed fetching deploys for ${account.name}: ${err.message}`);
+  }
+  return [];
+}
+
+function hasRecentDeployWithinMinutes(deploys, minutes = 30) {
+  if (!Array.isArray(deploys) || deploys.length === 0) return false;
+  const cutoff = Date.now() - (minutes * 60 * 1000);
+  for (const dep of deploys) {
+    const timestampStr = dep.createdAt || dep.startedAt;
+    if (timestampStr) {
+      const t = new Date(timestampStr).getTime();
+      if (!isNaN(t) && t > cutoff) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 async function getServiceStatus(account) {
   if (!account.apiKey) {
     console.warn(`[Failover] Warning: No API key provided for ${account.name}.`);
@@ -327,6 +495,7 @@ async function checkAndFailover() {
   console.log(`[Failover] 🔍 Scanning Render Accounts & Services (${new Date().toISOString()})`);
   console.log(`=============================================================`);
 
+  const masterConfig = await resolveMasterEnvConfig();
   const accountsStatus = [];
 
   for (const acc of RENDER_ACCOUNTS) {
@@ -401,6 +570,9 @@ async function checkAndFailover() {
     await updateCronJobUrl(activeEntry.account.url);
     await updateCronJobWatchdog(GITHUB_TOKEN);
 
+    // Verify active service has complete configuration
+    await syncAccountEnvVars(activeEntry.account, masterConfig);
+
     // Put any awake standby services to sleep to conserve free hours
     for (const entry of accountsStatus) {
       if (entry.account.serviceId !== activeEntry.account.serviceId && !entry.isSuspended) {
@@ -426,8 +598,32 @@ async function checkAndFailover() {
     console.warn(`[Failover] ℹ️ Notice: No other standby accounts available without billing exhaustion.`);
     if (activeEntry) {
       const currentUptime = activeEntry.uptime || 0;
-      if (currentUptime >= 180) {
-        console.warn(`[Failover] Active service has persistent disconnect (uptime: ${Math.round(currentUptime)}s). Attempting emergency redeploy on ${activeEntry.account.name}...`);
+
+      // 1. Self-healing: verify and inject any missing environment variables first
+      console.log(`[Failover] 🔍 Verifying configuration integrity on ${activeEntry.account.name}...`);
+      const syncRes = await syncAccountEnvVars(activeEntry.account, masterConfig);
+      if (syncRes.updated) {
+        console.log(`[Failover] 🚀 Missing configuration injected into ${activeEntry.account.name}. Triggering fresh deployment to apply...`);
+        await triggerDeploy(activeEntry.account);
+        await updateCronJobUrl(activeEntry.account.url);
+        return { success: true, healed: 'env_vars_injected', active: activeEntry.account.name };
+      }
+
+      // 2. Anti-thrashing guard: verify MONGODB_URI is present and check deploy frequency
+      const envMap = await getAccountEnvVars(activeEntry.account);
+      if (!envMap || !envMap.get('MONGODB_URI')) {
+        console.error(`[Failover] 🛑 Breaking redeploy loop: Database credentials (MONGODB_URI) are missing on ${activeEntry.account.name}. Redeploying would thrash without healing.`);
+        await updateCronJobUrl(activeEntry.account.url);
+        return { success: false, error: 'missing_database_credentials' };
+      }
+
+      const recentDeploys = await getRecentDeploys(activeEntry.account, 3);
+      const recentlyDeployed = hasRecentDeployWithinMinutes(recentDeploys, 30);
+
+      if (recentlyDeployed) {
+        console.warn(`[Failover] 🛑 Breaking redeploy loop: Service ${activeEntry.account.name} was redeployed within the last 30 minutes. Allowing socket/database to stabilize without redeploy thrashing.`);
+      } else if (currentUptime >= 180) {
+        console.warn(`[Failover] Active service has persistent disconnect (uptime: ${Math.round(currentUptime)}s) and no recent redeploy. Triggering emergency redeploy on ${activeEntry.account.name}...`);
         await triggerDeploy(activeEntry.account);
       } else {
         console.log(`[Failover] Service recently deployed or booting (uptime: ${Math.round(currentUptime)}s). Giving socket time to stabilize on ${activeEntry.account.name}.`);
@@ -440,6 +636,10 @@ async function checkAndFailover() {
   // Pick first available candidate
   const target = candidates[0];
   console.log(`[Failover] 🎯 Selected failover target: ${target.account.name} (${target.account.serviceId})`);
+
+  // Ensure environment variables are synchronized before activating or resuming target standby
+  console.log(`[Failover] 🔄 Synchronizing environment variables for standby candidate ${target.account.name}...`);
+  await syncAccountEnvVars(target.account, masterConfig);
 
   // If old active service was unhealthy, put it to sleep to avoid socket conflicts
   if (activeEntry && activeEntry.account.serviceId !== target.account.serviceId) {
@@ -455,6 +655,7 @@ async function checkAndFailover() {
     for (let c = 1; c < candidates.length; c++) {
       const alt = candidates[c];
       console.log(`[Failover] Attempting resume on alternate: ${alt.account.name}...`);
+      await syncAccountEnvVars(alt.account, masterConfig);
       if (await resumeService(alt.account)) {
         await triggerDeploy(alt.account);
         await updateCronJobUrl(alt.account.url);
@@ -491,4 +692,15 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   });
 }
 
-export { checkAndFailover, RENDER_ACCOUNTS, updateCronJobUrl, updateCronJobWatchdog };
+export {
+  checkAndFailover,
+  RENDER_ACCOUNTS,
+  updateCronJobUrl,
+  updateCronJobWatchdog,
+  MASTER_ENV_CONFIG,
+  resolveMasterEnvConfig,
+  getAccountEnvVars,
+  syncAccountEnvVars,
+  getRecentDeploys,
+  hasRecentDeployWithinMinutes
+};
