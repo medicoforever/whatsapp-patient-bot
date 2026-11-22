@@ -21,7 +21,7 @@ const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '').tr
 const RENDER_ACCOUNTS = [
   {
     name: 'medicoforever003',
-    apiKey: (process.env.RENDER_API_KEY_003 || process.env.RENDER_API_KEY_4 || process.env.RENDER_API_KEY_2 || '').trim() || 'rnd_k7763fBzTQHt7R0crVsSQrWYoKFB',
+    apiKey: (process.env.RENDER_API_KEY_003 || process.env.RENDER_API_KEY_4 || '').trim() || 'rnd_k7763fBzTQHt7R0crVsSQrWYoKFB',
     serviceId: (process.env.RENDER_SERVICE_ID_003 || process.env.RENDER_SERVICE_ID_4 || '').trim() || 'srv-da46e0fqj5pc73bdboqg',
     url: 'https://whatsapp-patient-bot-zcmf.onrender.com'
   },
@@ -33,13 +33,13 @@ const RENDER_ACCOUNTS = [
   },
   {
     name: 'medicoforever002',
-    apiKey: (process.env.RENDER_API_KEY_002 || process.env.RENDER_API_KEY_2 || process.env.RENDER_API_KEY_3 || '').trim() || 'rnd_jYutYuSK6dtAZwYKFbrjI1ekhffB',
+    apiKey: (process.env.RENDER_API_KEY_002 || process.env.RENDER_API_KEY_2 || '').trim() || 'rnd_jYutYuSK6dtAZwYKFbrjI1ekhffB',
     serviceId: (process.env.RENDER_SERVICE_ID_002 || process.env.RENDER_SERVICE_ID_2 || '').trim() || 'srv-d5jatbq4d50c73fpbgcg',
     url: 'https://whatsapp-patient-bot.onrender.com'
   },
   {
     name: 'raddoc1996',
-    apiKey: (process.env.RENDER_API_KEY_RADDOC || process.env.RENDER_API_KEY_3 || process.env.RENDER_API_KEY_4 || '').trim() || 'rnd_ATJs45AaaYcnkL3SETD3vBdkWVmf',
+    apiKey: (process.env.RENDER_API_KEY_RADDOC || process.env.RENDER_API_KEY_3 || '').trim() || 'rnd_ATJs45AaaYcnkL3SETD3vBdkWVmf',
     serviceId: (process.env.RENDER_SERVICE_ID_RADDOC || process.env.RENDER_SERVICE_ID_3 || '').trim() || 'srv-d9uvkuvavr4c73bljb10',
     url: 'https://whatsapp-patient-bot-b4tl.onrender.com'
   },
@@ -476,8 +476,11 @@ async function checkAccountHealth(account) {
 
     // Check if outdated code
     if (json.telegramConfigured === undefined) {
-      console.warn(`[Failover] ⚠️ ${account.name} is running older code missing modern features. Triggering deploy...`);
-      await triggerDeploy(account);
+      const recentDeploys = await getRecentDeploys(account, 3);
+      if (!hasRecentDeployWithinMinutes(recentDeploys, 30)) {
+        console.warn(`[Failover] ⚠️ ${account.name} is running older code missing modern features. Triggering deploy...`);
+        await triggerDeploy(account);
+      }
     }
 
     return {

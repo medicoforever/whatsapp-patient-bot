@@ -54,7 +54,7 @@ const REQUESTED_DEFAULT_MODEL_HIERARCHY = [
 
 function isProductionEnv() {
   if (process.env.NODE_ENV === 'test') return false;
-  return Boolean(process.env.RENDER || process.env.NODE_ENV === 'production' || !process.env.LOCAL_DEV);
+  return Boolean(process.env.RENDER || process.env.NODE_ENV === 'production');
 }
 
 const CONFIG = {
@@ -1769,13 +1769,22 @@ app.get('/health', (req, res) => {
 
 app.get('/reconnect', async (req, res) => {
   log('🔄', 'Manual reconnect triggered via /reconnect endpoint...');
-  try {
-    if (sock) {
-      sock.end(new Error('Manual reconnect'));
-    }
-  } catch (_) {}
-  setTimeout(startBot, 2000);
-  res.json({ success: true, message: 'Reconnecting bot in 2 seconds...' });
+  if (botReconnectTimeout) {
+    clearTimeout(botReconnectTimeout);
+    botReconnectTimeout = null;
+  }
+  if (sock) {
+    try {
+      sock.ev?.removeAllListeners();
+      try { sock.ws?.close?.(); } catch(_) {}
+      try { sock.ws?.terminate?.(); } catch(_) {}
+      sock.end?.(new Error('Manual reconnect'));
+    } catch (_) {}
+    sock = null;
+  }
+  isConnected = false;
+  setTimeout(startBot, 3000);
+  res.json({ success: true, message: 'Reconnecting bot in 3 seconds...' });
 });
 
 app.get('/test-ping', async (req, res) => {
@@ -2178,7 +2187,7 @@ async function startBot() {
       auth: state,
       logger: baileysLogger,
       browser: ['Ubuntu', 'Chrome', '20.0.04'],
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       syncFullHistory: false,
       retryRequestDelayMs: 1500,
       keepAliveIntervalMs: 25000,
@@ -2277,14 +2286,8 @@ async function startBot() {
           // Normal disconnect/reconnect: DO NOT delete cryptographic keys on routine 428/408/500!
           let reconnectDelay;
           if (statusCode === 440) {
-            // Autonomous healing: if 8 consecutive 440 conflicts occur, auto-heal stale session keys
-            if (reconnectAttempts >= 8) {
-              log('🔧', `Autonomous heal: ${reconnectAttempts} consecutive 440 conflicts. Auto-resetting session keys...`);
-              await triggerSessionHeal('consecutive_440_conflicts');
-              reconnectAttempts = 0;
-            }
-            // Code 440 is Stream Conflict: give previous socket escalating time to drop on WhatsApp servers
-            reconnectDelay = Math.min(8000 + (reconnectAttempts * 6000), 32000);
+            // Code 440 is Stream Conflict: give previous socket sufficient time to drop on WhatsApp servers
+            reconnectDelay = Math.min(15000 + (reconnectAttempts * 5000), 35000);
             log('🔄', `Stream conflict (440). Attempt ${reconnectAttempts}. Waiting ${reconnectDelay / 1000}s for server socket to clear...`);
           } else {
             reconnectDelay = Math.min(3000 + (reconnectAttempts * 2000), 20000);
@@ -2323,13 +2326,6 @@ async function startBot() {
         if (CONFIG.GROUPS.MRI_SOURCE) log('🏥', 'Monitoring MRI Source Group');
 
         // Signal pre-keys are automatically uploaded by Baileys when server count drops below threshold
-
-        // Send active presence safely after handshake has stabilized (10s delay prevents conflict race condition)
-        setTimeout(() => {
-          if (isConnected && sock?.sendPresenceUpdate) {
-            sock.sendPresenceUpdate('available').catch(() => {});
-          }
-        }, 10000);
       }
     });
 
