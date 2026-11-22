@@ -2370,6 +2370,13 @@ async function startBot() {
             recordIncomingMessage({ msgId, chatId, senderId, fromMe: true, decision: 'ignored_outgoing_external_chat' });
             continue;
           }
+
+          // If this is a protocol stub without content, record and ignore quietly without log spam
+          if (!msg.message) {
+            recordIncomingMessage({ msgId, chatId, senderId, fromMe: true, decision: 'ignored_outgoing_stub' });
+            continue;
+          }
+
           log('👤', `Processing human message from linked phone in ${isSelf ? 'Self-Chat' : chatId} (${msgId ? msgId.substring(0, 8) : 'unknown'})`);
         }
 
@@ -3866,6 +3873,13 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       console.log(finalSecondaryText);
       console.log('═'.repeat(60) + '\n');
 
+      // ✈️ Forward to Telegram channel simultaneously (dispatched before WhatsApp await so report is never lost)
+      const telegramType = (destinationChatId === CONFIG.GROUPS.CT_TARGET || targetChatId === CONFIG.GROUPS.CT_TARGET) ? 'CT' : ((destinationChatId === CONFIG.GROUPS.MRI_TARGET || targetChatId === CONFIG.GROUPS.MRI_TARGET) ? 'MRI' : null);
+      if (telegramType) {
+        sendTelegramReport(telegramType, step1Text).catch(() => {});
+        sendTelegramReport(telegramType, finalSecondaryText).catch(() => {});
+      }
+
       const sentMessage = await safeSendMessage(sock, destinationChatId, {
         text: finalSecondaryText,
         mentions: step2Mentions.length ? step2Mentions : undefined
@@ -3878,13 +3892,6 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
         log('💾', `Secondary Context stored for ...${shortId}`);
       }
       log('📤', `Sent Secondary (Step 2) to target!`);
-
-      // ✈️ Forward to Telegram channel simultaneously
-      const telegramType = (destinationChatId === CONFIG.GROUPS.CT_TARGET || targetChatId === CONFIG.GROUPS.CT_TARGET) ? 'CT' : ((destinationChatId === CONFIG.GROUPS.MRI_TARGET || targetChatId === CONFIG.GROUPS.MRI_TARGET) ? 'MRI' : null);
-      if (telegramType) {
-        sendTelegramReport(telegramType, step1Text).catch(() => {});
-        sendTelegramReport(telegramType, finalSecondaryText).catch(() => {});
-      }
 
       return;
     }
@@ -3953,6 +3960,12 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       finalResponseText += GROUP_REPLY_FOOTER;
     }
 
+    // ✈️ Forward to Telegram channel simultaneously (dispatched before WhatsApp await so report is never lost)
+    const telegramType = (destinationChatId === CONFIG.GROUPS.CT_TARGET || targetChatId === CONFIG.GROUPS.CT_TARGET) ? 'CT' : ((destinationChatId === CONFIG.GROUPS.MRI_TARGET || targetChatId === CONFIG.GROUPS.MRI_TARGET) ? 'MRI' : null);
+    if (telegramType) {
+      sendTelegramReport(telegramType, finalResponseText).catch(() => {});
+    }
+
     const sentMessage = await safeSendMessage(currentSock, destinationChatId, {
       text: finalResponseText,
       mentions: finalMentions.length ? finalMentions : undefined
@@ -3966,12 +3979,6 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     }
 
     log('📤', `Sent to target/chat!`);
-
-    // ✈️ Forward to Telegram channel simultaneously
-    const telegramType = (destinationChatId === CONFIG.GROUPS.CT_TARGET || targetChatId === CONFIG.GROUPS.CT_TARGET) ? 'CT' : ((destinationChatId === CONFIG.GROUPS.MRI_TARGET || targetChatId === CONFIG.GROUPS.MRI_TARGET) ? 'MRI' : null);
-    if (telegramType) {
-      sendTelegramReport(telegramType, finalResponseText).catch(() => {});
-    }
 
     await markUserBufferCompleted(chatId, senderId);
 
