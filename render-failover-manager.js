@@ -96,15 +96,23 @@ async function getAccountEnvVars(account) {
 async function setAccountTourStart(account, isoTimestamp) {
   if (!account.apiKey || !account.serviceId) return false;
   try {
+    const existingMap = await getAccountEnvVars(account) || new Map();
+    if (existingMap.get('ACTIVE_TOUR_START') === isoTimestamp) {
+      return true; // Already set to target timestamp
+    }
+    const merged = [];
+    for (const [k, v] of existingMap.entries()) {
+      if (k !== 'ACTIVE_TOUR_START') merged.push({ key: k, value: v });
+    }
+    merged.push({ key: 'ACTIVE_TOUR_START', value: isoTimestamp });
+
     const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/env-vars`, {
       method: 'PUT',
       headers: {
         'Authorization': `Bearer ${account.apiKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify([
-        { key: 'ACTIVE_TOUR_START', value: isoTimestamp }
-      ])
+      body: JSON.stringify(merged)
     });
     return res.ok;
   } catch (err) {
@@ -120,26 +128,19 @@ async function getActiveTourDays(account, service, uptimeSeconds = 0) {
     if (tourStartStr) {
       const tourStartMs = Date.parse(tourStartStr);
       if (!isNaN(tourStartMs) && tourStartMs > 0 && tourStartMs <= Date.now()) {
-        const days = (Date.now() - tourStartMs) / (1000 * 60 * 60 * 24);
-        return days;
+        return (Date.now() - tourStartMs) / (1000 * 60 * 60 * 24);
       }
     }
 
-    // If ACTIVE_TOUR_START is not set yet, initialize from service.updatedAt or current uptime
-    let initialDate = new Date();
-    if (uptimeSeconds && uptimeSeconds > 0) {
-      initialDate = new Date(Date.now() - (uptimeSeconds * 1000));
-    } else if (service?.updatedAt) {
+    // Fallback: calculate from service.updatedAt or process uptime without triggering rolling deploys
+    if (service?.updatedAt) {
       const parsedUpdated = Date.parse(service.updatedAt);
       if (!isNaN(parsedUpdated) && parsedUpdated > 0) {
-        initialDate = new Date(parsedUpdated);
+        return (Date.now() - parsedUpdated) / (1000 * 60 * 60 * 24);
       }
     }
 
-    console.log(`[Failover] 📌 Initializing ACTIVE_TOUR_START for ${account.name} as ${initialDate.toISOString()}`);
-    await setAccountTourStart(account, initialDate.toISOString());
-
-    return (Date.now() - initialDate.getTime()) / (1000 * 60 * 60 * 24);
+    return (uptimeSeconds || 0) / (60 * 60 * 24);
   } catch (err) {
     console.warn(`[Failover] Warning: could not parse tour start for ${account.name}: ${err.message}`);
     return (uptimeSeconds || 0) / (60 * 60 * 24);
