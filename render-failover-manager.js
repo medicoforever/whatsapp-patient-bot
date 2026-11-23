@@ -17,6 +17,7 @@ const CRON_JOB_API_KEY = (process.env.CRON_JOB_API_KEY || '').trim() || '3GKdFNC
 const CRON_JOB_ID = (process.env.CRON_JOB_ID || '').trim() || '7156467';
 const CRON_JOB_WATCHDOG_ID = (process.env.CRON_JOB_WATCHDOG_ID || '').trim() || '8538883';
 const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '').trim();
+const TOUR_ROTATION_DAYS = parseFloat(process.env.TOUR_ROTATION_DAYS || '10');
 
 const RENDER_ACCOUNTS = [
   {
@@ -90,6 +91,59 @@ async function getAccountEnvVars(account) {
     console.warn(`[Failover] Failed fetching env vars for ${account.name}: ${err.message}`);
   }
   return null;
+}
+
+async function setAccountTourStart(account, isoTimestamp) {
+  if (!account.apiKey || !account.serviceId) return false;
+  try {
+    const res = await fetch(`https://api.render.com/v1/services/${account.serviceId}/env-vars`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${account.apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify([
+        { key: 'ACTIVE_TOUR_START', value: isoTimestamp }
+      ])
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn(`[Failover] Failed setting ACTIVE_TOUR_START on ${account.name}: ${err.message}`);
+    return false;
+  }
+}
+
+async function getActiveTourDays(account, service, uptimeSeconds = 0) {
+  try {
+    const envMap = await getAccountEnvVars(account);
+    const tourStartStr = envMap?.get('ACTIVE_TOUR_START');
+    if (tourStartStr) {
+      const tourStartMs = Date.parse(tourStartStr);
+      if (!isNaN(tourStartMs) && tourStartMs > 0 && tourStartMs <= Date.now()) {
+        const days = (Date.now() - tourStartMs) / (1000 * 60 * 60 * 24);
+        return days;
+      }
+    }
+
+    // If ACTIVE_TOUR_START is not set yet, initialize from service.updatedAt or current uptime
+    let initialDate = new Date();
+    if (uptimeSeconds && uptimeSeconds > 0) {
+      initialDate = new Date(Date.now() - (uptimeSeconds * 1000));
+    } else if (service?.updatedAt) {
+      const parsedUpdated = Date.parse(service.updatedAt);
+      if (!isNaN(parsedUpdated) && parsedUpdated > 0) {
+        initialDate = new Date(parsedUpdated);
+      }
+    }
+
+    console.log(`[Failover] 📌 Initializing ACTIVE_TOUR_START for ${account.name} as ${initialDate.toISOString()}`);
+    await setAccountTourStart(account, initialDate.toISOString());
+
+    return (Date.now() - initialDate.getTime()) / (1000 * 60 * 60 * 24);
+  } catch (err) {
+    console.warn(`[Failover] Warning: could not parse tour start for ${account.name}: ${err.message}`);
+    return (uptimeSeconds || 0) / (60 * 60 * 24);
+  }
 }
 
 async function resolveMasterEnvConfig() {
@@ -583,8 +637,61 @@ async function checkAndFailover() {
         await suspendService(entry.account);
       }
     }
+
+    // -------------------------------------------------------------------------------------------------
+    // Autonomous Quota Budgeter & Planned 10-Day Rotation Policy
+    // Ensures each account runs for at least 10 days, then gracefully rotates to preserve ~510h in reserve.
+    // -------------------------------------------------------------------------------------------------
+    const tourDays = await getActiveTourDays(activeEntry.account, activeEntry.service, activeEntry.uptime);
+    console.log(`[Failover] ⏱️ Tour status: ${activeEntry.account.name} has served ${tourDays.toFixed(2)} days (Policy threshold: ${TOUR_ROTATION_DAYS} days).`);
+
+    const eligibleStandbys = accountsStatus.filter(e => 
+      !e.isBillingSuspended && 
+      e.state !== 'UNREACHABLE' &&
+      e.account.serviceId !== activeEntry.account.serviceId
+    );
+
+    if (tourDays >= TOUR_ROTATION_DAYS && eligibleStandbys.length > 0) {
+      console.log(`\n[Failover] 🔄 PLANNED ${TOUR_ROTATION_DAYS}-DAY ROTATION TRIGGERED!`);
+      console.log(`[Failover] Active service ${activeEntry.account.name} has completed its planned ${tourDays.toFixed(1)}-day cycle.`);
+      console.log(`[Failover] Rotating to next healthy standby to preserve remaining free hours on ${activeEntry.account.name}...`);
+
+      const nextTarget = eligibleStandbys[0];
+      console.log(`[Failover] 🎯 Rotating active duty to: ${nextTarget.account.name} (${nextTarget.account.serviceId})`);
+
+      // 1. Sync all environment variables on target candidate before activation
+      await syncAccountEnvVars(nextTarget.account, masterConfig);
+
+      // 2. Suspend old active instance first to avoid multi-device stream conflicts (Code: 440)
+      console.log(`[Failover] 💤 Suspending current active service ${activeEntry.account.name}...`);
+      await suspendService(activeEntry.account);
+
+      // 3. Resume next target service
+      console.log(`[Failover] 🚀 Resuming next candidate ${nextTarget.account.name}...`);
+      const resumed = await resumeService(nextTarget.account);
+      if (resumed) {
+        // Record fresh tour start timestamp on next target
+        await setAccountTourStart(nextTarget.account, new Date().toISOString());
+
+        // Trigger deploy on new target
+        await triggerDeploy(nextTarget.account);
+
+        // Update cron-job.org keep-alive ping URL to new target
+        await updateCronJobUrl(nextTarget.account.url);
+        await updateCronJobWatchdog(GITHUB_TOKEN);
+
+        console.log(`[Failover] 🎉 PLANNED ROTATION COMPLETED! Activated ${nextTarget.account.name} at ${nextTarget.account.url}.\n`);
+        return { success: true, rotated: true, from: activeEntry.account.name, to: nextTarget.account.name };
+      } else {
+        console.error(`[Failover] ❌ Target resume failed on ${nextTarget.account.name}. Re-activating fallback ${activeEntry.account.name}...`);
+        await resumeService(activeEntry.account);
+      }
+    } else if (tourDays >= TOUR_ROTATION_DAYS && eligibleStandbys.length === 0) {
+      console.log(`[Failover] ℹ️ Tour threshold reached (${tourDays.toFixed(1)} days), but no standby candidates are currently available (others billing-suspended or waiting for month reset). Continuing on ${activeEntry.account.name}.`);
+    }
+
     console.log(`[Failover] ✅ Failover scan complete. System stable on ${activeEntry.account.name}.\n`);
-    return { success: true, active: activeEntry.account.name };
+    return { success: true, active: activeEntry.account.name, tourDays };
   }
 
   // Case 2: Active service is UNHEALTHY or ALL accounts are suspended -> INITIATE FAILOVER
@@ -660,6 +767,7 @@ async function checkAndFailover() {
       console.log(`[Failover] Attempting resume on alternate: ${alt.account.name}...`);
       await syncAccountEnvVars(alt.account, masterConfig);
       if (await resumeService(alt.account)) {
+        await setAccountTourStart(alt.account, new Date().toISOString());
         await triggerDeploy(alt.account);
         await updateCronJobUrl(alt.account.url);
         await updateCronJobWatchdog(GITHUB_TOKEN);
@@ -668,6 +776,9 @@ async function checkAndFailover() {
     }
     return { success: false, error: 'resume_failed' };
   }
+
+  // Record fresh tour start timestamp on target
+  await setAccountTourStart(target.account, new Date().toISOString());
 
   // Trigger fresh deployment to guarantee latest code is running
   await triggerDeploy(target.account);
@@ -705,5 +816,8 @@ export {
   getAccountEnvVars,
   syncAccountEnvVars,
   getRecentDeploys,
-  hasRecentDeployWithinMinutes
+  hasRecentDeployWithinMinutes,
+  TOUR_ROTATION_DAYS,
+  getActiveTourDays,
+  setAccountTourStart
 };
