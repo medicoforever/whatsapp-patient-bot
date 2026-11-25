@@ -10,7 +10,9 @@ import {
   STARTUP_GRACE_PERIOD_S,
   app,
   CONFIG,
-  connectMongoDB
+  connectMongoDB,
+  safeSendMessage,
+  setMockSock
 } from '../index.js';
 
 import {
@@ -146,6 +148,30 @@ assert.ok(calcDays10 >= 10, '10 days ago must be >= 10 days');
 assert.ok(calcDays9 < 10, '9 days ago must be < 10 days');
 console.log('  ✅ PASS: 10-day tour duration thresholding verified.');
 
+// ----------------------------------------------------
+// Test 6: Stale Socket Failover in safeSendMessage
+// ----------------------------------------------------
+console.log('\nTest 6: Stale Socket Failover in safeSendMessage');
+const staleSock = {
+  sendMessage: async () => {
+    const err = new Error('Connection Closed');
+    err.output = { statusCode: 428 };
+    throw err;
+  }
+};
+let freshSendCount = 0;
+const freshSock = {
+  sendMessage: async (jid, content) => {
+    freshSendCount++;
+    return { key: { id: 'FRESH_MSG_123', remoteJid: jid }, content };
+  }
+};
+setMockSock(freshSock);
+const sentResult = await safeSendMessage(staleSock, '120363425099016220@g.us', { text: 'clinical profile' });
+assert.strictEqual(freshSendCount, 1, 'safeSendMessage must route through refreshed live sock instead of stale closure');
+assert.strictEqual(sentResult?.key?.id, 'FRESH_MSG_123');
+console.log('  ✅ PASS: safeSendMessage routes past stale socket references to live sock.');
+
 console.log('\n--------------------------------------------------');
-console.log('Summary: All 5 Test Suites Passed Successfully!');
+console.log('Summary: All 6 Test Suites Passed Successfully!');
 console.log('--------------------------------------------------\n');

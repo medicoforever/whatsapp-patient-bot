@@ -1062,7 +1062,7 @@ function resetUserTimeout(chatId, senderId, senderName) {
 
               log('▶️', `Processing Batch ${i+1}/${batches.length} (${batch.length} files)`);
 
-              await processMedia(sock, chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
+              await processMedia(getActiveSock(), chatId, batch, false, null, senderId, senderName, null, 3, false, targetChatId);
 
               if (i < batches.length - 1) {
                 await new Promise(r => setTimeout(r, 2000));
@@ -1194,12 +1194,63 @@ function isSelfChat(chatId) {
   return Boolean((myPhone && target === myPhone) || (myLid && target === myLid));
 }
 
+let isShuttingDown = false;
+
+function getActiveSock(preferredSock = null) {
+  if (sock && typeof sock.sendMessage === 'function') {
+    if (!preferredSock || sock !== preferredSock || isConnected) {
+      return sock;
+    }
+  }
+  return preferredSock || sock;
+}
+
 async function safeSendMessage(targetSock, jid, content, options = {}) {
-  const current = targetSock || sock;
+  let current = getActiveSock(targetSock);
+  if (!current?.sendMessage) {
+    const canWaitForReconnect = !isShuttingDown && (isBotStarting || reconnectAttempts > 0);
+    if (canWaitForReconnect) {
+      const deadline = Date.now() + 25000;
+      while (Date.now() < deadline && !isShuttingDown) {
+        await new Promise(r => setTimeout(r, 1000));
+        const candidate = getActiveSock(null);
+        if (isConnected && candidate?.sendMessage) {
+          current = candidate;
+          break;
+        }
+      }
+    }
+  }
   if (!current?.sendMessage) {
     throw new Error('Socket not available for sendMessage');
   }
-  const result = await current.sendMessage(jid, content, options);
+
+  let result;
+  try {
+    result = await current.sendMessage(jid, content, options);
+  } catch (sendErr) {
+    const errMsg = sendErr?.message || '';
+    const isClosedErr = sendErr?.output?.statusCode === 428 || /Connection Closed|not open/i.test(errMsg);
+    if (!isClosedErr || isShuttingDown) throw sendErr;
+
+    let retrySock = (sock && sock !== current && typeof sock.sendMessage === 'function') ? sock : null;
+    const isRealSocket = typeof current?.ws === 'object' || isBotStarting || reconnectAttempts > 0;
+    if (!retrySock && isRealSocket) {
+      const deadline = Date.now() + 25000;
+      while (Date.now() < deadline && !isShuttingDown) {
+        await new Promise(r => setTimeout(r, 1000));
+        const candidate = getActiveSock(null);
+        if (isConnected && candidate?.sendMessage && (candidate !== current || candidate?.ws?.readyState === 1)) {
+          retrySock = candidate;
+          break;
+        }
+      }
+    }
+    if (!retrySock?.sendMessage) throw sendErr;
+    log('🔄', 'Retrying sendMessage on refreshed WhatsApp socket after transient close...');
+    result = await retrySock.sendMessage(jid, content, options);
+  }
+
   if (result?.key?.id) {
     trackBotSentMessageId(result.key.id);
     trackBotMessage(jid, result.key.id);
@@ -2136,6 +2187,10 @@ let bufferWatchdogInterval = null;
 const offlineStanzaRetries = new Map();
 
 async function startBot() {
+  if (isShuttingDown) {
+    log('🛑', 'Shutdown in progress, skipping startBot.');
+    return;
+  }
   if (isBotStarting) {
     log('⏳', 'startBot already in progress, skipping duplicate call.');
     return;
@@ -2386,6 +2441,11 @@ async function startBot() {
         if (botReconnectTimeout) {
           clearTimeout(botReconnectTimeout);
           botReconnectTimeout = null;
+        }
+
+        if (isShuttingDown) {
+          log('🛑', 'Connection closed during graceful shutdown. Skipping reconnect.');
+          return;
         }
 
         const loggedOut = statusCode === DisconnectReason.loggedOut ||
@@ -4096,7 +4156,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       sendTelegramReport(telegramType, finalResponseText).catch(() => {});
     }
 
-    const sentMessage = await safeSendMessage(currentSock, destinationChatId, {
+    const sentMessage = await safeSendMessage(getActiveSock(sockParam), destinationChatId, {
       text: finalResponseText,
       mentions: finalMentions.length ? finalMentions : undefined
     });
@@ -4120,7 +4180,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
       log('⏳', `Generation/Send failed. Scheduling retry in 5 mins for ...${shortId}`);
 
       try {
-        await safeSendMessage(currentSock, destinationChatId, {
+        await safeSendMessage(getActiveSock(sockParam), destinationChatId, {
           text: `⚠️ *High Traffic / Network Alert*\n\nThe AI model is currently overloaded/unstable. I have queued your request and will *automatically retry in 5 minutes*.\n\nPlease do not resend the files.`,
           mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
         });
@@ -4130,7 +4190,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
 
       setTimeout(() => {
         log('🔄', `Executing 5-minute retry for ...${shortId}`);
-        processMedia(currentSock, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
+        processMedia(null, chatId, mediaFiles, isFollowUp, previousResponse, senderId, senderName, userTextInput, targetFps, isSecondaryMode, targetChatId, 1);
       }, 300000);
 
       return;
@@ -4139,7 +4199,7 @@ finalSecondaryText += GROUP_REPLY_FOOTER;
     await markUserBufferFailed(chatId, senderId);
 
     try {
-      await safeSendMessage(currentSock, destinationChatId, {
+      await safeSendMessage(getActiveSock(sockParam), destinationChatId, {
         text: `❌ @${senderId.split('@')[0]}, error processing your request:\n_${error.message}_\n\nPlease try again later.`,
         mentions: getValidMentions(senderId).length ? getValidMentions(senderId) : undefined
       });
@@ -4274,6 +4334,22 @@ export {
 };
 
 if (process.env.NODE_ENV !== 'test' && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index'))) {
+  const shutdownGracefully = (signal) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    isConnected = false;
+    log('🛑', `Received ${signal}. Closing WhatsApp socket cleanly before exit...`);
+    if (botReconnectTimeout) { clearTimeout(botReconnectTimeout); botReconnectTimeout = null; }
+    if (bufferWatchdogInterval) { clearInterval(bufferWatchdogInterval); bufferWatchdogInterval = null; }
+    if (connectionStabilizedTimer) { clearTimeout(connectionStabilizedTimer); connectionStabilizedTimer = null; }
+    try { sock?.ev?.removeAllListeners(); } catch (_) {}
+    try { sock?.end?.(new Error(`Shutdown: ${signal}`)); } catch (_) {}
+    try { server?.close?.(); } catch (_) {}
+    setTimeout(() => process.exit(0), 500).unref?.();
+  };
+  process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+  process.on('SIGINT', () => shutdownGracefully('SIGINT'));
+
   (async () => {
     try {
       await connectMongoDB();
