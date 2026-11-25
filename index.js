@@ -38,7 +38,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 function isAllowedGeminiModel(modelName) {
   if (!modelName || typeof modelName !== 'string') return false;
   const lower = modelName.trim().toLowerCase();
-  if (lower.includes('hydrogen') || lower.includes('gemini-4') || lower.includes('2.5') || lower.includes('3.8')) {
+  if (lower.includes('hydrogen') || lower.includes('gemini-4') || lower.includes('2.5') || lower.includes('3.8') || lower.includes('3.6')) {
     return false;
   }
   return true;
@@ -46,7 +46,6 @@ function isAllowedGeminiModel(modelName) {
 
 const REQUESTED_DEFAULT_MODEL_HIERARCHY = [
   'gemini-3.5-flash',
-  'gemini-3.6-flash',
   'gemini-3-flash-preview',
   'gemini-3.5-flash-lite'
 ];
@@ -60,11 +59,11 @@ const CONFIG = {
   // We now store an array of keys
   API_KEYS: getApiKeys(),
   PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
-  // 🔴 Model Chain Configuration - Strictly preserving requested hierarchy (no gemini-4-hydrogen, no gemini-2.5, no gemini-3.8)
+  // 🔴 Model Chain Configuration - Strictly preserving requested hierarchy (no gemini-4-hydrogen, no gemini-2.5, no gemini-3.8, no gemini-3.6)
   GEMINI_MODEL: (process.env.GEMINI_MODEL && isAllowedGeminiModel(process.env.GEMINI_MODEL)) ? process.env.GEMINI_MODEL.trim() : 'gemini-3.5-flash',
-  GEMINI_MODEL_FALLBACK_1: (process.env.GEMINI_MODEL_FALLBACK_1 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_1)) ? process.env.GEMINI_MODEL_FALLBACK_1.trim() : 'gemini-3.6-flash',
-  GEMINI_MODEL_FALLBACK_2: (process.env.GEMINI_MODEL_FALLBACK_2 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_2)) ? process.env.GEMINI_MODEL_FALLBACK_2.trim() : 'gemini-3-flash-preview',
-  GEMINI_MODEL_FALLBACK_3: (process.env.GEMINI_MODEL_FALLBACK_3 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_3)) ? process.env.GEMINI_MODEL_FALLBACK_3.trim() : 'gemini-3.5-flash-lite',
+  GEMINI_MODEL_FALLBACK_1: (process.env.GEMINI_MODEL_FALLBACK_1 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_1)) ? process.env.GEMINI_MODEL_FALLBACK_1.trim() : 'gemini-3-flash-preview',
+  GEMINI_MODEL_FALLBACK_2: (process.env.GEMINI_MODEL_FALLBACK_2 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_2)) ? process.env.GEMINI_MODEL_FALLBACK_2.trim() : 'gemini-3.5-flash-lite',
+  GEMINI_MODEL_FALLBACK_3: (process.env.GEMINI_MODEL_FALLBACK_3 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_3)) ? process.env.GEMINI_MODEL_FALLBACK_3.trim() : '',
   GEMINI_MODEL_FALLBACK_4: (process.env.GEMINI_MODEL_FALLBACK_4 && isAllowedGeminiModel(process.env.GEMINI_MODEL_FALLBACK_4)) ? process.env.GEMINI_MODEL_FALLBACK_4.trim() : '',
   MONGODB_URI: process.env.MONGODB_URI,
 
@@ -3682,7 +3681,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     CONFIG.GEMINI_MODEL_FALLBACK_4
   ].filter(m => m && isAllowedGeminiModel(m));
 
-  // Strict requested hierarchy: gemini-3.5-flash -> gemini-3.6-flash -> gemini-3-flash-preview -> gemini-3.5-flash-lite (High thinking)
+  // Strict requested hierarchy: gemini-3.5-flash -> gemini-3-flash-preview -> gemini-3.5-flash-lite (High thinking)
   const effectiveModels = candidateModels.length > 0 ? candidateModels : REQUESTED_DEFAULT_MODEL_HIERARCHY;
   const MODEL_CHAIN = effectiveModels.map(name => ({ name, thinking: name.includes('lite') }));
 

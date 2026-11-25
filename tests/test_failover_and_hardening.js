@@ -34,17 +34,16 @@ assert.strictEqual(isAllowedGeminiModel('gemini-2.5-flash'), false, 'gemini-2.5-
 assert.strictEqual(isAllowedGeminiModel('gemini-2.5-pro'), false, 'gemini-2.5-pro must be rejected');
 assert.strictEqual(isAllowedGeminiModel('hydrogen-model'), false, 'hydrogen model must be rejected');
 assert.strictEqual(isAllowedGeminiModel('gemini-3.8-flash'), false, 'gemini-3.8-flash must be rejected');
+assert.strictEqual(isAllowedGeminiModel('gemini-3.6-flash'), false, 'gemini-3.6-flash must be rejected');
 
 // 1.2 Allowed models must pass
 assert.strictEqual(isAllowedGeminiModel('gemini-3.5-flash'), true, 'gemini-3.5-flash must be allowed');
-assert.strictEqual(isAllowedGeminiModel('gemini-3.6-flash'), true, 'gemini-3.6-flash must be allowed');
 assert.strictEqual(isAllowedGeminiModel('gemini-3-flash-preview'), true, 'gemini-3-flash-preview must be allowed');
 assert.strictEqual(isAllowedGeminiModel('gemini-3.5-flash-lite'), true, 'gemini-3.5-flash-lite must be allowed');
 
 // 1.3 Exact hierarchy order check
 const expectedHierarchy = [
   'gemini-3.5-flash',
-  'gemini-3.6-flash',
   'gemini-3-flash-preview',
   'gemini-3.5-flash-lite'
 ];
