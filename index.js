@@ -328,8 +328,8 @@ async function pruneOldPreKeysFromMongo() {
       return 0;
     }
     const nextId = creds?.nextPreKeyId || 0;
-    if (nextId <= 300) return 0; // Not enough keys to warrant pruning
-    const cutoff = nextId - 150; // Keep the latest 150 pre-keys
+    if (nextId <= 1200) return 0; // Keep generous pre-key history so offline group senders do not hit Invalid PreKey ID
+    const cutoff = nextId - 1000; // Keep the latest 1000 pre-keys (~250 KB)
 
     const preKeys = await SessionModel.find(
       { key: { $regex: /^key_pre-key_/ } },
@@ -1750,6 +1750,7 @@ app.get('/health', (req, res) => {
     status: 'running',
     connected: isConnected,
     wsReadyState: sock?.ws?.readyState ?? null,
+    isBuffering: sock?.ev?.isBuffering?.() ?? null,
     botUser: sock?.user || null,
     mongoConnected: mongoConnected,
     mode: 'universal',
@@ -1872,6 +1873,32 @@ app.get('/groups', async (req, res) => {
 // ======================================================================
 // ✈️ TELEGRAM DISPATCH HELPER
 // ======================================================================
+async function sendTelegramChunkIPv4(botToken, chatId, text) {
+  const https = await import('https');
+  const payload = JSON.stringify({ chat_id: chatId, text });
+  return new Promise((resolve, reject) => {
+    const req = https.default.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${botToken}/sendMessage`,
+      method: 'POST',
+      family: 4,
+      timeout: 15000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      let body = '';
+      res.on('data', d => body += d);
+      res.on('end', () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, statusText: res.statusMessage, body }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('Telegram IPv4 request timeout')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
 async function sendTelegramReport(targetType, text) {
   if (!CONFIG.TELEGRAM.BOT_TOKEN) return;
   const chatId = targetType === 'CT' ? CONFIG.TELEGRAM.CT_CHAT_ID : CONFIG.TELEGRAM.MRI_CHAT_ID;
@@ -1886,20 +1913,46 @@ async function sendTelegramReport(targetType, text) {
     }
 
     for (const chunk of chunks) {
-      const response = await fetch(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: chunk
-        })
-      });
+      let delivered = false;
+      let lastErr = '';
+      for (let attempt = 1; attempt <= 3 && !delivered; attempt++) {
+        try {
+          const response = await fetch(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: chunk
+            })
+          });
 
-      if (!response.ok) {
-        const errJson = await response.json().catch(() => ({}));
-        log('⚠️', `Telegram send failed to ${chatId}: ${errJson.description || response.statusText}`);
-      } else {
-        log('✈️', `Telegram report delivered to ${chatId} (${targetType})`);
+          if (response.ok) {
+            delivered = true;
+            log('✈️', `Telegram report delivered to ${chatId} (${targetType})`);
+          } else {
+            const errJson = await response.json().catch(() => ({}));
+            lastErr = errJson.description || response.statusText;
+          }
+        } catch (fetchErr) {
+          lastErr = fetchErr.message;
+          try {
+            const fallbackRes = await sendTelegramChunkIPv4(CONFIG.TELEGRAM.BOT_TOKEN, chatId, chunk);
+            if (fallbackRes.ok) {
+              delivered = true;
+              log('✈️', `Telegram report delivered via IPv4 fallback to ${chatId} (${targetType})`);
+            } else {
+              lastErr = `IPv4 HTTP ${fallbackRes.status}: ${fallbackRes.body?.slice(0, 120)}`;
+            }
+          } catch (ipv4Err) {
+            lastErr = `${fetchErr.message} / IPv4: ${ipv4Err.message}`;
+          }
+        }
+        if (!delivered && attempt < 3) {
+          await new Promise(r => setTimeout(r, attempt * 1000));
+        }
+      }
+      if (!delivered) {
+        log('⚠️', `Telegram send failed to ${chatId} after 3 attempts: ${lastErr}`);
       }
     }
   } catch (error) {
@@ -2079,6 +2132,8 @@ let isBotStarting = false;
 let botReconnectTimeout = null;
 let reconnectAttempts = 0;
 let connectionStabilizedTimer = null;
+let bufferWatchdogInterval = null;
+const offlineStanzaRetries = new Map();
 
 async function startBot() {
   if (isBotStarting) {
@@ -2090,6 +2145,10 @@ async function startBot() {
   if (botReconnectTimeout) {
     clearTimeout(botReconnectTimeout);
     botReconnectTimeout = null;
+  }
+  if (bufferWatchdogInterval) {
+    clearInterval(bufferWatchdogInterval);
+    bufferWatchdogInterval = null;
   }
 
   // Clean up any existing socket before opening a new one to prevent 440 conflict / duplicate listeners
@@ -2205,6 +2264,64 @@ async function startBot() {
       }
     });
 
+    // 🛡️ Watchdog 1: Prevent Baileys event-buffer (isBuffering === true) from staying stuck after offline queue / upsertMessage
+    let bufferingSinceMs = null;
+    const currentSockRef = sock;
+    bufferWatchdogInterval = setInterval(() => {
+      if (sock !== currentSockRef || !isConnected) {
+        bufferingSinceMs = null;
+        return;
+      }
+      if (currentSockRef.ev?.isBuffering?.()) {
+        if (!bufferingSinceMs) {
+          bufferingSinceMs = Date.now();
+        } else if (Date.now() - bufferingSinceMs >= 5000) {
+          bufferingSinceMs = null;
+          try {
+            const flushed = currentSockRef.ev.flush();
+            if (flushed) {
+              log('🧹', 'Flushed stalled Baileys event buffer (prevented incoming message swallow)');
+            }
+          } catch (flushErr) {
+            log('⚠️', `Buffer flush error: ${flushErr.message}`);
+          }
+        }
+      } else {
+        bufferingSinceMs = null;
+      }
+    }, 3000);
+    bufferWatchdogInterval.unref?.();
+
+    // 🛡️ Watchdog 2: Break infinite Code 500 / PreKeyError offline message loops
+    // When a stale offline stanza repeatedly fails decryption across reconnects without a valid ACK,
+    // WhatsApp disconnects every ~50 mins with Code 500. After >=2 failed offline deliveries, send NACK (487) to clear it.
+    currentSockRef.ws?.on?.('CB:message', (node) => {
+      try {
+        const id = node?.attrs?.id;
+        if (!id || !node?.attrs?.offline) return;
+        const prev = offlineStanzaRetries.get(id);
+        const count = (prev?.count || 0) + 1;
+        offlineStanzaRetries.set(id, { count, node, firstSeenMs: prev?.firstSeenMs || Date.now() });
+        if (offlineStanzaRetries.size > 500) {
+          const oldestKey = offlineStanzaRetries.keys().next().value;
+          if (oldestKey) offlineStanzaRetries.delete(oldestKey);
+        }
+        if (count >= 2) {
+          setTimeout(async () => {
+            const entry = offlineStanzaRetries.get(id);
+            if (!entry || sock !== currentSockRef || !isConnected) return;
+            offlineStanzaRetries.delete(id);
+            try {
+              if (typeof currentSockRef.sendMessageAck === 'function') {
+                await currentSockRef.sendMessageAck(entry.node, 487);
+                log('🧹', `NACKed repeated un-decryptable offline stanza ${id.substring(0, 8)}... (attempt #${count}) to prevent Code 500 stream loop`);
+              }
+            } catch (_) {}
+          }, 12000).unref?.();
+        }
+      } catch (_) {}
+    });
+
     // 📱 Mobile Phone Number Pairing Code Flow
     const activePairingNumber = CONFIG.PAIRING_NUMBER || process.env.PAIRING_NUMBER;
     if (activePairingNumber && !state?.creds?.registered && typeof sock.requestPairingCode === 'function') {
@@ -2252,6 +2369,10 @@ async function startBot() {
         qrCodeDataURL = null;
         pairingCode = null;
 
+        if (bufferWatchdogInterval) {
+          clearInterval(bufferWatchdogInterval);
+          bufferWatchdogInterval = null;
+        }
         if (connectionStabilizedTimer) {
           clearTimeout(connectionStabilizedTimer);
           connectionStabilizedTimer = null;
@@ -2347,6 +2468,10 @@ async function startBot() {
         const chatId = msg.key?.remoteJid;
         const senderId = getSenderId(msg);
         const fromMe = Boolean(msg.key?.fromMe);
+
+        if (msgId && msg.message) {
+          offlineStanzaRetries.delete(msgId);
+        }
 
         if (fromMe) {
           // 1. If sent by the bot process itself (tracked message ID), skip the echo
@@ -3405,6 +3530,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 
     const keysToTry = [...CONFIG.API_KEYS];
     let allRateLimited = true;
+    let isDailyQuotaExhausted = false;
 
     for (let i = 0; i < keysToTry.length; i++) {
       const currentKey = keysToTry[i];
@@ -3463,6 +3589,9 @@ async function generateGeminiContent(requestContent, systemInstruction) {
         }
 
         if (isRateLimit) {
+          if (msg.includes('PerDay') || msg.includes('per day') || /retry in \d+h/i.test(msg)) {
+            isDailyQuotaExhausted = true;
+          }
           log('⚠️', `Key (...${currentKey.slice(-4)}) rate-limited/quota-exhausted on ${modelName}. Rotating to back.`);
           const idx = CONFIG.API_KEYS.indexOf(currentKey);
           if (idx > -1 && CONFIG.API_KEYS.length > 1) {
@@ -3476,10 +3605,11 @@ async function generateGeminiContent(requestContent, systemInstruction) {
       }
     }
 
-    // If all keys hit rate-limit on this model, put it on 15m cooldown to avoid wasting time on every message
+    // If all keys hit rate-limit on this model, put it on cooldown (60m for RPD exhaustion, 15m for RPM)
     if (allRateLimited && keysToTry.length > 0) {
-      log('⏸️', `All ${keysToTry.length} keys exhausted quota for ${modelName}. Putting ${modelName} on 15m cooldown.`);
-      modelCooldowns.set(modelName, Date.now() + 15 * 60 * 1000);
+      const cooldownMs = isDailyQuotaExhausted ? 60 * 60 * 1000 : 15 * 60 * 1000;
+      log('⏸️', `All ${keysToTry.length} keys exhausted quota for ${modelName}. Putting ${modelName} on ${Math.round(cooldownMs / 60000)}m cooldown.`);
+      modelCooldowns.set(modelName, Date.now() + cooldownMs);
     }
 
     return null; 
@@ -3493,9 +3623,9 @@ async function generateGeminiContent(requestContent, systemInstruction) {
     CONFIG.GEMINI_MODEL_FALLBACK_4
   ].filter(m => m && isAllowedGeminiModel(m));
 
-  // Strict requested hierarchy: gemini-3.8-flash -> gemini-3.5-flash -> gemini-3.6-flash -> gemini-3-flash-preview -> gemini-3.5-flash-lite
+  // Strict requested hierarchy: gemini-3.8-flash -> gemini-3.5-flash -> gemini-3.6-flash -> gemini-3-flash-preview -> gemini-3.5-flash-lite (High thinking)
   const effectiveModels = candidateModels.length > 0 ? candidateModels : REQUESTED_DEFAULT_MODEL_HIERARCHY;
-  const MODEL_CHAIN = effectiveModels.map(name => ({ name, thinking: false }));
+  const MODEL_CHAIN = effectiveModels.map(name => ({ name, thinking: name.includes('lite') }));
 
   // Deduplicate model names preserving order
   const uniqueModels = MODEL_CHAIN.filter((m, idx, arr) => m.name && arr.findIndex(x => x.name === m.name) === idx);
