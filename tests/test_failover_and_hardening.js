@@ -43,8 +43,8 @@ assert.strictEqual(isAllowedGeminiModel('gemini-3.5-flash-lite'), true, 'gemini-
 
 // 1.3 Exact hierarchy order check
 const expectedHierarchy = [
-  'gemini-3.5-flash',
   'gemini-3-flash-preview',
+  'gemini-3.5-flash',
   'gemini-3.5-flash-lite'
 ];
 assert.deepStrictEqual(REQUESTED_DEFAULT_MODEL_HIERARCHY, expectedHierarchy, 'Requested model hierarchy must strictly match order');
